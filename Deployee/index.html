@@ -1,0 +1,689 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Diffuse-VAE Cloud Points Generator</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        :root {
+            --bg-primary: #ffffff;
+            --bg-secondary: #f5f5f5;
+            --text-primary: #1a1a1a;
+            --text-secondary: #666666;
+            --accent: #2563eb;
+            --accent-light: #dbeafe;
+            --border: #e5e5e5;
+            --shadow: rgba(0, 0, 0, 0.1);
+        }
+
+        html.dark-mode {
+            --bg-primary: #0f0f0f;
+            --bg-secondary: #1a1a1a;
+            --text-primary: #ffffff;
+            --text-secondary: #a0a0a0;
+            --accent: #3b82f6;
+            --accent-light: #1e3a8a;
+            --border: #333333;
+            --shadow: rgba(255, 255, 255, 0.1);
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            transition: background 0.3s ease, color 0.3s ease;
+            overflow-x: hidden;
+        }
+
+        /* Header & Theme Toggle */
+        header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 1.5rem 2rem;
+            border-bottom: 1px solid var(--border);
+            background: var(--bg-secondary);
+        }
+
+        .logo {
+            font-size: 1.5rem;
+            font-weight: 700;
+            background: linear-gradient(135deg, var(--accent), #ec4899);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+
+        .theme-toggle {
+            background: var(--accent);
+            border: none;
+            padding: 0.5rem 1rem;
+            border-radius: 8px;
+            cursor: pointer;
+            color: white;
+            font-weight: 600;
+            transition: transform 0.2s ease;
+        }
+
+        .theme-toggle:hover {
+            transform: scale(1.05);
+        }
+
+        /* Pages */
+        .page {
+            display: none;
+            animation: fadeIn 0.5s ease;
+        }
+
+        .page.active {
+            display: flex;
+        }
+
+        @keyframes fadeIn {
+            from {
+                opacity: 0;
+                transform: translateY(10px);
+            }
+
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        /* Introduction Page */
+        .intro-page {
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            min-height: calc(100vh - 80px);
+            padding: 2rem;
+            text-align: center;
+        }
+
+        .intro-hero {
+            max-width: 600px;
+            animation: slideUp 0.8s ease 0.2s both;
+        }
+
+        @keyframes slideUp {
+            from {
+                opacity: 0;
+                transform: translateY(30px);
+            }
+
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        .intro-hero h1 {
+            font-size: 3.5rem;
+            font-weight: 800;
+            margin-bottom: 1rem;
+            line-height: 1.2;
+            background: linear-gradient(135deg, var(--accent), #ec4899);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+
+        .intro-hero p {
+            font-size: 1.1rem;
+            color: var(--text-secondary);
+            margin-bottom: 2rem;
+            line-height: 1.6;
+        }
+
+        .feature-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+            gap: 1.5rem;
+            margin: 2rem 0;
+            animation: slideUp 0.8s ease 0.4s both;
+        }
+
+        .feature-item {
+            padding: 1.5rem;
+            background: var(--bg-secondary);
+            border-radius: 12px;
+            border: 1px solid var(--border);
+        }
+
+        .feature-item .icon {
+            font-size: 2rem;
+            margin-bottom: 0.5rem;
+        }
+
+        .feature-item p {
+            font-size: 0.9rem;
+            color: var(--text-secondary);
+        }
+
+        .cta-button {
+            display: inline-block;
+            padding: 1rem 2.5rem;
+            background: linear-gradient(135deg, var(--accent), #ec4899);
+            color: white;
+            border: none;
+            border-radius: 50px;
+            font-size: 1.1rem;
+            font-weight: 700;
+            cursor: pointer;
+            transition: transform 0.2s ease, box-shadow 0.2s ease;
+            animation: slideUp 0.8s ease 0.6s both;
+            margin-top: 1rem;
+        }
+
+        .cta-button:hover {
+            transform: translateY(-3px);
+            box-shadow: 0 10px 30px rgba(37, 99, 235, 0.3);
+        }
+
+        /* Generator Page */
+        .generator-page {
+            flex-direction: row;
+            min-height: calc(100vh - 80px);
+        }
+
+        .generator-container {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 2rem;
+            padding: 2rem;
+            max-width: 1400px;
+            margin: 0 auto;
+            width: 100%;
+        }
+
+        .controls-panel {
+            display: flex;
+            flex-direction: column;
+            gap: 1.5rem;
+        }
+
+        .control-group {
+            padding: 1.5rem;
+            background: var(--bg-secondary);
+            border-radius: 12px;
+            border: 1px solid var(--border);
+        }
+
+        .control-group h3 {
+            margin-bottom: 1rem;
+            font-size: 1.1rem;
+            color: var(--accent);
+        }
+
+        .class-selector {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 0.8rem;
+        }
+
+        .class-button {
+            padding: 0.8rem;
+            background: var(--bg-primary);
+            border: 2px solid var(--border);
+            border-radius: 8px;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            font-weight: 600;
+            color: var(--text-primary);
+        }
+
+        .class-button:hover {
+            border-color: var(--accent);
+            background: var(--accent-light);
+        }
+
+        .class-button.active {
+            background: var(--accent);
+            color: white;
+            border-color: var(--accent);
+        }
+
+        .latent-section {
+            display: flex;
+            flex-direction: column;
+            gap: 1rem;
+        }
+
+        .slider-group {
+            display: flex;
+            flex-direction: column;
+            gap: 0.5rem;
+        }
+
+        .slider-label {
+            display: flex;
+            justify-content: space-between;
+            font-size: 0.9rem;
+            color: var(--text-secondary);
+        }
+
+        input[type="range"] {
+            width: 100%;
+            height: 6px;
+            border-radius: 3px;
+            background: var(--border);
+            outline: none;
+            -webkit-appearance: none;
+        }
+
+        input[type="range"]::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            appearance: none;
+            width: 18px;
+            height: 18px;
+            border-radius: 50%;
+            background: var(--accent);
+            cursor: pointer;
+            transition: background 0.2s ease;
+        }
+
+        input[type="range"]::-moz-range-thumb {
+            width: 18px;
+            height: 18px;
+            border-radius: 50%;
+            background: var(--accent);
+            cursor: pointer;
+            border: none;
+        }
+
+        input[type="range"]::-webkit-slider-thumb:hover {
+            background: #ec4899;
+        }
+
+        .generate-button {
+            padding: 1rem;
+            background: linear-gradient(135deg, var(--accent), #ec4899);
+            color: white;
+            border: none;
+            border-radius: 8px;
+            font-size: 1rem;
+            font-weight: 700;
+            cursor: pointer;
+            transition: transform 0.2s ease, box-shadow 0.2s ease;
+            margin-top: 1rem;
+        }
+
+        .generate-button:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 20px rgba(37, 99, 235, 0.3);
+        }
+
+        .generate-button:active {
+            transform: translateY(0);
+        }
+
+        /* Preview Panel */
+        .preview-panel {
+            display: flex;
+            flex-direction: column;
+            gap: 1rem;
+        }
+
+        .preview-container {
+            flex: 1;
+            background: var(--bg-secondary);
+            border-radius: 12px;
+            border: 2px dashed var(--border);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            min-height: 400px;
+            overflow: hidden;
+            position: relative;
+        }
+
+        .preview-image {
+            width: 100%;
+            height: 100%;
+            object-fit: contain;
+            padding: 2rem;
+        }
+
+        .preview-info {
+            padding: 1.5rem;
+            background: var(--bg-secondary);
+            border-radius: 12px;
+            border: 1px solid var(--border);
+        }
+
+        .preview-info h4 {
+            margin-bottom: 0.5rem;
+            color: var(--accent);
+        }
+
+        .preview-info p {
+            font-size: 0.9rem;
+            color: var(--text-secondary);
+        }
+
+        .latent-values {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 0.8rem;
+            margin-top: 1rem;
+        }
+
+        .latent-value {
+            padding: 0.8rem;
+            background: var(--bg-primary);
+            border-radius: 6px;
+            border: 1px solid var(--border);
+        }
+
+        .latent-value small {
+            display: block;
+            color: var(--text-secondary);
+            font-size: 0.8rem;
+            margin-bottom: 0.3rem;
+        }
+
+        .latent-value strong {
+            color: var(--accent);
+            font-family: 'Courier New', monospace;
+        }
+
+        /* Responsive */
+        @media (max-width: 1024px) {
+            .generator-container {
+                grid-template-columns: 1fr;
+            }
+
+            .intro-hero h1 {
+                font-size: 2.5rem;
+            }
+        }
+
+        @media (max-width: 768px) {
+            header {
+                padding: 1rem;
+            }
+
+            .logo {
+                font-size: 1.2rem;
+            }
+
+            .class-selector {
+                grid-template-columns: repeat(2, 1fr);
+            }
+
+            .latent-values {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        .loading {
+            display: inline-block;
+            width: 20px;
+            height: 20px;
+            border: 3px solid var(--border);
+            border-top-color: var(--accent);
+            border-radius: 50%;
+            animation: spin 0.6s linear infinite;
+        }
+
+        @keyframes spin {
+            to {
+                transform: rotate(360deg);
+            }
+        }
+    </style>
+</head>
+
+<body>
+    <header>
+        <div class="logo">✨ Cloud Points VAE</div>
+        <button class="theme-toggle" onclick="toggleTheme()">🌙 Dark Mode</button>
+    </header>
+
+    <!-- Introduction Page -->
+    <div id="introPage" class="page intro-page active">
+        <div class="intro-hero">
+            <h1>Diffuse-VAE Cloud Points</h1>
+            <p>Generate 3D point clouds with latent space control. Create, explore, and visualize geometric structures
+                using variational autoencoders.</p>
+
+            <div class="feature-grid">
+                <div class="feature-item">
+                    <div class="icon">🎯</div>
+                    <p><strong>Class-based</strong> Generation</p>
+                </div>
+                <div class="feature-item">
+                    <div class="icon">🎨</div>
+                    <p><strong>Latent</strong> Space Control</p>
+                </div>
+                <div class="feature-item">
+                    <div class="icon">☁️</div>
+                    <p><strong>3D</strong> Point Clouds</p>
+                </div>
+                <div class="feature-item">
+                    <div class="icon">🔗</div>
+                    <p><strong>Triangle</strong> Meshes</p>
+                </div>
+            </div>
+
+            <button class="cta-button" onclick="goToGenerator()">Start Generating →</button>
+        </div>
+    </div>
+
+    <!-- Generator Page -->
+    <div id="generatorPage" class="page generator-page">
+        <div class="generator-container">
+            <!-- Controls Panel -->
+            <div class="controls-panel">
+                <!-- Class Selection -->
+                <div class="control-group">
+                    <h3>📦 Select Class</h3>
+                    <div class="class-selector">
+                        <button class="class-button active" onclick="selectClass(this, 'chair')">Chair</button>
+                        <button class="class-button" onclick="selectClass(this, 'table')">Table</button>
+                        <button class="class-button" onclick="selectClass(this, 'lamp')">Lamp</button>
+                        <button class="class-button" onclick="selectClass(this, 'sofa')">Sofa</button>
+                    </div>
+                </div>
+
+                <!-- Latent Vector Controls -->
+                <div class="control-group">
+                    <h3>🎛️ Latent Vector</h3>
+                    <div class="latent-section">
+                        <div class="slider-group">
+                            <div class="slider-label">
+                                <span>Z₁ (Shape)</span>
+                                <span id="z1Value">0.00</span>
+                            </div>
+                            <input type="range" id="z1" min="-1" max="1" step="0.01" value="0"
+                                oninput="updateLatent('z1')">
+                        </div>
+
+                        <div class="slider-group">
+                            <div class="slider-label">
+                                <span>Z₂ (Size)</span>
+                                <span id="z2Value">0.00</span>
+                            </div>
+                            <input type="range" id="z2" min="-1" max="1" step="0.01" value="0"
+                                oninput="updateLatent('z2')">
+                        </div>
+
+                        <div class="slider-group">
+                            <div class="slider-label">
+                                <span>Z₃ (Complexity)</span>
+                                <span id="z3Value">0.00</span>
+                            </div>
+                            <input type="range" id="z3" min="-1" max="1" step="0.01" value="0"
+                                oninput="updateLatent('z3')">
+                        </div>
+
+                        <div class="slider-group">
+                            <div class="slider-label">
+                                <span>Z₄ (Orientation)</span>
+                                <span id="z4Value">0.00</span>
+                            </div>
+                            <input type="range" id="z4" min="-1" max="1" step="0.01" value="0"
+                                oninput="updateLatent('z4')">
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Generate Button -->
+                <button class="generate-button" onclick="generateCloud()">
+                    ✨ Generate Cloud
+                </button>
+
+                <!-- Back Button -->
+                <button class="generate-button" style="background: linear-gradient(135deg, #666, #888);"
+                    onclick="goToIntro()">
+                    ← Back to Home
+                </button>
+            </div>
+
+            <!-- Preview Panel -->
+            <div class="preview-panel">
+                <div class="preview-container" id="previewContainer">
+                    <img src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 400 400'%3E%3Crect fill='%23f5f5f5' width='400' height='400'/%3E%3Ctext x='50%25' y='50%25' font-size='24' fill='%23999' text-anchor='middle' dominant-baseline='middle'%3E☁️ Point Cloud Preview%3C/text%3E%3C/svg%3E"
+                        alt="Point cloud preview" class="preview-image">
+                </div>
+
+                <div class="preview-info">
+                    <h4>📊 Generation Info</h4>
+                    <p id="infoText">Select a class and adjust latent vectors to generate a point cloud.</p>
+
+                    <div class="latent-values" id="latentValuesDisplay">
+                        <div class="latent-value">
+                            <small>Z₁ (Shape)</small>
+                            <strong>0.00</strong>
+                        </div>
+                        <div class="latent-value">
+                            <small>Z₂ (Size)</small>
+                            <strong>0.00</strong>
+                        </div>
+                        <div class="latent-value">
+                            <small>Z₃ (Complexity)</small>
+                            <strong>0.00</strong>
+                        </div>
+                        <div class="latent-value">
+                            <small>Z₄ (Orientation)</small>
+                            <strong>0.00</strong>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let selectedClass = 'chair';
+        let latentVectors = { z1: 0, z2: 0, z3: 0, z4: 0 };
+        const API_BASE = 'http://localhost:5000';
+
+        // Theme Toggle
+        function toggleTheme() {
+            const html = document.documentElement;
+            html.classList.toggle('dark-mode');
+            const isDark = html.classList.contains('dark-mode');
+            localStorage.setItem('theme', isDark ? 'dark' : 'light');
+
+            const btn = document.querySelector('.theme-toggle');
+            btn.textContent = isDark ? '☀️ Light Mode' : '🌙 Dark Mode';
+        }
+
+        // Initialize theme from localStorage
+        if (localStorage.getItem('theme') === 'dark') {
+            toggleTheme();
+        }
+
+        // Page Navigation
+        function goToGenerator() {
+            document.getElementById('introPage').classList.remove('active');
+            document.getElementById('generatorPage').classList.add('active');
+        }
+
+        function goToIntro() {
+            document.getElementById('generatorPage').classList.remove('active');
+            document.getElementById('introPage').classList.add('active');
+        }
+
+        // Class Selection
+        function selectClass(button, className) {
+            document.querySelectorAll('.class-button').forEach(btn => {
+                btn.classList.remove('active');
+            });
+            button.classList.add('active');
+            selectedClass = className;
+            updateInfo();
+        }
+
+        // Latent Vector Control
+        function updateLatent(param) {
+            const value = parseFloat(document.getElementById(param).value);
+            latentVectors[param] = value;
+            document.getElementById(param + 'Value').textContent = value.toFixed(2);
+            updateLatentDisplay();
+        }
+
+        function updateLatentDisplay() {
+            const values = document.querySelectorAll('.latent-value strong');
+            values[0].textContent = latentVectors.z1.toFixed(2);
+            values[1].textContent = latentVectors.z2.toFixed(2);
+            values[2].textContent = latentVectors.z3.toFixed(2);
+            values[3].textContent = latentVectors.z4.toFixed(2);
+        }
+
+        // Generate Cloud
+        async function generateCloud() {
+            const btn = document.querySelector('.generate-button');
+            const originalText = btn.textContent;
+            btn.textContent = '⏳ Generating...';
+            btn.disabled = true;
+
+            try {
+                const response = await fetch(`${API_BASE}/generate`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        class: selectedClass,
+                        latent: latentVectors
+                    })
+                });
+
+                if (response.ok) {
+                    const data = await response.json();
+                    // For now, keep the static image
+                    // In future: document.querySelector('.preview-image').src = data.image_url;
+                    updateInfo(data);
+                    alert('Generation successful! (Static image for now)');
+                } else {
+                    alert('Generation failed. Check server connection.');
+                }
+            } catch (error) {
+                console.error('Error:', error);
+                alert('Error connecting to server. Make sure Python backend is running.');
+            } finally {
+                btn.textContent = originalText;
+                btn.disabled = false;
+            }
+        }
+
+        function updateInfo(data = null) {
+            const infoText = document.getElementById('infoText');
+            if (data) {
+                infoText.textContent = `Generated: ${selectedClass.toUpperCase()} | Points: ${data.points_count || '5000'} | Mesh: Ready for triangulation`;
+            } else {
+                infoText.textContent = `Class: ${selectedClass.toUpperCase()} | Adjust vectors and click Generate`;
+            }
+        }
+    </script>
+</body>
+
+</html>
