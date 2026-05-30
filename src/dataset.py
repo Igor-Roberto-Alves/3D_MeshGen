@@ -1,24 +1,26 @@
 import os
+import open3d as o3d
+import numpy as np
+import torch
 
 
 class Ds_point_model:
-    
+
     def __init__(self, root="Shapenet"):
         self.root = root
         self.classes = []
         self.dict = {}
-        self.all_files = [] 
+        self.all_files = []
 
         if not os.path.exists(root):
             print(f"Warning: Root directory '{root}' does not exist.")
             return
 
-
         for rt, dirs, files in os.walk(root):
             self.classes = dirs
             for cl in dirs:
                 self.dict[cl] = []
-            break 
+            break
 
         for cl in self.classes:
             class_path = os.path.join(self.root, cl)
@@ -27,19 +29,16 @@ class Ds_point_model:
                     if file.endswith(".obj"):
                         full_path = os.path.join(sub_rt, file)
                         self.dict[cl].append(full_path)
-                        
 
                         self.all_files.append((cl, full_path))
-        
-    
 
     @staticmethod
     def map():
         mapp = {
-            "04379243": "table", 
+            "04379243": "table",
             "03593526": "jar",
             "04225987": "skateboard",
-            "02958343": "car", 
+            "02958343": "car",
             "02876657": "bottle",
             "04460130": "tower",
             "03001627": "chair",
@@ -87,12 +86,11 @@ class Ds_point_model:
             "03325088": "faucet",
             "04004475": "printer",
             "02954340": "cap",
-            "02992529": "celular"
+            "02992529": "celular",
         }
 
         return mapp
 
-        
     def __len__(self):
 
         return len(self.all_files)
@@ -103,6 +101,43 @@ class Ds_point_model:
             raise IndexError("Dataset index out of range.")
 
         class_name, file_path = self.all_files[idx]
-        
 
         return class_name, file_path
+
+
+class Ds_point_sampled:
+    def __init__(self, model: Ds_point_model):
+        self.model = model
+        if not os.path.exists("point_clouds"):
+            os.makedirs("point_clouds")
+            self.save_all()
+
+    def save_all(self):
+        for i in range(len(self.model)):
+            class_name, file_path = self.model[i]
+            mesh = o3d.io.read_triangle_mesh(file_path)
+            mesh.compute_vertex_normals()
+            pcd = mesh.sample_points_uniformly(number_of_points=2048)
+            save_path = "point_clouds/" + f"{i}.ply"
+            o3d.io.write_point_cloud(save_path, pcd)
+
+    def __getitem__(self, idx):
+        class_name, file_path = self.model[idx]
+        file_path = "point_clouds/" + f"{idx}.ply"
+        pcd = o3d.io.read_point_cloud(file_path)
+
+        # 1. Extrai as coordenadas XYZ -> formato (2048, 3)
+        # 1. Extrai as coordenadas XYZ -> formato (2048, 3)
+        points = np.asarray(pcd.points, dtype=np.float32)
+
+        # 2. Extrai as Normais Nx, Ny, Nz -> formato (2048, 3)
+        normals = np.asarray(pcd.normals, dtype=np.float32)
+
+        # 3. Junta lado a lado -> formato (2048, 6)
+        features = np.concatenate([points, normals], axis=1)
+
+        # NÃO ACHATE OS DADOS AQUI. Mantemos o formato (2048, 6)
+        return class_name, torch.from_numpy(features)
+
+    def __len__(self):
+        return len(self.model)
