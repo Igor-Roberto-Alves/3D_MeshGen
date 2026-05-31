@@ -126,17 +126,10 @@ class Ds_point_sampled:
         file_path = "point_clouds/" + f"{idx}.ply"
         pcd = o3d.io.read_point_cloud(file_path)
 
-        # 1. Extrai as coordenadas XYZ -> formato (2048, 3)
-        # 1. Extrai as coordenadas XYZ -> formato (2048, 3)
         points = np.asarray(pcd.points, dtype=np.float32)
-
-        # 2. Extrai as Normais Nx, Ny, Nz -> formato (2048, 3)
         normals = np.asarray(pcd.normals, dtype=np.float32)
-
-        # 3. Junta lado a lado -> formato (2048, 6)
         features = np.concatenate([points, normals], axis=1)
 
-        # NÃO ACHATE OS DADOS AQUI. Mantemos o formato (2048, 6)
         return class_name, torch.from_numpy(features)
 
     def __len__(self):
