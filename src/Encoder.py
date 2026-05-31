@@ -85,13 +85,19 @@ class HierarchicalEncoder(nn.Module):
             t = all_tokens[i]
             for blk in self.blocks:
                 t = blk(t)
-            encoded_levels.append(t.mean(dim=1))  # (B, d_model)
+            encoded_levels.append(t) # Mantém a dimensão (B, M_level, d_model)
 
-        centers = torch.cat(all_centers, dim=1)  # (B, M_total, 6)
-        feat = torch.cat(encoded_levels, dim=-1)  # (B, d_model * 3)
-        feat = self.norm(self.proj(feat))  # (B, d_model)
-        return feat, centers
-
+        # Junta todos os tokens espaciais de todos os níveis numa grande sequência
+        # Níveis: 512 + 256 + 128 = 896 tokens no total
+        feat = torch.cat(encoded_levels, dim=1)  # (B, 896, d_model)
+        centers = torch.cat(all_centers, dim=1)  # (B, 896, 6)
+        
+        # Tirar a média agregada da sequência inteira APENAS no final se necessário,
+        # mas o ideal é extrair um token global (ex: Max Pooling sobre os tokens)
+        feat_global = feat.max(dim=1).values # (B, d_model) - Muito melhor que .mean()
+        feat_global = self.norm(feat_global) 
+        
+        return feat_global, centers
 
 # green branch
 
@@ -128,37 +134,32 @@ class GlobalEncoder(nn.Module):
         
         for blk in self.blocks:
             tokens = blk(tokens)
-        return self.norm(tokens.mean(dim=1))
+        # Substitui .mean() por .max() para capturar características fortes de ativação
+        return self.norm(tokens.max(dim=1).values) # (B, d_model)
 
 # Attention fusion
 
 
 class CrossBranchFusion(nn.Module):
     """
-    Bidirectional cross-attention between hierarchical and global feature vectors.
-    Both are unsqueezed to sequence length 1 for nn.MultiheadAttention.
+    Fusão direta e eficiente via MLP para características globais Hierárquicas e Globais.
+    Aceita n_heads como argumento opcional para manter compatibilidade com o VAE principal.
     """
-
-    def __init__(self, d_model: int, n_heads: int = 8):
+    def __init__(self, d_model: int, n_heads: int = None, **kwargs):
         super().__init__()
-        self.attn_h2g = nn.MultiheadAttention(d_model, n_heads, batch_first=True)
-        self.attn_g2h = nn.MultiheadAttention(d_model, n_heads, batch_first=True)
-        self.norm_h = nn.LayerNorm(d_model)
-        self.norm_g = nn.LayerNorm(d_model)
-        self.proj = nn.Linear(d_model * 2, d_model)
+        # n_heads é ignorado pois a fusão agora usa MLP em vez de Attention
+        self.fusion_mlp = nn.Sequential(
+            nn.Linear(d_model * 2, d_model * 2),
+            nn.GELU(),
+            nn.Linear(d_model * 2, d_model),
+        )
+        self.norm = nn.LayerNorm(d_model)
 
     def forward(self, h: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
         """h, g : (B, d_model)  →  fused (B, d_model)"""
-        h_s = h.unsqueeze(1)  # (B, 1, d_model)
-        g_s = g.unsqueeze(1)
-        h2g, _ = self.attn_h2g(self.norm_h(h_s), self.norm_g(g_s), self.norm_g(g_s))
-        g2h, _ = self.attn_g2h(self.norm_g(g_s), self.norm_h(h_s), self.norm_h(h_s))
-        h_out = (h_s + h2g).squeeze(1)
-        g_out = (g_s + g2h).squeeze(1)
-        return self.proj(torch.cat([h_out, g_out], dim=-1))
-
-
-
+        combined = torch.cat([h, g], dim=-1) # (B, d_model * 2)
+        fused = self.fusion_mlp(combined)    # (B, d_model)
+        return self.norm(fused + g)
 
 class VAEBottleneck(nn.Module):
     def __init__(self, in_dim: int, latent_dim: int):

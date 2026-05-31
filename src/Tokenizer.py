@@ -58,81 +58,88 @@ def knn_group(
     return grouped, idx
 
 
+
 class PatchEmbed(nn.Module):
     """
-    Dual-stream mini-PointNet.
+    Dual-stream mini-PointNet otimizada e corrigida com LayerNorm.
     Input : (B, M, k, 6)  — [rel_xyz | normals]
     Output: (B, M, out_ch)
     """
-
     def __init__(self, in_ch: int = 6, out_ch: int = 256, k: int = 32):
         super().__init__()
         assert in_ch == 6, "PatchEmbed expects 6-channel input (xyz + normals)"
         half = out_ch // 2
 
-        # Stream A: local geometry (relative XYZ)
+        # Stream A: Geometria local (XYZ Relativo + Distância)
+        # Adicionamos +1 canal para a distância euclidiana intrínseca
         self.geo_net = nn.Sequential(
-            nn.Linear(3, half),
-            nn.BatchNorm1d(half),
+            nn.Linear(3 + 1, half),
+            nn.LayerNorm(half),
             nn.GELU(),
             nn.Linear(half, half),
-            nn.BatchNorm1d(half),
+            nn.LayerNorm(half),
             nn.GELU(),
         )
 
-        # Stream B: surface orientation (normals)
+        # Stream B: Orientação de Superfície (Normais)
         self.norm_net = nn.Sequential(
             nn.Linear(3, half),
-            nn.BatchNorm1d(half),
+            nn.LayerNorm(half),
             nn.GELU(),
             nn.Linear(half, half),
-            nn.BatchNorm1d(half),
+            nn.LayerNorm(half),
             nn.GELU(),
         )
 
-        # Fusion: combine both streams before max-pool
+        # Fusão Avançada após a extração de características
         self.fuse = nn.Sequential(
             nn.Linear(out_ch, out_ch),
+            nn.LayerNorm(out_ch),
             nn.GELU(),
+            nn.Linear(out_ch, out_ch), # Camada extra para dar capacidade não-linear ao Token
         )
 
-        self.k      = k
+        self.k = k
         self.out_ch = out_ch
 
     def forward(self, grouped: torch.Tensor) -> torch.Tensor:
         """grouped : (B, M, k, 6)"""
         B, M, k, _ = grouped.shape
-        N           = B * M * k
 
-        xyz_rel  = grouped[..., :3].reshape(N, 3)
-        normals  = grouped[..., 3:].reshape(N, 3)
+        xyz_rel = grouped[..., :3]  # (B, M, k, 3)
+        normals = grouped[..., 3:]  # (B, M, k, 3)
 
-        geo_feat  = self.geo_net(xyz_rel)   # (N, half)
-        norm_feat = self.norm_net(normals)  # (N, half)
+        # 1. Calcular a distância euclidiana ao quadrado como feature geométrica extra
+        dist = torch.sum(xyz_rel ** 2, dim=-1, keepdim=True) # (B, M, k, 1)
+        geo_input = torch.cat([xyz_rel, dist], dim=-1)       # (B, M, k, 4)
 
-        fused = self.fuse(torch.cat([geo_feat, norm_feat], dim=-1))  # (N, out_ch)
-        fused = fused.reshape(B * M, k, self.out_ch)
+        # 2. Passar as correntes mantendo as dimensões estruturadas para o LayerNorm
+        geo_feat = self.geo_net(geo_input)  # (B, M, k, half)
+        norm_feat = self.norm_net(normals)  # (B, M, k, half)
 
-        token = fused.max(dim=1).values     # max-pool over k neighbours
-        return token.reshape(B, M, self.out_ch)
+        # 3. Concatenar os canais (half + half = out_ch)
+        fused = torch.cat([geo_feat, norm_feat], dim=-1)  # (B, M, k, out_ch)
+        fused = self.fuse(fused)                          # (B, M, k, out_ch)
 
+        # 4. Max-pooling sobre a dimensão dos k vizinhos
+        token = fused.max(dim=2).values  # (B, M, out_ch)
+        return token
 
 
 class PositionalEncoding(nn.Module):
     """
-    MLP positional encoding from 3-D spatial coordinates only.
-    Input : (B, M, 3)  — XYZ of patch centres
+    MLP positional encoding robusto. Mapia os centros XYZ para o d_model do Transformer.
+    Input : (B, M, 3)  — XYZ absoluto dos centros dos patches
     Output: (B, M, d_model)
     """
-
     def __init__(self, d_model: int):
         super().__init__()
         self.mlp = nn.Sequential(
             nn.Linear(3, d_model),
+            nn.LayerNorm(d_model), # Adicionado para estabilizar a soma com os tokens
             nn.GELU(),
             nn.Linear(d_model, d_model),
         )
 
     def forward(self, xyz: torch.Tensor) -> torch.Tensor:
-        """xyz : (..., 3)"""
         return self.mlp(xyz)
