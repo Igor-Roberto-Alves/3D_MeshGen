@@ -116,6 +116,8 @@ class Ds_point_sampled:
         for i in range(len(self.model)):
             class_name, file_path = self.model[i]
             mesh = o3d.io.read_triangle_mesh(file_path)
+            print(file_path)
+            print(mesh)
             mesh.compute_vertex_normals()
             pcd = mesh.sample_points_uniformly(number_of_points=2048)
             save_path = "point_clouds/" + f"{i}.ply"
@@ -133,4 +135,9 @@ class Ds_point_sampled:
         return class_name, torch.from_numpy(features)
 
     def __len__(self):
-        return len(self.model)
+        count = 0
+        for root, dirs, files in os.walk("point_clouds"):
+            for filez in files:
+                count += 1
+
+        return count
