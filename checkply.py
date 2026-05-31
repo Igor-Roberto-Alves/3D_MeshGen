@@ -14,80 +14,86 @@ def str2bool(v):
     else:
         raise argparse.ArgumentTypeError('Boolean value expected.')
 
-def check_ply_contents(file_path, visualize=False):
+def verify_and_load_pcd(file_path):
+    """Auxiliary function to check logs and load the point cloud safely."""
     if not os.path.exists(file_path):
         print(f"❌ File not found: {file_path}")
-        return
+        return None
 
-    # Load the point cloud
     pcd = o3d.io.read_point_cloud(file_path)
     
-    # Check if the Open3D object is physically empty
     if pcd.is_empty():
         print(f"❌ The PLY file '{file_path}' is completely EMPTY (0 points).")
-        return
+        return None
 
-    # Gather stats
     points = np.asarray(pcd.points)
     num_points = len(points)
     has_normals = pcd.has_normals()
     
-    print(f"✅ The PLY file '{file_path}' is NOT empty.")
-    print(f"   - Number of points: {num_points}")
-    print(f"   - Has normals:      {has_normals}")
+    print(f"✅ Loaded '{os.path.basename(file_path)}' -> Points: {num_points} | Has normals: {has_normals}")
     
-    # Check for NaNs or Infinity in spatial points
     if np.isnan(points).any() or np.isinf(points).any():
-        print("   - ⚠️ WARNING: Your points contain NaN or Inf values!")
-    else:
-        print("\n   - First 3 spatial points (X, Y, Z):")
-        print(points[:3])
+        print(f"   - ⚠️ WARNING: '{os.path.basename(file_path)}' contains NaN or Inf values!")
+        
+    return pcd
 
-    # Check and print normals
-    if has_normals:
-        normals = np.asarray(pcd.normals)
-        if np.isnan(normals).any() or np.isinf(normals).any():
-            print("\n   - ⚠️ WARNING: Your normals contain NaN or Inf values!")
-        else:
-            print("\n   - First 3 normals (NX, NY, NZ):")
-            print(normals[:3])
-            
-            print("\n   - Combined View [X, Y, Z, NX, NY, NZ] for the first 3 points:")
-            # Stack points and normals horizontally for a clean 6D view
-            combined = np.hstack((points[:3], normals[:3]))
-            print(combined)
+def compare_ply_contents(epoch_num, visualize=False):
+    # Gerar os caminhos para ambos os ficheiros
+    orig_path = f"reconstructions/epoch_{epoch_num}_03001627_ORIGINAL.ply"
+    rec_path  = f"reconstructions/epoch_{epoch_num}_03001627_RECONSTRUCTED.ply"
+    
+    print(f"\n--- [INFO] Checking Epoch {epoch_num} Data ---")
+    pcd_orig = verify_and_load_pcd(orig_path)
+    pcd_rec  = verify_and_load_pcd(rec_path)
+    
+    if pcd_orig is None or pcd_rec is None:
+        print("❌ Cannot visualize. One or both files are missing/corrupted.")
+        return
 
     # ─── POP WINDOW IF FLAG IS TRUE ───
     if visualize:
-        print(f"\n[INFO] Launching Open3D visualizer for: {file_path}")
+        print(f"\n[INFO] Launching Open3D visualizer side-by-side for epoch {epoch_num}")
+        print("[INFO] Legend: GREEN = Original | RED = Reconstructed")
+        print("[INFO] Press 'N' inside the window to toggle surface normals display.")
         print("[INFO] Close the window manually to finish script execution.")
         
-        # If your 3 extra channels are un-trained random values, the shader might make them invisible.
-        # Clearing or painting handles this smoothly for inspection.
-        pcd.paint_uniform_color([0.0, 0.8, 0.8]) # Paint it a solid teal/cyan color
+        # Copiar para não alterar as nuvens originais em futuras operações se necessário
+        pcd_orig_vis = o3d.geometry.PointCloud(pcd_orig)
+        pcd_rec_vis = o3d.geometry.PointCloud(pcd_rec)
         
-        o3d.visualization.draw_geometries([pcd], window_name=f"Checking: {os.path.basename(file_path)}")
+        # Pintar com cores distintas para fácil identificação
+        pcd_orig_vis.paint_uniform_color([0.1, 0.7, 0.1])  # Verde para Original
+        pcd_rec_vis.paint_uniform_color([0.7, 0.1, 0.1])   # Vermelho para Reconstruída
+        
+        # Calcular deslocamento baseado no bounding box da nuvem original
+        bbox = pcd_orig_vis.get_axis_aligned_bounding_box()
+        extent_x = bbox.get_extent()[0]
+        
+        # Deslocar a reconstruída para o lado no eixo X (com folga de 1.5x a sua largura)
+        pcd_rec_vis.translate([extent_x * 1.5, 0, 0])
+        
+        # Renderizar ambas na mesma janela
+        o3d.visualization.draw_geometries(
+            [pcd_orig_vis, pcd_rec_vis], 
+            window_name=f"Comparison Epoch {epoch_num} - Left: Original (Green) | Right: Reconstructed (Red)",
+            width=1280,
+            height=720
+        )
 
 if __name__ == "__main__":
     # Hide verbose Open3D backend warnings/errors during window init
     o3d.utility.set_verbosity_level(o3d.utility.VerbosityLevel.Error)
 
-    parser = argparse.ArgumentParser(description="Check and verify a point cloud PLY file.")
+    parser = argparse.ArgumentParser(description="Check and compare original vs reconstructed point clouds side-by-side.")
     parser.add_argument(
         "-v", "--visualize", 
         type=str2bool, 
         default=False, 
         help="Set to True to pop up an interactive Open3D viewer window"
     )
-    parser.add_argument("-e", "--epoch", type = str, default = 1, help= "epoch value")
-    parser.add_argument("-rec", "--reconstruction", type = str2bool, default = False, help = "recontructed")
-    args = parser.parse_args()
-    if args.reconstruction:
-        rec = "RECONSTRUCTED" 
-    else:
-        rec = "ORIGINAL"
-
-    target_file = "reconstructions/epoch_" + args.epoch + "_02876657_" + rec + ".ply"
+    parser.add_argument("-e", "--epoch", type=str, default="1", help="Epoch value to inspect")
     
-    # Run verification with command line flag configuration
-    check_ply_contents(target_file, visualize=args.visualize)
+    args = parser.parse_args()
+    
+    # Executa a comparação direta
+    compare_ply_contents(args.epoch, visualize=args.visualize)
