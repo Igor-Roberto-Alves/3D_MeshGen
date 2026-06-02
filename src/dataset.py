@@ -2,6 +2,7 @@ import os
 import open3d as o3d
 import numpy as np
 import torch
+import tqdm
 
 
 class Ds_point_model:
@@ -22,7 +23,7 @@ class Ds_point_model:
                 self.dict[cl] = []
             break
 
-        for cl in self.classes:
+        for cl in tqdm.tqdm(self.classes, "Generating dataset file list"):
             class_path = os.path.join(self.root, cl)
             for sub_rt, _, sub_files in os.walk(class_path):
                 for file in sub_files:
@@ -113,7 +114,7 @@ class Ds_point_sampled:
             self.save_all()
 
     def save_all(self):
-        for i in range(len(self.model)):
+        for i in tqdm.tqdm(range(len(self.model))):
             class_name, file_path = self.model[i]
             mesh = o3d.io.read_triangle_mesh(file_path)
             print(file_path)
@@ -141,3 +142,9 @@ class Ds_point_sampled:
                 count += 1
 
         return count
+
+
+if __name__ == "__main__":
+    
+    ds = Ds_point_sampled(Ds_point_model())
+    print(len(ds))

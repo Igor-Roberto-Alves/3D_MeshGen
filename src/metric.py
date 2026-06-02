@@ -2,8 +2,8 @@ import torch
 
 def chamfer_distance(pred, target, normal_weight=0.5):
     """
-    Versão Otimizada e Corrigida da Perda de Chamfer (XYZ + Normais).
-    Consumo de memória reduzido via expansão algébrica e livre de bugs de alinhamento.
+    Versão Estabilizada e Corrigida da Perda de Chamfer (XYZ + Normais).
+    Aplica raiz quadrada antes da média para estabilização de gradientes (L2 linear).
     
     pred, target: (B, N, 6) -> [X, Y, Z, Nx, Ny, Nz]
     """
@@ -15,18 +15,19 @@ def chamfer_distance(pred, target, normal_weight=0.5):
     pred_norm  = pred[..., 3:]
     target_norm = target[..., 3:]
 
-    # 1. Distância Euclidiana Otimizada (Evita OOM na GPU)
+    # 1. Distância Euclidiana Otimizada (Matriz de Distâncias Cruzadas)
     r_pred = torch.sum(pred_xyz ** 2, dim=-1, keepdim=True) 
     r_tgt  = torch.sum(target_xyz ** 2, dim=-1, keepdim=True)
     mul    = torch.bmm(pred_xyz, target_xyz.transpose(1, 2))
     dist   = r_pred - 2 * mul + r_tgt.transpose(1, 2)
     
-    # Garantir que imprecisões numéricas não criem distâncias negativas antes do argmin
+    # Garante estabilidade numérica contra valores ligeiramente negativos
     dist = torch.clamp(dist, min=0.0)
 
-    # 2. Encontrar os vizinhos mais próximos (Índices)
+    # 2. Encontrar os índices dos vizinhos mais próximos
     nn_pred_to_tgt = dist.argmin(dim=2)   # (B, N)
     nn_tgt_to_pred = dist.argmin(dim=1)   # (B, N)
+
 
     # 3. Coleta dos vizinhos geométricos correspondentes (XYZ)
     idx_xyz = nn_pred_to_tgt.unsqueeze(-1).expand(-1, -1, 3)

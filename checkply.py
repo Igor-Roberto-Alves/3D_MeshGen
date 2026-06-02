@@ -37,10 +37,10 @@ def verify_and_load_pcd(file_path):
         
     return pcd
 
-def compare_ply_contents(epoch_num, visualize=False):
+def compare_ply_contents(epoch_num, visualize=False, series="03624134"):
     # Gerar os caminhos para ambos os ficheiros
-    orig_path = f"reconstructions/epoch_{epoch_num}_03001627_ORIGINAL.ply"
-    rec_path  = f"reconstructions/epoch_{epoch_num}_03001627_RECONSTRUCTED.ply"
+    orig_path = f"reconstructions/epoch_{epoch_num}_{series}_ORIGINAL.ply"
+    rec_path  = f"reconstructions/epoch_{epoch_num}_{series}_RECONSTRUCTED.ply"
     
     print(f"\n--- [INFO] Checking Epoch {epoch_num} Data ---")
     pcd_orig = verify_and_load_pcd(orig_path)
@@ -92,8 +92,9 @@ if __name__ == "__main__":
         help="Set to True to pop up an interactive Open3D viewer window"
     )
     parser.add_argument("-e", "--epoch", type=str, default="1", help="Epoch value to inspect")
-    
+    parser.add_argument("-s", "--series", type=str, default="03624134", help="Class series identifier (default: 03624134)")
+
     args = parser.parse_args()
     
     # Executa a comparação direta
-    compare_ply_contents(args.epoch, visualize=args.visualize)
+    compare_ply_contents(args.epoch, visualize=args.visualize, series = args.series)

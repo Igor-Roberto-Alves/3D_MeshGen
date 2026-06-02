@@ -2,14 +2,30 @@ import torch
 import torch.nn as nn
 from typing import Tuple
 
+"""
+A little instruction about the data:
 
+The data is represented as a tensor of shape (B, N, 6), where:
+- B: Batch size (number of point clouds in the batch)
+- N: Number of points in each point cloud (e.g., 2048)
+- 6: Number of channels per point, where the first 3 channels are the XYZ
+    coordinates (absolute) and the next 3 channels are the normals
+
+Inspired in this representation of point clouds, 
+The Tokenizer are working in this way:
+"""
+
+
+# Collecting "mass points"
 
 def farthest_point_sampling(xyz: torch.Tensor, n_samples: int) -> torch.Tensor:
+
     """
     Iterative FPS on a batch of point clouds.
     xyz : (B, N, C)  — only the first 3 channels are used for distance.
     returns idx : (B, n_samples)  long indices into N
     """
+
     B, N, _ = xyz.shape
     device   = xyz.device
 
@@ -31,6 +47,7 @@ def farthest_point_sampling(xyz: torch.Tensor, n_samples: int) -> torch.Tensor:
 def knn_group(
     xyz: torch.Tensor, centers: torch.Tensor, k: int
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    
     """
     xyz     : (B, N, C)
     centers : (B, M, C)
@@ -58,20 +75,22 @@ def knn_group(
     return grouped, idx
 
 
+# PatchEmbed and PositionEncoding
 
 class PatchEmbed(nn.Module):
+
     """
     Dual-stream mini-PointNet otimizada e corrigida com LayerNorm.
     Input : (B, M, k, 6)  — [rel_xyz | normals]
     Output: (B, M, out_ch)
     """
+
     def __init__(self, in_ch: int = 6, out_ch: int = 256, k: int = 32):
         super().__init__()
         assert in_ch == 6, "PatchEmbed expects 6-channel input (xyz + normals)"
         half = out_ch // 2
 
-        # Stream A: Geometria local (XYZ Relativo + Distância)
-        # Adicionamos +1 canal para a distância euclidiana intrínseca
+
         self.geo_net = nn.Sequential(
             nn.Linear(3 + 1, half),
             nn.LayerNorm(half),
@@ -127,16 +146,18 @@ class PatchEmbed(nn.Module):
 
 
 class PositionalEncoding(nn.Module):
+
     """
     MLP positional encoding robusto. Mapia os centros XYZ para o d_model do Transformer.
     Input : (B, M, 3)  — XYZ absoluto dos centros dos patches
     Output: (B, M, d_model)
     """
+
     def __init__(self, d_model: int):
         super().__init__()
         self.mlp = nn.Sequential(
             nn.Linear(3, d_model),
-            nn.LayerNorm(d_model), # Adicionado para estabilizar a soma com os tokens
+            nn.LayerNorm(d_model), 
             nn.GELU(),
             nn.Linear(d_model, d_model),
         )

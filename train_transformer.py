@@ -3,7 +3,7 @@ import open3d as o3d
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
-from src.VQ_VAE import DualBranchPointVQVAE
+from src.Vae import DualBranchPointVAE
 from src.dataset import Ds_point_sampled, Ds_point_model
 from tqdm import tqdm
 
@@ -54,8 +54,8 @@ def log_codebook_usage(model: DualBranchPointVQVAE, xyz: torch.Tensor, device):
 # ── Training loop ─────────────────────────────────────────────────────────────
 
 
-def train_vqvae_gan_single_batch(
-    model: DualBranchPointVQVAE,
+def train_vae_gan_single_batch(
+    model: DualBranchPointVAE,
     dataset,
     num_epochs: int = 1000,
     batch_size: int = 16,
@@ -91,6 +91,7 @@ def train_vqvae_gan_single_batch(
     loop = tqdm(range(num_epochs), desc="VQ-VAE + GAN")
 
     for epoch in loop:
+        print(f"epoch {epoch}")
         model.train()
 
         # ── Passo D (discriminador) ───────────────────────────────────────
@@ -150,13 +151,13 @@ if __name__ == "__main__":
     o3d.utility.set_verbosity_level(o3d.utility.VerbosityLevel.Error)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    model = DualBranchPointVQVAE(
+    model = DualBranchPointVAE(
         d_model=512,
         latent_dim=512,
         n_embeddings=512,
         n_out=2048,
-        enc_depth=4,
-        dec_depth=4,
+        enc_depth=10,
+        dec_depth=10,
         n_heads=8,
         commitment_cost=0.25,
         ema_update=True,
@@ -164,4 +165,5 @@ if __name__ == "__main__":
     ).to(device)
 
     dataset = Ds_point_sampled(Ds_point_model())
-    train_vqvae_gan_single_batch(model, dataset, num_epochs=1000, batch_size=16)
+    
+    train_vqvae_gan_single_batch(model, dataset, num_epochs=1000, batch_size=1)
