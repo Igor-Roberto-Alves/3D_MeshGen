@@ -52,7 +52,23 @@ The model is the same as the first one, but with a more robust MLP decoder. The 
     <img src="imgs/ex1struc.png"  width = 230>
 </div>
 
-<div class="container-imagens">
-    <img src="imgs/ex2point.png" width = 230, height= 131>
-    <img src="imgs/ex2struc.png"  width = 230>
-</div>
+4 - Nksr Incorpore
+
+
+## History:
+
+### First: [A model can be finded in branch VIT_init]
+
+Simple VAE with PointNet encoder and PointNet decoder. The loss is the Chamfer Distance between the input point cloud and the output point cloud. The model is trained on the Shapenet dataset, only one batch for training.
+
+Results:
+
+![Example1](imgs/Captura%20de%20tela%20de%202026-05-31%2015-36-39.png)
+
+![Example2](imgs/Captura%20de%20tela%20de%202026-05-31%2017-27-38.png)
+
+----------------------------------------------------------------------------------------------------
+
+### Second: [A model can be finded in branch VQ-GAN]
+
+Not yet
