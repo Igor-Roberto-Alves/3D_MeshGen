@@ -121,12 +121,12 @@ class Ds_point_sampled:
             print(mesh)
             mesh.compute_vertex_normals()
             pcd = mesh.sample_points_uniformly(number_of_points=2048)
-            save_path = "point_clouds/" + f"{i}.ply"
+            save_path = "point_clouds/" + f"{class_name}_{i}.ply"
             o3d.io.write_point_cloud(save_path, pcd)
 
     def __getitem__(self, idx):
         class_name, file_path = self.model[idx]
-        file_path = "point_clouds/" + f"{idx}.ply"
+        file_path = "point_clouds/" + f"{class_name}_{idx}.ply"
         pcd = o3d.io.read_point_cloud(file_path)
 
         points = np.asarray(pcd.points, dtype=np.float32)
@@ -144,7 +144,32 @@ class Ds_point_sampled:
         return count
 
 
+class Ds_point_sampled_already:
+
+    def __init__(self, root="point_clouds"):
+        self.root = root
+        self.files = []
+        for rt, dirs, files in os.walk(root):
+            for file in files:
+                if file.endswith(".ply"):
+                    self.files.append(os.path.join(rt, file))
+
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, idx):
+        file_path = self.files[idx]
+        pcd = o3d.io.read_point_cloud(file_path)
+        class_name = os.path.basename(file_path).split("_")[0]
+
+        points = np.asarray(pcd.points, dtype=np.float32)
+        normals = np.asarray(pcd.normals, dtype=np.float32)
+        features = np.concatenate([points, normals], axis=1)
+
+        return class_name, torch.from_numpy(features)
+
+
 if __name__ == "__main__":
-    
+
     ds = Ds_point_sampled(Ds_point_model())
     print(len(ds))
