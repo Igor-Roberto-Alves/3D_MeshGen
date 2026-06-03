@@ -1,135 +1,140 @@
 import os
-import torch
-import open3d as o3d
+import argparse
 import numpy as np
+import open3d as o3d
+import torch
 from torch.utils.data import DataLoader
+from tqdm import tqdm
+
 from src.Vae import DualBranchPointVAE
-from src.dataset import Ds_point_sampled, Ds_point_model
+from src.dataset import Ds_point_sampled, Ds_point_model, Ds_point_sampled_already
 
-def force_overfit():
-    torch.manual_seed(42)
-    np.random.seed(42)
+
+def save_before_after(original_tensor, reconstructed_tensor, epoch, class_name):
+    os.makedirs("reconstructions_sanity", exist_ok=True)
+
+    # Coleta os dados direto no formato correto (N, 6)
+    orig = original_tensor.detach().cpu().numpy()
+    recon = reconstructed_tensor.detach().cpu().numpy()
+
+    pcd_orig = o3d.geometry.PointCloud()
+    pcd_orig.points = o3d.utility.Vector3dVector(orig[:, :3])
+    pcd_orig.normals = o3d.utility.Vector3dVector(orig[:, 3:])
+
+    pcd_recon = o3d.geometry.PointCloud()
+    pcd_recon.points = o3d.utility.Vector3dVector(recon[:, :3])
+    pcd_recon.normals = o3d.utility.Vector3dVector(recon[:, 3:])
+
+    path_orig = f"reconstructions_sanity/epoch_{epoch+1}_{class_name}_ORIGINAL.ply"
+    path_recon = (
+        f"reconstructions_sanity/epoch_{epoch+1}_{class_name}_RECONSTRUCTED.ply"
+    )
+
+    o3d.io.write_point_cloud(path_orig, pcd_orig)
+    o3d.io.write_point_cloud(path_recon, pcd_recon)
+    print(f"\n[VISUAL] Amostra salva em {path_orig} e {path_recon}")
+
+
+def run_sanity_check(
+    model: DualBranchPointVAE,
+    dataset,
+    num_epochs: int = 50,
+    batch_size: int = 16,
+    learning_rate: float = 1e-3,
+):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"[SANITY] Usando dispositivo: {device}")
+    model = model.to(device)
 
-    print("[SANITY] Instanciando o modelo com beta=0.0...")
-    model = DualBranchPointVAE(
-        d_model   = 384,
-        latent_dim= 1024*4,
-        n_out     = 2048, # <-- Investigando o impacto disso
-        enc_depth = 6,
-        dec_depth = 6,
-        n_heads   = 6,
-        beta      = 0.0,  
-    ).to(device)
+    # Criamos o dataloader apenas para puxar o primeiro lote
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
-    print("[SANITY] Carregando uma única amostra geométrica fixa...")
-    base_dataset = Ds_point_model()
-    dataset = Ds_point_sampled(base_dataset)
-    dataloader = DataLoader(dataset, batch_size=1, shuffle=False)
-    
-    class_name_list, fixed_pcd = next(iter(dataloader))
-    class_name = class_name_list[0]
-    
-    xyz_fixed = fixed_pcd.to(device).clone().detach()
-    
-    print(f"[SANITY] Dado fixado com sucesso. Classe: {class_name}")
+    print("\n" + "=" * 60)
+    print("[INFO] Coletando 1 único batch para o Overfitting de Sanidade...")
+    fixed_batch = next(iter(dataloader))
+    class_names, pcd_data = fixed_batch
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=2e-3)
+    # Trava os dados na GPU de forma estática
+    xyz = pcd_data.to(device)
+    target_class = class_names[0]
+    print(
+        f"[INFO] Batch coletado com sucesso! Classe da primeira amostra: '{target_class}'"
+    )
+    print("=" * 60 + "\n")
 
-    num_epochs = 7000
-    print(f"\n[SANITY] Iniciando loop de overfit por {num_epochs} épocas...")
-    
-    model.train()
-    for epoch in range(num_epochs):
+    # Usando AdamW que lida melhor com a estabilização de Transformers
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=learning_rate, weight_decay=1e-4
+    )
+
+    # O loop agora itera diretamente sobre as épocas, já que o lote é fixo
+    loop = tqdm(range(num_epochs), desc="Sanity Overfit")
+
+    for epoch in loop:
+        model.train()
         optimizer.zero_grad()
-        
-        out = model(xyz_fixed)              
-        
-        # ─── BLOCO DE INSPEÇÃO GEOMÉTRICA (RODA APENAS NA ÉPOCA 0) ───
-        if epoch == 0:
-            print("\n" + "="*50)
-            print("🕵️ ANÁLISE DE COMPATIBILIDADE DIMENSIONAL 🕵️")
-            print("="*50)
-            print(f"👉 DADO DE ENTRADA (xyz_fixed):")
-            print(f"   - Shape: {xyz_fixed.shape} -> Esperado: [Batch, N_pontos, Canais_coordenadas_e_normais]")
-            print(f"   - Tipo:  {xyz_fixed.dtype}")
-            print(f"   - Device: {xyz_fixed.device}")
-            print("-" * 50)
-            
-            # Investiga a estrutura do dicionário de saída
-            print(f"👉 DADO DE SAÍDA DO MODELO (out):")
-            print(f"   - Chaves geradas pelo modelo: {list(out.keys())}")
-            
-            if "recon" in out:
-                recon_tensor = out["recon"]
-                print(f"   - Shape de out['recon']: {recon_tensor.shape}")
-                print(f"   - Tipo de out['recon']:  {recon_tensor.dtype}")
-                print(f"   - Device de out['recon']: {recon_tensor.device}")
-                
-                # Verificação de compatibilidade direta
-                if recon_tensor.shape == xyz_fixed.shape:
-                    print("\n🟩 COMPATÍVEL: Os shapes de entrada e saída são idênticos!")
-                else:
-                    print("\n🟥 INCOMPATÍVEL: Os shapes de entrada e saída divergem!")
-                    print(f"   Diferença gritante: Entrada {list(xyz_fixed.shape)} vs Saída {list(recon_tensor.shape)}")
-                    print("   *Nota: Se a perda Chamfer não souber lidar com shapes diferentes internamente, ela falhará ou estagnará.*")
-            else:
-                print("🟥 ERRO CRÍTICO: A chave 'recon' não foi encontrada no output do modelo.")
-            print("="*50 + "\n")
-        # ─────────────────────────────────────────────────────────────
 
-        loss_dict = model.loss(out, xyz_fixed)
-        
+        # Forward pass no lote estático
+        out = model(xyz)
+
+        # Cálculo da Loss interna (Chamfer + KL)
+        loss_dict = model.loss(out, xyz)
+
         loss_dict["total"].backward()
         optimizer.step()
 
-        if (epoch + 1) % 10 == 0 or epoch == 0:
-            print(
-                f"Época [{epoch + 1:03d}/{num_epochs}] -> "
-                f"Loss Total (CD): {loss_dict['total'].item():.6f} | "
-                f"CD Pura: {loss_dict['cd'].item():.6f} | "
-                f"KL (Ignorada): {loss_dict['kl'].item():.4f}"
-            )
+        # Atualiza a barra de progresso instantaneamente
+        loop.set_postfix(
+            loss=f"{loss_dict['total'].item():.4f}",
+            cd=f"{loss_dict['cd'].item():.4f}",
+            kl=f"{loss_dict['kl'].item():.4f}",
+        )
 
-    print("\n[SANITY] Treinamento de sanidade concluído!")
-    
-    model.eval()
-    with torch.no_grad():
-        final_out = model(xyz_fixed)
-        final_recon = final_out["recon"]
+        # Salva amostras visuais no início, a cada 10 épocas e na última
+        if epoch == 0 or (epoch + 1) % 10 == 0 or (epoch + 1) == num_epochs:
+            save_before_after(xyz[0], out["recon"][0], epoch, f"sanity_{target_class}")
 
-    os.makedirs("sanity_results", exist_ok=True)
-    
-    orig_np = xyz_fixed[0].cpu().numpy()
-    recon_np = final_recon[0].cpu().numpy()
+    print("\n" + "=" * 60)
+    print("[SUCESSO] Teste de Sanidade Concluído!")
+    print("[DICA] Verifique a pasta 'reconstructions_sanity' para avaliar o Overfit.")
+    print("=" * 60 + "\n")
 
-    # Tratamento dinâmico para evitar crashes caso as dimensões de saída estejam quebradas (ex: achatadas em 1D ou 2D)
-    pcd_orig = o3d.geometry.PointCloud()
-    if len(orig_np.shape) == 2 and orig_np.shape[1] >= 3:
-        pcd_orig.points = o3d.utility.Vector3dVector(orig_np[:, :3])
-        if orig_np.shape[1] >= 6:
-            pcd_orig.normals = o3d.utility.Vector3dVector(orig_np[:, 3:])
-
-    pcd_recon = o3d.geometry.PointCloud()
-    if len(recon_np.shape) == 2 and recon_np.shape[1] >= 3:
-        pcd_recon.points = o3d.utility.Vector3dVector(recon_np[:, :3])
-        if recon_np.shape[1] >= 6:
-            pcd_recon.normals = o3d.utility.Vector3dVector(recon_np[:, 3:])
-    elif len(recon_np.shape) == 1:
-         print(f"⚠️ [AVISO] O dado de saída está achatado (1D) com tamanho {recon_np.shape}. Tentando redimensionar para XYZ...")
-         try:
-             recon_np_reshaped = recon_np.reshape(-1, 6)
-             pcd_recon.points = o3d.utility.Vector3dVector(recon_np_reshaped[:, :3])
-             pcd_recon.normals = o3d.utility.Vector3dVector(recon_np_reshaped[:, 3:])
-         except Exception as e:
-             print(f"Não foi possível converter a saída para pontos 3D: {e}")
-
-    o3d.io.write_point_cloud("sanity_results/SANITY_ORIGINAL.ply", pcd_orig)
-    o3d.io.write_point_cloud("sanity_results/SANITY_OVERFITTED.ply", pcd_recon)
-    
-    print("[INFO] Arquivos de sanidade salvos na pasta 'sanity_results/'.")
 
 if __name__ == "__main__":
     o3d.utility.set_verbosity_level(o3d.utility.VerbosityLevel.Error)
-    force_overfit()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    parser = argparse.ArgumentParser(description="Dataset Sanity Check.")
+    parser.add_argument(
+        "-d",
+        "--dataset",
+        type=int,
+        default=False,
+        help="1 if dataset is charged, 0 if not",
+    )
+
+    # Inicializa o modelo com os mesmos hiperparâmetros do treino real
+    model = DualBranchPointVAE(
+        d_model=384,
+        latent_dim=512,
+        n_out=2048,
+        enc_depth=8,
+        dec_depth=4,
+        n_heads=6,
+        beta=0,
+    ).to(device)
+
+    if parser.parse_args().dataset:
+        print("[INFO] Carregando dataset pré-processado...")
+        dataset = Ds_point_sampled_already()
+    else:
+        print("[INFO] Processando nuvens de pontos originais...")
+        dataset = Ds_point_sampled(Ds_point_model())
+
+    # Executa o teste controlado
+    run_sanity_check(
+        model=model,
+        dataset=dataset,
+        num_epochs=150,  # 50 épocas são mais que suficientes para esmagar 1 único batch
+        batch_size=1,
+        learning_rate=1e-3,
+    )

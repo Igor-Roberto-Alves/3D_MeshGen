@@ -18,8 +18,8 @@ The Tokenizer are working in this way:
 
 # Collecting "mass points"
 
-def farthest_point_sampling(xyz: torch.Tensor, n_samples: int) -> torch.Tensor:
 
+def farthest_point_sampling(xyz: torch.Tensor, n_samples: int) -> torch.Tensor:
     """
     Iterative FPS on a batch of point clouds.
     xyz : (B, N, C)  — only the first 3 channels are used for distance.
@@ -27,27 +27,25 @@ def farthest_point_sampling(xyz: torch.Tensor, n_samples: int) -> torch.Tensor:
     """
 
     B, N, _ = xyz.shape
-    device   = xyz.device
+    device = xyz.device
 
-    idx      = torch.zeros(B, n_samples, dtype=torch.long, device=device)
-    dist     = torch.full((B, N), 1e10, device=device)
+    idx = torch.zeros(B, n_samples, dtype=torch.long, device=device)
+    dist = torch.full((B, N), 1e10, device=device)
     centroid = torch.randint(0, N, (B,), device=device)
 
     for i in range(n_samples):
         idx[:, i] = centroid
-        c    = xyz[torch.arange(B, device=device), centroid, :3].unsqueeze(1)  # (B,1,3)
-        d    = ((xyz[..., :3] - c) ** 2).sum(-1)                               # (B,N)
+        c = xyz[torch.arange(B, device=device), centroid, :3].unsqueeze(1)  # (B,1,3)
+        d = ((xyz[..., :3] - c) ** 2).sum(-1)  # (B,N)
         dist = torch.min(dist, d)
         centroid = dist.argmax(dim=-1)
 
     return idx
 
 
-
 def knn_group(
     xyz: torch.Tensor, centers: torch.Tensor, k: int
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    
     """
     xyz     : (B, N, C)
     centers : (B, M, C)
@@ -56,17 +54,17 @@ def knn_group(
         idx     : (B, M, k)
     """
     B, _, C = xyz.shape
-    M       = centers.shape[1]
+    M = centers.shape[1]
 
     # Spatial-only pairwise distances
-    diff    = centers[..., :3].unsqueeze(2) - xyz[..., :3].unsqueeze(1)  # (B,M,N,3)
-    sq_dist = (diff ** 2).sum(-1)                                         # (B,M,N)
-    idx     = sq_dist.topk(k, largest=False, dim=-1).indices              # (B,M,k)
+    diff = centers[..., :3].unsqueeze(2) - xyz[..., :3].unsqueeze(1)  # (B,M,N,3)
+    sq_dist = (diff**2).sum(-1)  # (B,M,N)
+    idx = sq_dist.topk(k, largest=False, dim=-1).indices  # (B,M,k)
 
     # Gather all C channels for the k neighbours
-    idx_flat = idx.reshape(B, -1)                                         # (B, M*k)
-    pts      = torch.gather(xyz, 1, idx_flat.unsqueeze(-1).expand(-1, -1, C))
-    grouped  = pts.reshape(B, M, k, C)                                    # (B,M,k,C)
+    idx_flat = idx.reshape(B, -1)  # (B, M*k)
+    pts = torch.gather(xyz, 1, idx_flat.unsqueeze(-1).expand(-1, -1, C))
+    grouped = pts.reshape(B, M, k, C)  # (B,M,k,C)
 
     # Relative XYZ only — normals are left absolute
     grouped = grouped.clone()
@@ -77,8 +75,8 @@ def knn_group(
 
 # PatchEmbed and PositionEncoding
 
-class PatchEmbed(nn.Module):
 
+class PatchEmbed(nn.Module):
     """
     Dual-stream mini-PointNet otimizada e corrigida com LayerNorm.
     Input : (B, M, k, 6)  — [rel_xyz | normals]
@@ -89,7 +87,6 @@ class PatchEmbed(nn.Module):
         super().__init__()
         assert in_ch == 6, "PatchEmbed expects 6-channel input (xyz + normals)"
         half = out_ch // 2
-
 
         self.geo_net = nn.Sequential(
             nn.Linear(3 + 1, half),
@@ -115,7 +112,9 @@ class PatchEmbed(nn.Module):
             nn.Linear(out_ch, out_ch),
             nn.LayerNorm(out_ch),
             nn.GELU(),
-            nn.Linear(out_ch, out_ch), # Camada extra para dar capacidade não-linear ao Token
+            nn.Linear(
+                out_ch, out_ch
+            ),  # Camada extra para dar capacidade não-linear ao Token
         )
 
         self.k = k
@@ -129,8 +128,8 @@ class PatchEmbed(nn.Module):
         normals = grouped[..., 3:]  # (B, M, k, 3)
 
         # 1. Calcular a distância euclidiana ao quadrado como feature geométrica extra
-        dist = torch.sum(xyz_rel ** 2, dim=-1, keepdim=True) # (B, M, k, 1)
-        geo_input = torch.cat([xyz_rel, dist], dim=-1)       # (B, M, k, 4)
+        dist = torch.sum(xyz_rel**2, dim=-1, keepdim=True)  # (B, M, k, 1)
+        geo_input = torch.cat([xyz_rel, dist], dim=-1)  # (B, M, k, 4)
 
         # 2. Passar as correntes mantendo as dimensões estruturadas para o LayerNorm
         geo_feat = self.geo_net(geo_input)  # (B, M, k, half)
@@ -138,7 +137,7 @@ class PatchEmbed(nn.Module):
 
         # 3. Concatenar os canais (half + half = out_ch)
         fused = torch.cat([geo_feat, norm_feat], dim=-1)  # (B, M, k, out_ch)
-        fused = self.fuse(fused)                          # (B, M, k, out_ch)
+        fused = self.fuse(fused)  # (B, M, k, out_ch)
 
         # 4. Max-pooling sobre a dimensão dos k vizinhos
         token = fused.max(dim=2).values  # (B, M, out_ch)
@@ -146,7 +145,6 @@ class PatchEmbed(nn.Module):
 
 
 class PositionalEncoding(nn.Module):
-
     """
     MLP positional encoding robusto. Mapia os centros XYZ para o d_model do Transformer.
     Input : (B, M, 3)  — XYZ absoluto dos centros dos patches
@@ -157,7 +155,7 @@ class PositionalEncoding(nn.Module):
         super().__init__()
         self.mlp = nn.Sequential(
             nn.Linear(3, d_model),
-            nn.LayerNorm(d_model), 
+            nn.LayerNorm(d_model),
             nn.GELU(),
             nn.Linear(d_model, d_model),
         )

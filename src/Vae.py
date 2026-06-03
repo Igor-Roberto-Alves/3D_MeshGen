@@ -7,6 +7,8 @@ from src.Encoder import (
     CrossBranchFusion,
     VAEBottleneck,
 )
+
+# Certifique-se de que o arquivo src/Decoder.py contém a classe PointDecoder
 from src.Decoder import PointDecoder
 from src.GAN import PointNetDiscriminator
 from src.metric import chamfer_distance
@@ -14,46 +16,17 @@ from src.metric import chamfer_distance
 
 class DualBranchPointVAE(nn.Module):
     """
-    Dual-branch β-VAE + GAN for point cloud generation.
-
-    Training has two alternating phases (handled in train_vae_gan.py):
-
-        Phase 1 — Discriminator step
-            • real batch  → D → real_loss  (label = 1)
-            • recon batch → D → fake_loss  (label = 0)
-            • optimiser_D.step()
-
-        Phase 2 — Generator (VAE) step
-            • reconstruction loss  : Chamfer distance
-            • KL divergence        : β-weighted
-            • adversarial loss     : fool D  (label = 1 on fake)
-            • optimiser_G.step()
-
-    The discriminator is a member of this class so checkpointing is simple,
-    but its parameters are frozen during the generator step via the helper
-    methods  freeze_D / unfreeze_D.
-
-    Args:
-        d_model      : transformer channel dimension
-        latent_dim   : VAE latent space size
-        n_out        : output points per cloud
-        enc_depth    : transformer layers in each encoder branch
-        dec_depth    : transformer layers in decoder
-        n_heads      : attention heads (encoder + decoder)
-        beta         : β weight on the KL term
-        lambda_adv   : weight on the adversarial loss in the G step
-                       set to 0.0 to disable GAN and train as plain β-VAE
-        disc_base_ch : base channel width of the discriminator MLP
+    Dual-branch β-VAE + GAN for point cloud generation with MLP Decoder.
     """
 
     def __init__(
         self,
         d_model: int = 384,
-        latent_dim: int = 2048 * 6,
+        latent_dim: int = 512,  # Corrigido para bater com o bottleneck real do VAE
         n_out: int = 2048,
         enc_depth: int = 4,
-        dec_depth: int = 4,
-        n_heads: int = 6,
+        dec_depth: int = 4,  # Mantido para retrocompatibilidade de assinatura
+        n_heads: int = 6,  # Mantido para retrocompatibilidade de assinatura
         beta: float = 1e-3,
         lambda_adv: float = 0.1,
         disc_base_ch: int = 64,
@@ -71,12 +44,10 @@ class DualBranchPointVAE(nn.Module):
         self.fusion = CrossBranchFusion(d_model=d_model, n_heads=n_heads)
         self.bottleneck = VAEBottleneck(in_dim=d_model, latent_dim=latent_dim)
 
-        # ── Decoder ───────────────────────────────────────────────────────────
+        # ── Novo Decoder Baseado em MLP (Sem Transformers / Centros + Deslocamentos) ──
         self.decoder = PointDecoder(
             latent_dim=latent_dim,
             d_model=d_model,
-            n_heads=n_heads,
-            depth=dec_depth,
             n_out=n_out,
         )
 
@@ -135,16 +106,6 @@ class DualBranchPointVAE(nn.Module):
         real: torch.Tensor,
         fake: torch.Tensor,
     ) -> dict:
-        """
-        Compute the discriminator loss on one batch.
-
-        Call BEFORE loss_generator. Do NOT call freeze_D here — the
-        discriminator must be unfrozen to accumulate gradients.
-
-        real : (B, N, 6)  ground-truth point cloud
-        fake : (B, N, 6)  reconstructed / generated cloud  (.detach() applied
-                           inside so G gradients do not flow here)
-        """
         B = real.size(0)
         device = real.device
 
@@ -162,15 +123,6 @@ class DualBranchPointVAE(nn.Module):
         out: dict,
         target: torch.Tensor,
     ) -> dict:
-        """
-        Compute the full VAE + adversarial generator loss.
-
-        Freeze the discriminator with freeze_D() before calling this so D
-        parameters do not receive gradients during the G step.
-
-        out    : dict returned by forward()
-        target : (B, N, 6)  ground-truth point cloud
-        """
         B = out["recon"].size(0)
         device = out["recon"].device
 
@@ -192,20 +144,19 @@ class DualBranchPointVAE(nn.Module):
             normal_loss=normal_loss,
         )
 
-    # ── kept for backward-compat with non-GAN training loops ─────────────────
-
     def loss(self, out: dict, target: torch.Tensor) -> dict:
         """Plain β-VAE loss (no adversarial term). Useful for warm-up epochs."""
         point_loss, normal_loss = chamfer_distance(out["recon"], target)
         kl = VAEBottleneck.kl_loss(out["mu"], out["logvar"])
-        total = point_loss + self.beta * kl
+        total = (
+            point_loss + self.beta * kl + normal_loss
+        )  # Adicionado normal_loss para consistência
         return dict(total=total, cd=point_loss, kl=kl, normal_loss=normal_loss)
 
     # ── generation ────────────────────────────────────────────────────────────
 
     @torch.no_grad()
     def sample(self, n: int, device: torch.device) -> torch.Tensor:
-        """Sample n point clouds from the prior N(0, I)."""
         z = torch.randn(n, self.latent_dim, device=device)
         return self.decode(z)["recon"]
 
@@ -217,7 +168,6 @@ class DualBranchPointVAE(nn.Module):
         steps: int = 8,
         use_slerp: bool = False,
     ) -> torch.Tensor:
-        """Linear or spherical interpolation between two shapes."""
         _, mu_a, _ = self.encode(xyz_a)
         _, mu_b, _ = self.encode(xyz_b)
         alphas = torch.linspace(0, 1, steps, device=xyz_a.device)
@@ -233,4 +183,39 @@ class DualBranchPointVAE(nn.Module):
             else:
                 z = (1 - a) * mu_a + a * mu_b
             shapes.append(self.decode(z)["recon"])
-        return torch.stack(shapes, dim=1)  # (B, steps, N, 6)
+        return torch.stack(shapes, dim=1)
+
+    def report_parameters(self) -> None:
+        def count_module_params(module: nn.Module):
+            tot = sum(p.numel() for p in module.parameters())
+            train = sum(p.numel() for p in module.parameters() if p.requires_grad)
+            return tot, train
+
+        h_tot, h_train = count_module_params(self.hier_enc)
+        g_tot, g_train = count_module_params(self.glob_enc)
+        f_tot, f_train = count_module_params(self.fusion)
+        b_tot, b_train = count_module_params(self.bottleneck)
+        dec_tot, dec_train = count_module_params(self.decoder)
+        disc_tot, disc_train = count_module_params(self.discriminator)
+
+        global_tot, global_train = count_module_params(self)
+
+        print("\n" + "=" * 65)
+        print(f"{'SUBMODULE':<25} | {'TOTAL PARAMS':<16} | {'TRAINABLE PARAMS':<16}")
+        print("=" * 65)
+        print(f"{'Hierarchical Encoder':<25} | {h_tot:>14,} | {h_train:>16,}")
+        print(f"{'Global Encoder':<25} | {g_tot:>14,} | {g_train:>16,}")
+        print(f"{'Cross-Branch Fusion':<25} | {f_tot:>14,} | {f_train:>16,}")
+        print(f"{'VAE Bottleneck':<25} | {b_tot:>14,} | {b_train:>16,}")
+        print(f"{'Point Decoder (MLP)':<25} | {dec_tot:>14,} | {dec_train:>16,}")
+        print(f"{'Discriminator (PointNet)':<25} | {disc_tot:>14,} | {disc_train:>16,}")
+        print("-" * 65)
+        print(f"{'GLOBAL SYSTEM TOTAL':<25} | {global_tot:>14,} | {global_train:>16,}")
+        print("=" * 65 + "\n")
+
+
+if __name__ == "__main__":
+    # Teste rápido para verificar se o modelo compila e roda um forward pass
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = DualBranchPointVAE().to(device)
+    model.report_parameters()

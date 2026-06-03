@@ -1,7 +1,12 @@
 from torch import nn
 import torch
 from typing import Tuple, Optional
-from src.Tokenizer import PatchEmbed, PositionalEncoding, farthest_point_sampling, knn_group
+from src.Tokenizer import (
+    PatchEmbed,
+    PositionalEncoding,
+    farthest_point_sampling,
+    knn_group,
+)
 
 
 class TransformerBlock(nn.Module):
@@ -33,6 +38,7 @@ class TransformerBlock(nn.Module):
 
 
 # ── Blue Branch ───────────────────────────────────────────────────────────────
+
 
 class HierarchicalEncoder(nn.Module):
     """
@@ -71,6 +77,7 @@ class HierarchicalEncoder(nn.Module):
         feat_global : (B, d_model)
         centers     : (B, M_total, 3)
         """
+
         all_tokens, all_centers_xyz = [], []
 
         for i, lv in enumerate(self.LEVELS):
@@ -81,7 +88,7 @@ class HierarchicalEncoder(nn.Module):
             grouped, _ = knn_group(xyz, centers, lv["k"])
             tokens = self.embeds[i](grouped) + self.pos_encs[i](centers[..., :3])
             all_tokens.append(tokens)
-            all_centers_xyz.append(centers[..., :3])   # store xyz only (Bug 7 fix)
+            all_centers_xyz.append(centers[..., :3])
 
         # Encode each level independently through the shared transformer blocks
         encoded_levels = []
@@ -89,17 +96,18 @@ class HierarchicalEncoder(nn.Module):
             t = all_tokens[i]
             for blk in self.blocks:
                 t = blk(t)
-            encoded_levels.append(t)   # (B, M_level, d_model)
+            encoded_levels.append(t)  # (B, M_level, d_model)
 
         # Max-pool each level → (B, d_model), concat → proj → norm  (Bug 6 fix)
         level_globals = [t.max(dim=1).values for t in encoded_levels]
         feat_global = self.norm(self.proj(torch.cat(level_globals, dim=-1)))
 
-        centers = torch.cat(all_centers_xyz, dim=1)   # (B, M_total, 3)
+        centers = torch.cat(all_centers_xyz, dim=1)  # (B, M_total, 3)
         return feat_global, centers
 
 
 # ── Green Branch ─────────────────────────────────────────────────────────────
+
 
 class GlobalEncoder(nn.Module):
     """Single-level FPS grouping + transformer. Captures global shape context."""
@@ -125,17 +133,16 @@ class GlobalEncoder(nn.Module):
     def forward(self, xyz: torch.Tensor) -> torch.Tensor:
         """xyz : (B, N, 6)  →  (B, d_model)"""
         idx = farthest_point_sampling(xyz, self.n_tokens)
-        centers = torch.gather(
-            xyz, 1, idx.unsqueeze(-1).expand(-1, -1, xyz.shape[-1])
-        )
+        centers = torch.gather(xyz, 1, idx.unsqueeze(-1).expand(-1, -1, xyz.shape[-1]))
         grouped, _ = knn_group(xyz, centers, k=self.k)
         tokens = self.embed(grouped) + self.pos_enc(centers[..., :3])
         for blk in self.blocks:
             tokens = blk(tokens)
-        return self.norm(tokens.max(dim=1).values)   # (B, d_model)
+        return self.norm(tokens.max(dim=1).values)  # (B, d_model)
 
 
 # ── Cross-attention used in CrossBranchFusion ─────────────────────────────────
+
 
 class Attention(nn.Module):
     """
@@ -156,12 +163,12 @@ class Attention(nn.Module):
         super().__init__()
         self.num_heads = num_heads
         head_dim = dim // num_heads
-        self.scale = qk_scale or head_dim ** -0.5
+        self.scale = qk_scale or head_dim**-0.5
 
-        self.q  = nn.Linear(dim, dim, bias=qkv_bias)
+        self.q = nn.Linear(dim, dim, bias=qkv_bias)
         self.kv = nn.Linear(dim, dim * 2, bias=qkv_bias)
         self.attn_drop = nn.Dropout(attn_drop)
-        self.proj      = nn.Linear(dim, dim)
+        self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
 
     def forward(
@@ -201,6 +208,7 @@ class Attention(nn.Module):
 
 # ── Cross-Branch Fusion ───────────────────────────────────────────────────────
 
+
 class CrossBranchFusion(nn.Module):
     """
     Fuses hierarchical (h) and global (g) descriptors in two stages:
@@ -220,10 +228,10 @@ class CrossBranchFusion(nn.Module):
     def __init__(self, d_model: int, n_heads: int = 8, **kwargs):
         super().__init__()
         # Pre-LN for the cross-attention inputs
-        self.norm_h   = nn.LayerNorm(d_model)
-        self.norm_g   = nn.LayerNorm(d_model)
-        self.attn     = Attention(d_model, num_heads=n_heads)
-        self.norm_mid = nn.LayerNorm(d_model)   # after attn residual
+        self.norm_h = nn.LayerNorm(d_model)
+        self.norm_g = nn.LayerNorm(d_model)
+        self.attn = Attention(d_model, num_heads=n_heads)
+        self.norm_mid = nn.LayerNorm(d_model)  # after attn residual
 
         # MLP stage
         self.fusion_mlp = nn.Sequential(
@@ -240,37 +248,39 @@ class CrossBranchFusion(nn.Module):
         Returns fused (B, d_model)
         """
         # Attention operates on sequences; lift (B, C) → (B, 1, C)
-        h_seq = self.norm_h(h).unsqueeze(1)   # (B, 1, d_model)  query
-        g_seq = self.norm_g(g).unsqueeze(1)   # (B, 1, d_model)  key / value
+        h_seq = self.norm_h(h).unsqueeze(1)  # (B, 1, d_model)  query
+        g_seq = self.norm_g(g).unsqueeze(1)  # (B, 1, d_model)  key / value
 
         # Stage 1: h attends to g, residual on h
-        attended = self.attn(h_seq, y=g_seq).squeeze(1)   # (B, d_model)
-        attended = self.norm_mid(attended + h)             # (B, d_model)
+        attended = self.attn(h_seq, y=g_seq).squeeze(1)  # (B, d_model)
+        attended = self.norm_mid(attended + h)  # (B, d_model)
 
         # Stage 2: MLP mix, residual on g
-        fused = self.fusion_mlp(torch.cat([attended, g], dim=-1))   # (B, d_model)
+        fused = self.fusion_mlp(torch.cat([attended, g], dim=-1))  # (B, d_model)
         return self.norm_out(fused + g)
 
 
 # ── VAE Bottleneck ────────────────────────────────────────────────────────────
 
+
 class VAEBottleneck(nn.Module):
     def __init__(self, in_dim: int, latent_dim: int):
         super().__init__()
-        self.fc_mu     = nn.Linear(in_dim, latent_dim)
+        self.fc_mu = nn.Linear(in_dim, latent_dim)
         self.fc_logvar = nn.Linear(in_dim, latent_dim)
 
     def forward(
         self, x: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        mu     = self.fc_mu(x)
+        mu = self.fc_mu(x)
         logvar = self.fc_logvar(x).clamp(-10, 10)
-        std    = torch.exp(0.5 * logvar)
-        eps    = torch.randn_like(std)
-        z      = mu + eps * std   # reparametrisation
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        z = mu + eps * std  # reparametrisation
         return z, mu, logvar
 
     @staticmethod
     def kl_loss(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
         """KL( N(μ,σ²) ‖ N(0,1) ) averaged over the batch."""
+
         return -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
