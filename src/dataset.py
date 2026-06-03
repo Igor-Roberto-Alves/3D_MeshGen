@@ -2,6 +2,7 @@ import os
 import open3d as o3d
 import numpy as np
 import torch
+import tqdm
 
 
 class Ds_point_model:
@@ -22,7 +23,7 @@ class Ds_point_model:
                 self.dict[cl] = []
             break
 
-        for cl in self.classes:
+        for cl in tqdm.tqdm(self.classes, "Generating dataset file list"):
             class_path = os.path.join(self.root, cl)
             for sub_rt, _, sub_files in os.walk(class_path):
                 for file in sub_files:
@@ -113,19 +114,19 @@ class Ds_point_sampled:
             self.save_all()
 
     def save_all(self):
-        for i in range(len(self.model)):
+        for i in tqdm.tqdm(range(len(self.model))):
             class_name, file_path = self.model[i]
             mesh = o3d.io.read_triangle_mesh(file_path)
             print(file_path)
             print(mesh)
             mesh.compute_vertex_normals()
             pcd = mesh.sample_points_uniformly(number_of_points=2048)
-            save_path = "point_clouds/" + f"{i}.ply"
+            save_path = "point_clouds/" + f"{class_name}_{i}.ply"
             o3d.io.write_point_cloud(save_path, pcd)
 
     def __getitem__(self, idx):
         class_name, file_path = self.model[idx]
-        file_path = "point_clouds/" + f"{idx}.ply"
+        file_path = "point_clouds/" + f"{class_name}_{idx}.ply"
         pcd = o3d.io.read_point_cloud(file_path)
 
         points = np.asarray(pcd.points, dtype=np.float32)
@@ -141,3 +142,34 @@ class Ds_point_sampled:
                 count += 1
 
         return count
+
+
+class Ds_point_sampled_already:
+
+    def __init__(self, root="point_clouds"):
+        self.root = root
+        self.files = []
+        for rt, dirs, files in os.walk(root):
+            for file in files:
+                if file.endswith(".ply"):
+                    self.files.append(os.path.join(rt, file))
+
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, idx):
+        file_path = self.files[idx]
+        pcd = o3d.io.read_point_cloud(file_path)
+        class_name = os.path.basename(file_path).split("_")[0]
+
+        points = np.asarray(pcd.points, dtype=np.float32)
+        normals = np.asarray(pcd.normals, dtype=np.float32)
+        features = np.concatenate([points, normals], axis=1)
+
+        return class_name, torch.from_numpy(features)
+
+
+if __name__ == "__main__":
+
+    ds = Ds_point_sampled(Ds_point_model())
+    print(len(ds))
