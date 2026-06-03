@@ -5,24 +5,27 @@ A Diffuse Latent Model in Shapenet dataset
 
 ## Current State
 
-Example 1:
+<div class="container-imagens">
+    <img src="imgs/ex1point.png" width = 230>
+    <img src="imgs/ex1struc.png"  width = 230>
+</div>
 
-![Example1](imgs/Captura%20de%20tela%20de%202026-05-31%2015-36-39.png)
-
-Example 2:
-
-![Example2](imgs/Captura%20de%20tela%20de%202026-05-31%2017-27-38.png)
-
+<div class="container-imagens">
+    <img src="imgs/ex2point.png" width = 230, height= 131>
+    <img src="imgs/ex2struc.png"  width = 230>
+</div>
 
 ## I need To
 
-1 - Solve Loss Stagnation
+1 - Solve Loss Stagnation (Normals) (EMD)
 
-2 - Solve KL Collapse
+2 - Take care with KL collapse
 
-3 - Init Diffuse
+3 - Init Gan structure
 
-4 - Nksr Incorpore
+4 - Init Diffuse Latent
+
+5 - Nksr Incorpore
 
 
 ## History:
@@ -39,6 +42,17 @@ Results:
 
 ----------------------------------------------------------------------------------------------------
 
-### Second: [A model can be finded in branch VQ-GAN]
+### Second: [A model can be finded in branch test]
 
-Not yet
+The model is the same as the first one, but with a more robust MLP decoder. The loss is the Chamfer Distance between the input point cloud and the output point cloud. The model is trained on the Shapenet dataset, only one batch for training.
+
+
+<div class="container-imagens">
+    <img src="imgs/ex1point.png" width = 230>
+    <img src="imgs/ex1struc.png"  width = 230>
+</div>
+
+<div class="container-imagens">
+    <img src="imgs/ex2point.png" width = 230, height= 131>
+    <img src="imgs/ex2struc.png"  width = 230>
+</div>
