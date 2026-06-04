@@ -8,25 +8,31 @@ from src.Encoder import (
     VAEBottleneck,
 )
 
-# Certifique-se de que o arquivo src/Decoder.py contém a classe PointDecoder
-from src.Decoder import PointDecoder
+# Keep your original GAN and loss modules
 from src.GAN import PointNetDiscriminator
 from src.metric import chamfer_distance, earth_movers_distance_sinkhorn
 
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from src.LionDecoder import *
+
+
+
 class DualBranchPointVAE(nn.Module):
     """
-    Dual-branch β-VAE + GAN for point cloud generation with MLP Decoder.
+    Dual-branch β-VAE + GAN for point cloud generation with MiniLion Decoder.
     """
 
     def __init__(
         self,
         d_model: int = 384,
-        latent_dim: int = 512,  # Corrigido para bater com o bottleneck real do VAE
+        latent_dim: int = 512,
         n_out: int = 2048,
         enc_depth: int = 4,
-        dec_depth: int = 4,  # Mantido para retrocompatibilidade de assinatura
-        n_heads: int = 6,  # Mantido para retrocompatibilidade de assinatura
+        dec_depth: int = 4,  # Kept for signature backward compatibility
+        n_heads: int = 6,    # Kept for signature backward compatibility
         beta: float = 1e-3,
         lambda_adv: float = 0.1,
         disc_base_ch: int = 64,
@@ -44,11 +50,12 @@ class DualBranchPointVAE(nn.Module):
         self.fusion = CrossBranchFusion(d_model=d_model, n_heads=n_heads)
         self.bottleneck = VAEBottleneck(in_dim=d_model, latent_dim=latent_dim)
 
-        # ── Novo Decoder Baseado em MLP (Sem Transformers / Centros + Deslocamentos) ──
-        self.decoder = PointDecoder(
+        # ── INTEGRATED: New LION Style/AdaGN-based Decoder ────────────────────
+        self.decoder = NvidiaStyleLatentDecoder(
             latent_dim=latent_dim,
-            d_model=d_model,
+            style_dim=d_model,
             n_out=n_out,
+            n_seed=256,  # Can be tuned for quality/speed trade-off
         )
 
         # ── Discriminator ─────────────────────────────────────────────────────
@@ -77,28 +84,30 @@ class DualBranchPointVAE(nn.Module):
 
     def encode(
         self, xyz: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         h_feat, _ = self.hier_enc(xyz)
-        g_feat = self.glob_enc(xyz)
+        g_feat = self.glob_enc(xyz)  # <--- Este é o seu STYLE original (B, d_model)
+        
         fused = self.fusion(h_feat, g_feat)
         z, mu, logvar = self.bottleneck(fused)
-        return z, mu, logvar
+        
+        return z, mu, logvar, g_feat  # <--- Passamos o g_feat para fora
 
-    def decode(self, z: torch.Tensor) -> dict:
-        return self.decoder(z)
+    def decode(self, z: torch.Tensor, style: torch.Tensor) -> dict:
+        # O novo decoder precisa receber tanto o z (pontos latentes) quanto o style
+        return self.decoder(z_local=z, style=style)
 
     # ── forward ───────────────────────────────────────────────────────────────
 
     def forward(self, xyz: torch.Tensor) -> dict:
-        z, mu, logvar = self.encode(xyz)
-        decoder_out = self.decode(z)
+        z, mu, logvar, style = self.encode(xyz) # <--- Captura o style aqui
+        decoder_out = self.decode(z, style)     # <--- Passa o style para o decode
         return dict(
             recon=decoder_out["recon"],
             z=z,
             mu=mu,
             logvar=logvar,
         )
-
     # ── losses ────────────────────────────────────────────────────────────────
 
     def loss_discriminator(
@@ -106,16 +115,14 @@ class DualBranchPointVAE(nn.Module):
         real: torch.Tensor,
         fake: torch.Tensor,
     ) -> dict:
-        B = real.size(0)
-        device = real.device
+        # Usando Hinge Loss para o Discriminador
+        d_real_logits = self.discriminator(real)
+        d_fake_logits = self.discriminator(fake.detach())
 
-        real_labels = torch.ones(B, 1, device=device)
-        fake_labels = torch.zeros(B, 1, device=device)
+        loss_real = F.relu(1.0 - d_real_logits).mean()
+        loss_fake = F.relu(1.0 + d_fake_logits).mean()
 
-        loss_real = self.adv_loss(self.discriminator(real), real_labels)
-        loss_fake = self.adv_loss(self.discriminator(fake.detach()), fake_labels)
-
-        loss_D = (loss_real + loss_fake) * 0.5
+        loss_D = loss_real + loss_fake
         return dict(loss_D=loss_D, loss_D_real=loss_real, loss_D_fake=loss_fake)
 
     def loss_generator(
@@ -124,15 +131,13 @@ class DualBranchPointVAE(nn.Module):
         target: torch.Tensor,
     ) -> dict:
         B = out["recon"].size(0)
-        device = out["recon"].device
-
-        # Reconstruction (Chamfer) + KL
-        point_loss, normal_loss = earth_movers_distance_sinkhorn(out["recon"], target)
+        
+        point_loss, normal_loss = chamfer_distance(out["recon"], target)
         kl = VAEBottleneck.kl_loss(out["mu"], out["logvar"])
 
-        # Adversarial: fool D into predicting fake as real
-        real_labels = torch.ones(B, 1, device=device)
-        loss_adv = self.adv_loss(self.discriminator(out["recon"]), real_labels)
+        # Hinge Loss para o Gerador
+        g_fake_logits = self.discriminator(out["recon"])
+        loss_adv = -g_fake_logits.mean()
 
         total = point_loss + self.beta * kl + self.lambda_adv * loss_adv + normal_loss
 
@@ -148,9 +153,7 @@ class DualBranchPointVAE(nn.Module):
         """Plain β-VAE loss (no adversarial term). Useful for warm-up epochs."""
         point_loss, normal_loss = chamfer_distance(out["recon"], target)
         kl = VAEBottleneck.kl_loss(out["mu"], out["logvar"])
-        total = (
-            point_loss + self.beta * kl + normal_loss
-        )  # Adicionado normal_loss para consistência
+        total = point_loss + self.beta * kl + normal_loss
         return dict(total=total, cd=point_loss, kl=kl, normal_loss=normal_loss)
 
     # ── generation ────────────────────────────────────────────────────────────
@@ -207,7 +210,7 @@ class DualBranchPointVAE(nn.Module):
         print(f"{'Global Encoder':<25} | {g_tot:>14,} | {g_train:>16,}")
         print(f"{'Cross-Branch Fusion':<25} | {f_tot:>14,} | {f_train:>16,}")
         print(f"{'VAE Bottleneck':<25} | {b_tot:>14,} | {b_train:>16,}")
-        print(f"{'Point Decoder (MLP)':<25} | {dec_tot:>14,} | {dec_train:>16,}")
+        print(f"{'Point Decoder (LION)':<25} | {dec_tot:>14,} | {dec_train:>16,}")
         print(f"{'Discriminator (PointNet)':<25} | {disc_tot:>14,} | {disc_train:>16,}")
         print("-" * 65)
         print(f"{'GLOBAL SYSTEM TOTAL':<25} | {global_tot:>14,} | {global_train:>16,}")
