@@ -11,7 +11,7 @@ from src.Encoder import (
 # Certifique-se de que o arquivo src/Decoder.py contém a classe PointDecoder
 from src.Decoder import PointDecoder
 from src.GAN import PointNetDiscriminator
-from src.metric import chamfer_distance
+from src.metric import chamfer_distance, earth_movers_distance_sinkhorn
 
 
 class DualBranchPointVAE(nn.Module):
@@ -127,7 +127,7 @@ class DualBranchPointVAE(nn.Module):
         device = out["recon"].device
 
         # Reconstruction (Chamfer) + KL
-        point_loss, normal_loss = chamfer_distance(out["recon"], target)
+        point_loss, normal_loss = earth_movers_distance_sinkhorn(out["recon"], target)
         kl = VAEBottleneck.kl_loss(out["mu"], out["logvar"])
 
         # Adversarial: fool D into predicting fake as real
@@ -212,10 +212,3 @@ class DualBranchPointVAE(nn.Module):
         print("-" * 65)
         print(f"{'GLOBAL SYSTEM TOTAL':<25} | {global_tot:>14,} | {global_train:>16,}")
         print("=" * 65 + "\n")
-
-
-if __name__ == "__main__":
-    # Teste rápido para verificar se o modelo compila e roda um forward pass
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = DualBranchPointVAE().to(device)
-    model.report_parameters()
