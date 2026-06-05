@@ -39,8 +39,8 @@ def verify_and_load_pcd(file_path):
 
 def compare_ply_contents(epoch_num, visualize=False, series="03624134"):
     # Gerar os caminhos para ambos os ficheiros
-    orig_path = f"reconstructions/epoch_{epoch_num}_{series}_ORIGINAL.ply"
-    rec_path  = f"reconstructions/epoch_{epoch_num}_{series}_RECONSTRUCTED.ply"
+    orig_path = f"runs/default/reconstructions/ep{epoch_num}_{series}_ORIG.ply"
+    rec_path  = f"runs/default/reconstructions/ep{epoch_num}_{series}_RECON.ply"
     
     print(f"\n--- [INFO] Checking Epoch {epoch_num} Data ---")
     pcd_orig = verify_and_load_pcd(orig_path)

@@ -121,6 +121,8 @@ if __name__ == "__main__":
         dec_depth=4,
         n_heads=6,
         beta=0,
+        lambda_adv = 0
+        
     ).to(device)
 
     if parser.parse_args().dataset:

@@ -12,7 +12,7 @@ The data is represented as a tensor of shape (B, N, 6), where:
     coordinates (absolute) and the next 3 channels are the normals
 
 Inspired in this representation of point clouds, 
-The Tokenizer are working in this way:
+The Tokenizer is working in this way:
 """
 
 
@@ -20,6 +20,7 @@ The Tokenizer are working in this way:
 
 
 def farthest_point_sampling(xyz: torch.Tensor, n_samples: int) -> torch.Tensor:
+
     """
     Iterative FPS on a batch of point clouds.
     xyz : (B, N, C)  — only the first 3 channels are used for distance.
@@ -46,6 +47,7 @@ def farthest_point_sampling(xyz: torch.Tensor, n_samples: int) -> torch.Tensor:
 def knn_group(
     xyz: torch.Tensor, centers: torch.Tensor, k: int
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    
     """
     xyz     : (B, N, C)
     centers : (B, M, C)
@@ -53,6 +55,7 @@ def knn_group(
         grouped : (B, M, k, C)  — relative XYZ + absolute normals
         idx     : (B, M, k)
     """
+
     B, _, C = xyz.shape
     M = centers.shape[1]
 
@@ -77,8 +80,9 @@ def knn_group(
 
 
 class PatchEmbed(nn.Module):
+
     """
-    Dual-stream mini-PointNet otimizada e corrigida com LayerNorm.
+    Dual-stream mini-PointNet.
     Input : (B, M, k, 6)  — [rel_xyz | normals]
     Output: (B, M, out_ch)
     """
@@ -97,7 +101,7 @@ class PatchEmbed(nn.Module):
             nn.GELU(),
         )
 
-        # Stream B: Orientação de Superfície (Normais)
+  
         self.norm_net = nn.Sequential(
             nn.Linear(3, half),
             nn.LayerNorm(half),
@@ -107,46 +111,47 @@ class PatchEmbed(nn.Module):
             nn.GELU(),
         )
 
-        # Fusão Avançada após a extração de características
         self.fuse = nn.Sequential(
             nn.Linear(out_ch, out_ch),
             nn.LayerNorm(out_ch),
             nn.GELU(),
             nn.Linear(
                 out_ch, out_ch
-            ),  # Camada extra para dar capacidade não-linear ao Token
+            ),  
         )
 
         self.k = k
         self.out_ch = out_ch
 
     def forward(self, grouped: torch.Tensor) -> torch.Tensor:
+
         """grouped : (B, M, k, 6)"""
         B, M, k, _ = grouped.shape
 
         xyz_rel = grouped[..., :3]  # (B, M, k, 3)
         normals = grouped[..., 3:]  # (B, M, k, 3)
 
-        # 1. Calcular a distância euclidiana ao quadrado como feature geométrica extra
+   
         dist = torch.sum(xyz_rel**2, dim=-1, keepdim=True)  # (B, M, k, 1)
         geo_input = torch.cat([xyz_rel, dist], dim=-1)  # (B, M, k, 4)
 
-        # 2. Passar as correntes mantendo as dimensões estruturadas para o LayerNorm
+   
         geo_feat = self.geo_net(geo_input)  # (B, M, k, half)
         norm_feat = self.norm_net(normals)  # (B, M, k, half)
 
-        # 3. Concatenar os canais (half + half = out_ch)
+
         fused = torch.cat([geo_feat, norm_feat], dim=-1)  # (B, M, k, out_ch)
         fused = self.fuse(fused)  # (B, M, k, out_ch)
 
-        # 4. Max-pooling sobre a dimensão dos k vizinhos
+
         token = fused.max(dim=2).values  # (B, M, out_ch)
         return token
 
 
 class PositionalEncoding(nn.Module):
+
     """
-    MLP positional encoding robusto. Mapia os centros XYZ para o d_model do Transformer.
+    MLP positional encoding robusto. Mapeia os centros XYZ para o d_model do Transformer.
     Input : (B, M, 3)  — XYZ absoluto dos centros dos patches
     Output: (B, M, d_model)
     """
