@@ -92,7 +92,7 @@ def chamfer_distance_knn(
 
     Parameters are identical to chamfer_distance.
     """
-    dist = torch.cdist(pred, target)                  # (B, N, M)
+    dist = torch.cdist(pred.float(), target.float())                  # (B, N, M)
 
     cd_pred = dist.topk(k, dim=2, largest=False).values.mean(dim=2)  # (B, N)
     cd_tgt  = dist.topk(k, dim=1, largest=False).values.mean(dim=1)  # (B, M)
@@ -129,7 +129,7 @@ def emd_approx(
     B, N, _ = pred.shape
     assert pred.shape == target.shape, "pred and target must have the same shape."
 
-    cost = torch.cdist(pred, target)                  # (B, N, N)
+    cost = torch.cdist(pred.float(), target.float())                  # (B, N, N)
 
     # uniform marginals
     log_a = torch.full((B, N), -torch.log(torch.tensor(float(N))),
@@ -178,7 +178,7 @@ def f_score(
     -------
     dict with keys "precision", "recall", "f_score"
     """
-    dist = torch.cdist(pred, target)                   # (B, N, M)
+    dist = torch.cdist(pred.float(), target.float())                   # (B, N, M)
 
     # precision: fraction of pred points with a match within τ
     prec = (dist.min(dim=2).values < threshold).float().mean(dim=1)   # (B,)
@@ -219,7 +219,7 @@ def normal_consistency(
     pred_nrm = F.normalize(pred_nrm, dim=2)
     tgt_nrm  = F.normalize(tgt_nrm,  dim=2)
 
-    dist = torch.cdist(pred_pts, tgt_pts)             # (B, N, M)
+    dist = torch.cdist(pred_pts.float(), tgt_pts.float())             # (B, N, M)
     nn_idx = dist.min(dim=2).indices                  # (B, N)
 
     # gather nearest target normals
