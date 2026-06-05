@@ -1,286 +1,232 @@
-from torch import nn
 import torch
-from typing import Tuple, Optional
-from src.Tokenizer import (
-    PatchEmbed,
-    PositionalEncoding,
-    farthest_point_sampling,
-    knn_group,
-)
+import torch.nn as nn
+import torch.nn.functional as F
 
 
-class TransformerBlock(nn.Module):
-    def __init__(
-        self, d_model: int, n_heads: int, ffn_mult: int = 4, dropout: float = 0.1
-    ):
+# ---------------------------------------------------------------------------
+# Low-level building blocks
+# ---------------------------------------------------------------------------
+
+class SharedMLP(nn.Sequential):
+    """1-D shared MLP applied point-wise (B, C, N) → (B, C', N)."""
+    def __init__(self, channels: list[int], bn: bool = True, act: bool = True):
+        layers = []
+        for i in range(len(channels) - 1):
+            layers.append(nn.Conv1d(channels[i], channels[i + 1], 1, bias=not bn))
+            if bn:
+                layers.append(nn.BatchNorm1d(channels[i + 1]))
+            if act:
+                layers.append(nn.GELU())
+        super().__init__(*layers)
+
+
+# ---------------------------------------------------------------------------
+# Voxel branch (PVCNN-style)
+# ---------------------------------------------------------------------------
+
+class VoxelBranch(nn.Module):
+    """
+    Voxelises a point cloud, applies 3-D convolutions, then trilinearly
+    samples the voxel features back onto the original point positions.
+
+    Args:
+        in_channels  : number of input point features (e.g. 6 for xyz+normals)
+        out_channels : number of output voxel features per point
+        resolution   : voxel grid resolution (cubic)
+    """
+
+    def __init__(self, in_channels: int, out_channels: int, resolution: int = 16):
         super().__init__()
-        self.attn = nn.MultiheadAttention(
-            d_model, n_heads, dropout=dropout, batch_first=True
-        )
-        self.ff = nn.Sequential(
-            nn.Linear(d_model, d_model * ffn_mult),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(d_model * ffn_mult, d_model),
-        )
-        self.norm1 = nn.LayerNorm(d_model)
-        self.norm2 = nn.LayerNorm(d_model)
-        self.drop = nn.Dropout(dropout)
+        self.resolution = resolution
+        mid = out_channels * 2
 
-    def forward(
-        self, x: torch.Tensor, kv: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
-        kv_src = x if kv is None else kv
-        attn_out, _ = self.attn(self.norm1(x), self.norm1(kv_src), self.norm1(kv_src))
-        x = x + self.drop(attn_out)
-        x = x + self.drop(self.ff(self.norm2(x)))
+        self.voxel_net = nn.Sequential(
+            nn.Conv3d(in_channels, mid, 3, padding=1, bias=False),
+            nn.BatchNorm3d(mid),
+            nn.GELU(),
+            nn.Conv3d(mid, out_channels, 3, padding=1, bias=False),
+            nn.BatchNorm3d(out_channels),
+            nn.GELU(),
+        )
+
+    # ------------------------------------------------------------------
+    def _voxelise(self, coords: torch.Tensor, features: torch.Tensor,
+                  R: int) -> torch.Tensor:
+        """
+        Scatter-average features into a (B, C, R, R, R) voxel grid.
+
+        coords   : (B, 3, N)  – already normalised to [0, R-1]
+        features : (B, C, N)
+        """
+        B, C, N = features.shape
+        device = features.device
+
+        idx = coords.long().clamp(0, R - 1)          # (B, 3, N)
+        flat_idx = idx[:, 0] * R * R + idx[:, 1] * R + idx[:, 2]  # (B, N)
+
+        # accumulate sum + count
+        voxels = torch.zeros(B, C, R * R * R, device=device, dtype = features.dtype)
+        count  = torch.zeros(B, 1, R * R * R, device=device, dtype = features.dtype)
+
+        flat_idx_exp = flat_idx.unsqueeze(1).expand_as(features)  # (B, C, N)
+        voxels.scatter_add_(2, flat_idx_exp, features)
+
+        count_src = torch.ones(B, 1, N, device=device, dtype = features.dtype)
+        count.scatter_add_(2, flat_idx.unsqueeze(1), count_src)
+
+        count = count.clamp(min=1.0)
+        voxels = voxels / count                                    # average
+
+        return voxels.view(B, C, R, R, R)
+
+    # ------------------------------------------------------------------
+    def forward(self, points: torch.Tensor) -> torch.Tensor:
+        """
+        points : (B, N, 6)  – [xyz | normals]
+        returns: (B, N, out_channels)
+        """
+        B, N, _ = points.shape
+        R = self.resolution
+
+        coords   = points[:, :, :3].permute(0, 2, 1)   # (B, 3, N)
+        features = points.permute(0, 2, 1)              # (B, 6, N)
+
+        # normalise xyz to voxel grid indices
+        xyz_min = coords.min(dim=2, keepdim=True).values
+        xyz_max = coords.max(dim=2, keepdim=True).values
+        scale   = (xyz_max - xyz_min).clamp(min=1e-6)
+        norm_coords = (coords - xyz_min) / scale * (R - 1)  # [0, R-1]
+
+        # voxelise → 3-D conv → sample back
+        voxel_grid   = self._voxelise(norm_coords, features, R)   # (B, C, R, R, R)
+        voxel_feats  = self.voxel_net(voxel_grid)                 # (B, out_C, R, R, R)
+
+        # trilinear sampling
+        sample_grid  = norm_coords / (R - 1) * 2 - 1             # [-1, 1]
+        sample_grid  = sample_grid.permute(0, 2, 1).unsqueeze(1).unsqueeze(1)
+        # grid_sample expects (B, D_out, H_out, W_out, 3)
+        sample_grid  = sample_grid.expand(-1, 1, 1, N, 3)        # (B, 1, 1, N, 3)
+
+        sampled = F.grid_sample(
+            voxel_feats, sample_grid,
+            mode="bilinear", align_corners=True, padding_mode="border"
+        )                                                          # (B, out_C, 1, 1, N)
+        sampled = sampled.squeeze(2).squeeze(2).permute(0, 2, 1) # (B, N, out_C)
+        return sampled
+
+
+# ---------------------------------------------------------------------------
+# Point branch (PointNet-style)
+# ---------------------------------------------------------------------------
+
+class PointBranch(nn.Module):
+    """Lightweight point-wise MLP branch."""
+    def __init__(self, in_channels: int, out_channels: int):
+        super().__init__()
+        self.mlp = SharedMLP([in_channels, out_channels * 2, out_channels])
+
+    def forward(self, points: torch.Tensor) -> torch.Tensor:
+        """points: (B, N, C) → (B, N, out_channels)"""
+        x = points.permute(0, 2, 1)       # (B, C, N)
+        x = self.mlp(x)
+        return x.permute(0, 2, 1)         # (B, N, out_channels)
+
+
+# ---------------------------------------------------------------------------
+# PVCNN Block  (voxel + point fusion)
+# ---------------------------------------------------------------------------
+
+class PVConvBlock(nn.Module):
+    """
+    One PVCNN-style block: fuses a voxel branch with a point branch.
+
+    in_channels  : input feature dim per point
+    out_channels : output feature dim per point
+    resolution   : voxel resolution for this stage
+    """
+
+    def __init__(self, in_channels: int, out_channels: int, resolution: int = 16):
+        super().__init__()
+        self.voxel = VoxelBranch(in_channels, out_channels // 2, resolution)
+        self.point = PointBranch(in_channels, out_channels // 2)
+
+        # fusion + projection
+        self.fuse = nn.Sequential(
+            nn.Conv1d(out_channels, out_channels, 1, bias=False),
+            nn.BatchNorm1d(out_channels),
+            nn.GELU(),
+        )
+
+    def forward(self, points: torch.Tensor) -> torch.Tensor:
+        """points: (B, N, in_channels) → (B, N, out_channels)"""
+        v = self.voxel(points)             # (B, N, out//2)
+        p = self.point(points)             # (B, N, out//2)
+        x = torch.cat([v, p], dim=2)      # (B, N, out)
+        x = self.fuse(x.permute(0, 2, 1)).permute(0, 2, 1)
         return x
 
 
-# ── Blue Branch ───────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Encoder
+# ---------------------------------------------------------------------------
 
-
-class HierarchicalEncoder(nn.Module):
+class Encoder(nn.Module):
     """
-    Three FPS + kNN grouping levels whose tokens are max-pooled per level,
-    projected together, and returned as a single global descriptor (B, d_model).
+    PVCNN-inspired hierarchical encoder that maps a point cloud
+    (B, N, 6) → latent mean μ and log-variance log σ²  of shape (B, latent_dim).
+
+    Architecture
+    ------------
+    Stage 0 : PVConvBlock  6   → 64   (res=32)
+    Stage 1 : PVConvBlock  64  → 128  (res=16)
+    Stage 2 : PVConvBlock  128 → 256  (res=8)
+    Stage 3 : SharedMLP    256 → 512
+    Global  : max-pool over N
+    Head    : Linear → (μ, log σ²)
     """
 
-    LEVELS = [
-        dict(n_samples=512, k=32),
-        dict(n_samples=256, k=32),
-        dict(n_samples=128, k=32),
-    ]
-
-    def __init__(self, d_model: int = 384, n_heads: int = 6, depth: int = 4):
+    def __init__(self, latent_dim: int = 256, in_channels: int = 6):
         super().__init__()
-        self.d_model = d_model
+        self.latent_dim = latent_dim
 
-        self.embeds = nn.ModuleList(
-            [PatchEmbed(in_ch=6, out_ch=d_model, k=lv["k"]) for lv in self.LEVELS]
-        )
-        self.pos_encs = nn.ModuleList(
-            [PositionalEncoding(d_model) for _ in self.LEVELS]
-        )
-        self.blocks = nn.ModuleList(
-            [TransformerBlock(d_model, n_heads) for _ in range(depth)]
-        )
-        # Projects the concatenation of the 3 per-level max-pooled descriptors
-        self.proj = nn.Linear(d_model * len(self.LEVELS), d_model)
-        self.norm = nn.LayerNorm(d_model)
+        self.stage0 = PVConvBlock(in_channels, 64,  resolution=32)
+        self.stage1 = PVConvBlock(64,          128, resolution=16)
+        self.stage2 = PVConvBlock(128,         256, resolution=8)
 
-    def forward(self, xyz: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        self.local_mlp = SharedMLP([256, 512])
+
+        # global aggregation head
+        self.global_mlp = nn.Sequential(
+            nn.Linear(512, 512),
+            nn.GELU(),
+            nn.Linear(512, 512),
+            nn.GELU(),
+        )
+
+        self.fc_mu     = nn.Linear(512, latent_dim)
+        self.fc_logvar = nn.Linear(512, latent_dim)
+
+    # ------------------------------------------------------------------
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        xyz : (B, N, 6)
+        x : (B, N, 6)  – concatenation of xyz and normals
+
         Returns
         -------
-        feat_global : (B, d_model)
-        centers     : (B, M_total, 3)
+        mu     : (B, latent_dim)
+        logvar : (B, latent_dim)
         """
+        x = self.stage0(x)               # (B, N, 64)
+        x = self.stage1(x)               # (B, N, 128)
+        x = self.stage2(x)               # (B, N, 256)
 
-        all_tokens, all_centers_xyz = [], []
+        # point-wise MLP
+        x = self.local_mlp(x.permute(0, 2, 1)).permute(0, 2, 1)  # (B, N, 512)
 
-        for i, lv in enumerate(self.LEVELS):
-            idx = farthest_point_sampling(xyz, lv["n_samples"])
-            centers = torch.gather(
-                xyz, 1, idx.unsqueeze(-1).expand(-1, -1, xyz.shape[-1])
-            )
-            grouped, _ = knn_group(xyz, centers, lv["k"])
-            tokens = self.embeds[i](grouped) + self.pos_encs[i](centers[..., :3])
-            all_tokens.append(tokens)
-            all_centers_xyz.append(centers[..., :3])
+        # global max-pool
+        g = x.max(dim=1).values           # (B, 512)
+        g = self.global_mlp(g)            # (B, 512)
 
-        # Encode each level independently through the shared transformer blocks
-        encoded_levels = []
-        for i in range(len(self.LEVELS)):
-            t = all_tokens[i]
-            for blk in self.blocks:
-                t = blk(t)
-            encoded_levels.append(t)  # (B, M_level, d_model)
-
-        # Max-pool each level → (B, d_model), concat → proj → norm  (Bug 6 fix)
-        level_globals = [t.max(dim=1).values for t in encoded_levels]
-        feat_global = self.norm(self.proj(torch.cat(level_globals, dim=-1)))
-
-        centers = torch.cat(all_centers_xyz, dim=1)  # (B, M_total, 3)
-        return feat_global, centers
-
-
-# ── Green Branch ─────────────────────────────────────────────────────────────
-
-
-class GlobalEncoder(nn.Module):
-    """Single-level FPS grouping + transformer. Captures global shape context."""
-
-    def __init__(
-        self,
-        d_model: int = 384,
-        n_heads: int = 6,
-        depth: int = 4,
-        n_tokens: int = 64,
-        k: int = 32,
-    ):
-        super().__init__()
-        self.n_tokens = n_tokens
-        self.k = k
-        self.embed = PatchEmbed(in_ch=6, out_ch=d_model, k=k)
-        self.pos_enc = PositionalEncoding(d_model)
-        self.blocks = nn.ModuleList(
-            [TransformerBlock(d_model, n_heads) for _ in range(depth)]
-        )
-        self.norm = nn.LayerNorm(d_model)
-
-    def forward(self, xyz: torch.Tensor) -> torch.Tensor:
-        """xyz : (B, N, 6)  →  (B, d_model)"""
-        idx = farthest_point_sampling(xyz, self.n_tokens)
-        centers = torch.gather(xyz, 1, idx.unsqueeze(-1).expand(-1, -1, xyz.shape[-1]))
-        grouped, _ = knn_group(xyz, centers, k=self.k)
-        tokens = self.embed(grouped) + self.pos_enc(centers[..., :3])
-        for blk in self.blocks:
-            tokens = blk(tokens)
-        return self.norm(tokens.max(dim=1).values)  # (B, d_model)
-
-
-# ── Cross-attention used in CrossBranchFusion ─────────────────────────────────
-
-
-class Attention(nn.Module):
-    """
-    Scaled dot-product cross-attention.
-    x  → query
-    y  → key / value  (defaults to x for self-attention)
-    """
-
-    def __init__(
-        self,
-        dim: int,
-        num_heads: int = 8,
-        qkv_bias: bool = False,
-        qk_scale: float = None,
-        attn_drop: float = 0.0,
-        proj_drop: float = 0.0,
-    ):
-        super().__init__()
-        self.num_heads = num_heads
-        head_dim = dim // num_heads
-        self.scale = qk_scale or head_dim**-0.5
-
-        self.q = nn.Linear(dim, dim, bias=qkv_bias)
-        self.kv = nn.Linear(dim, dim * 2, bias=qkv_bias)
-        self.attn_drop = nn.Dropout(attn_drop)
-        self.proj = nn.Linear(dim, dim)
-        self.proj_drop = nn.Dropout(proj_drop)
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        y: Optional[torch.Tensor] = None,
-        mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        if y is None:
-            y = x
-
-        B, Ny, C = y.shape
-        kv = (
-            self.kv(y)
-            .reshape(B, Ny, 2, self.num_heads, C // self.num_heads)
-            .permute(2, 0, 3, 1, 4)
-        )
-        k, v = kv[0], kv[1]
-
-        B, Nx, C = x.shape
-        q = (
-            self.q(x)
-            .reshape(B, Nx, 1, self.num_heads, C // self.num_heads)
-            .permute(2, 0, 3, 1, 4)[0]
-        )
-
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        if mask is not None:
-            attn = attn + mask.unsqueeze(1) * -1e5
-        attn = attn.softmax(dim=-1)
-        attn = self.attn_drop(attn)
-
-        x = (attn @ v).transpose(1, 2).reshape(B, Nx, C)
-        x = self.proj_drop(self.proj(x))
-        return x
-
-
-# ── Cross-Branch Fusion ───────────────────────────────────────────────────────
-
-
-class CrossBranchFusion(nn.Module):
-    """
-    Fuses hierarchical (h) and global (g) descriptors in two stages:
-
-    Stage 1 — Cross-attention
-        h is the query: hierarchical features decide what to pull from g.
-        g is the key/value: provides global context.
-        A residual on h preserves the hierarchical signal.
-
-    Stage 2 — MLP residual
-        The attention output and g are concatenated and mixed by a small MLP.
-        A final residual on g ensures the global signal is never discarded.
-
-    Both stages use Pre-LN (LayerNorm before each sub-layer).
-    """
-
-    def __init__(self, d_model: int, n_heads: int = 8, **kwargs):
-        super().__init__()
-        # Pre-LN for the cross-attention inputs
-        self.norm_h = nn.LayerNorm(d_model)
-        self.norm_g = nn.LayerNorm(d_model)
-        self.attn = Attention(d_model, num_heads=n_heads)
-        self.norm_mid = nn.LayerNorm(d_model)  # after attn residual
-
-        # MLP stage
-        self.fusion_mlp = nn.Sequential(
-            nn.Linear(d_model * 2, d_model * 2),
-            nn.GELU(),
-            nn.Linear(d_model * 2, d_model),
-        )
-        self.norm_out = nn.LayerNorm(d_model)
-
-    def forward(self, h: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
-        """
-        h : (B, d_model)  hierarchical descriptor
-        g : (B, d_model)  global descriptor
-        Returns fused (B, d_model)
-        """
-        # Attention operates on sequences; lift (B, C) → (B, 1, C)
-        h_seq = self.norm_h(h).unsqueeze(1)  # (B, 1, d_model)  query
-        g_seq = self.norm_g(g).unsqueeze(1)  # (B, 1, d_model)  key / value
-
-        # Stage 1: h attends to g, residual on h
-        attended = self.attn(h_seq, y=g_seq).squeeze(1)  # (B, d_model)
-        attended = self.norm_mid(attended + h)  # (B, d_model)
-
-        # Stage 2: MLP mix, residual on g
-        fused = self.fusion_mlp(torch.cat([attended, g], dim=-1))  # (B, d_model)
-        return self.norm_out(fused + g)
-
-
-# ── VAE Bottleneck ────────────────────────────────────────────────────────────
-
-
-class VAEBottleneck(nn.Module):
-    def __init__(self, in_dim: int, latent_dim: int):
-        super().__init__()
-        self.fc_mu = nn.Linear(in_dim, latent_dim)
-        self.fc_logvar = nn.Linear(in_dim, latent_dim)
-
-    def forward(
-        self, x: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        mu = self.fc_mu(x)
-        logvar = self.fc_logvar(x).clamp(-10, 10)
-        std = torch.exp(0.5 * logvar)
-        eps = torch.randn_like(std)
-        z = mu + eps * std  # reparametrisation
-        return z, mu, logvar
-
-    @staticmethod
-    def kl_loss(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
-        """KL( N(μ,σ²) ‖ N(0,1) ) averaged over the batch."""
-
-        return -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
+        mu     = self.fc_mu(g)            # (B, latent_dim)
+        logvar = self.fc_logvar(g)        # (B, latent_dim)
+        return mu, logvar
