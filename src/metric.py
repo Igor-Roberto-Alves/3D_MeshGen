@@ -1,134 +1,311 @@
+"""
+metrics.py
+----------
+Differentiable and evaluation metrics for point-cloud VAE.
+
+Metrics
+-------
+chamfer_distance     – bidirectional Chamfer Distance (differentiable, O(N²))
+chamfer_distance_knn – fast Chamfer via kNN (differentiable for large N)
+emd_approx           – Sinkhorn-based approximate Earth Mover's Distance
+f_score              – precision / recall / F-score at threshold τ
+normal_consistency   – mean cosine similarity between nearest-neighbour normals
+kl_divergence        – closed-form KL for Gaussian VAE prior
+vae_loss             – full ELBO = recon_loss + β·KL
+"""
+
 import torch
+import torch.nn.functional as F
+from torch import Tensor
 
 
-def chamfer_distance(pred, target, normal_weight=0.5):
+# ============================================================
+# Internal helpers
+# ============================================================
+
+def _pairwise_sq_dist(a: Tensor, b: Tensor) -> Tensor:
     """
-    Versão Estabilizada e Corrigida da Perda de Chamfer (XYZ + Normais).
-    Aplica raiz quadrada antes da média para estabilização de gradientes (L2 linear).
+    Compute squared pairwise Euclidean distances.
 
-    pred, target: (B, N, 6) -> [X, Y, Z, Nx, Ny, Nz]
+    a : (B, M, 3)
+    b : (B, N, 3)
+    returns: (B, M, N)
+    """
+    # ||a - b||² = ||a||² + ||b||² - 2 a·b
+    a2 = (a ** 2).sum(dim=2, keepdim=True)   # (B, M, 1)
+    b2 = (b ** 2).sum(dim=2, keepdim=True)   # (B, N, 1)
+    ab = torch.bmm(a, b.transpose(1, 2))     # (B, M, N)
+    return (a2 + b2.transpose(1, 2) - 2 * ab).clamp(min=0.0)
+
+
+# ============================================================
+# Chamfer Distance
+# ============================================================
+
+def chamfer_distance(
+    pred: Tensor,
+    target: Tensor,
+    reduce: str = "mean",
+) -> tuple[Tensor, Tensor, Tensor]:
+    """
+    Bidirectional Chamfer Distance (O(BNM) – suitable for N ≤ 2048).
+
+    Parameters
+    ----------
+    pred, target : (B, N, 3)
+    reduce       : "mean" | "sum" | "none"
+
+    Returns
+    -------
+    cd_total : scalar (or (B,) if reduce="none")
+    cd_pred  : pred → target (forward)
+    cd_tgt   : target → pred (backward)
+    """
+    sq = _pairwise_sq_dist(pred, target)              # (B, N, N)
+
+    # each pred point → nearest target
+    cd_pred = sq.min(dim=2).values                    # (B, N)
+    # each target point → nearest pred
+    cd_tgt  = sq.min(dim=1).values                    # (B, N)
+
+    if reduce == "none":
+        return cd_pred.mean(1) + cd_tgt.mean(1), cd_pred.mean(1), cd_tgt.mean(1)
+
+    agg = torch.mean if reduce == "mean" else torch.sum
+    cd_pred_s = agg(cd_pred)
+    cd_tgt_s  = agg(cd_tgt)
+    return cd_pred_s + cd_tgt_s, cd_pred_s, cd_tgt_s
+
+
+# ============================================================
+# Fast Chamfer via kNN  (memory-friendly for large point clouds)
+# ============================================================
+
+def chamfer_distance_knn(
+    pred: Tensor,
+    target: Tensor,
+    k: int = 1,
+    reduce: str = "mean",
+) -> tuple[Tensor, Tensor, Tensor]:
+    """
+    Chamfer Distance using torch.cdist (uses less peak memory).
+
+    Parameters are identical to chamfer_distance.
+    """
+    dist = torch.cdist(pred, target)                  # (B, N, M)
+
+    cd_pred = dist.topk(k, dim=2, largest=False).values.mean(dim=2)  # (B, N)
+    cd_tgt  = dist.topk(k, dim=1, largest=False).values.mean(dim=1)  # (B, M)
+
+    if reduce == "none":
+        return cd_pred.mean(1) + cd_tgt.mean(1), cd_pred.mean(1), cd_tgt.mean(1)
+
+    agg = torch.mean if reduce == "mean" else torch.sum
+    cd_pred_s = agg(cd_pred)
+    cd_tgt_s  = agg(cd_tgt)
+    return cd_pred_s + cd_tgt_s, cd_pred_s, cd_tgt_s
+
+
+# ============================================================
+# Approximate Earth Mover's Distance  (Sinkhorn)
+# ============================================================
+
+def emd_approx(
+    pred: Tensor,
+    target: Tensor,
+    n_iters: int = 50,
+    eps: float = 0.05,
+    reduce: str = "mean",
+) -> Tensor:
+    """
+    Approximate EMD via Sinkhorn iterations (differentiable).
+
+    pred, target : (B, N, 3)   – must have the same N
+    n_iters      : Sinkhorn iterations
+    eps          : entropy regularisation
+
+    Returns scalar loss.
     """
     B, N, _ = pred.shape
-    device = pred.device
+    assert pred.shape == target.shape, "pred and target must have the same shape."
 
-    pred_xyz = pred[..., :3]
-    target_xyz = target[..., :3]
-    pred_norm = pred[..., 3:]
-    target_norm = target[..., 3:]
+    cost = torch.cdist(pred, target)                  # (B, N, N)
 
-    # 1. Distância Euclidiana Otimizada (Matriz de Distâncias Cruzadas)
-    r_pred = torch.sum(pred_xyz**2, dim=-1, keepdim=True)
-    r_tgt = torch.sum(target_xyz**2, dim=-1, keepdim=True)
-    mul = torch.bmm(pred_xyz, target_xyz.transpose(1, 2))
-    dist = r_pred - 2 * mul + r_tgt.transpose(1, 2)
+    # uniform marginals
+    log_a = torch.full((B, N), -torch.log(torch.tensor(float(N))),
+                       device=pred.device)
+    log_b = log_a.clone()
 
-    # Garante estabilidade numérica contra valores ligeiramente negativos
-    dist = torch.clamp(dist, min=0.0)
+    # log-domain Sinkhorn
+    log_u = torch.zeros_like(log_a)
+    log_K = -cost / eps
 
-    # 2. Encontrar os índices dos vizinhos mais próximos
-    nn_pred_to_tgt = dist.argmin(dim=2)  # (B, N)
-    nn_tgt_to_pred = dist.argmin(dim=1)  # (B, N)
+    for _ in range(n_iters):
+        log_v = log_b - torch.logsumexp(log_K + log_u.unsqueeze(2), dim=1)
+        log_u = log_a - torch.logsumexp(log_K + log_v.unsqueeze(1), dim=2)
 
-    # 3. Coleta dos vizinhos geométricos correspondentes (XYZ)
-    idx_xyz = nn_pred_to_tgt.unsqueeze(-1).expand(-1, -1, 3)
-    idx_pred = nn_tgt_to_pred.unsqueeze(-1).expand(-1, -1, 3)
+    # transport plan
+    log_T = log_K + log_u.unsqueeze(2) + log_v.unsqueeze(1)   # (B, N, N)
+    T = log_T.exp()
 
-    matched_tgt_xyz = target_xyz.gather(1, idx_xyz)
-    matched_pred_xyz = pred_xyz.gather(1, idx_pred)
+    emd = (T * cost).sum(dim=(1, 2))                          # (B,)
 
-    # Perda Geométrica (XYZ)
-    cd_xyz = (pred_xyz - matched_tgt_xyz).pow(2).sum(-1).mean() + (
-        target_xyz - matched_pred_xyz
-    ).pow(2).sum(-1).mean()
-
-    # 4. Coleta e Alinhamento das Normais correspondentes
-    matched_tgt_norm = target_norm.gather(1, idx_xyz)
-    matched_pred_norm = pred_norm.gather(1, idx_pred)
-
-    # Normalização dos vetores para garantir Cosseno Perfeito
-    pred_norm_u = pred_norm / (pred_norm.norm(dim=-1, keepdim=True) + 1e-8)
-    target_norm_u = target_norm / (target_norm.norm(dim=-1, keepdim=True) + 1e-8)
-
-    matched_tgt_norm_u = matched_tgt_norm / (
-        matched_tgt_norm.norm(dim=-1, keepdim=True) + 1e-8
-    )
-    matched_pred_norm_u = matched_pred_norm / (
-        matched_pred_norm.norm(dim=-1, keepdim=True) + 1e-8
-    )
-
-    # Cálculo da perda de orientação (1.0 - Cosine_Similarity)
-    normal_loss_pred = 1.0 - (pred_norm_u * matched_tgt_norm_u).sum(-1)
-    normal_loss_tgt = 1.0 - (matched_pred_norm_u * target_norm_u).sum(-1)
-
-    cd_normal = normal_loss_pred.mean() + normal_loss_tgt.mean()
-
-    # Combinar ambas com o peso estipulado
-    return cd_xyz, (normal_weight * cd_normal)
+    if reduce == "none":
+        return emd
+    return emd.mean() if reduce == "mean" else emd.sum()
 
 
-def earth_movers_distance_sinkhorn(
-    pred, target, normal_weight=0.5, eps=0.01, max_iter=100
-):
+# ============================================================
+# F-Score
+# ============================================================
+
+def f_score(
+    pred: Tensor,
+    target: Tensor,
+    threshold: float = 0.01,
+    reduce: str = "mean",
+) -> dict[str, Tensor]:
     """
-    Aproximação da Earth Mover's Distance (EMD) via Algoritmo de Sinkhorn.
-    Força uma bijeção (mapeamento 1 para 1) entre as nuvens de pontos.
+    F-Score at distance threshold τ.
 
-    pred, target: (B, N, 6) -> [X, Y, Z, Nx, Ny, Nz]
-    eps: Parâmetro de regularização de entropia (valores menores = mais próximo da EMD exata)
-    max_iter: Número máximo de iterações de Sinkhorn
+    Parameters
+    ----------
+    pred, target : (B, N, 3)
+    threshold    : τ in the same unit as the point coordinates
+    reduce       : "mean" | "none"
+
+    Returns
+    -------
+    dict with keys "precision", "recall", "f_score"
     """
-    B, N, _ = pred.shape
-    device = pred.device
+    dist = torch.cdist(pred, target)                   # (B, N, M)
 
-    pred_xyz = pred[..., :3]
-    target_xyz = target[..., :3]
-    pred_norm = pred[..., 3:]
-    target_norm = target[..., 3:]
+    # precision: fraction of pred points with a match within τ
+    prec = (dist.min(dim=2).values < threshold).float().mean(dim=1)   # (B,)
+    # recall: fraction of target points covered
+    rec  = (dist.min(dim=1).values < threshold).float().mean(dim=1)   # (B,)
 
-    # 1. Calcular a matriz de custo geométrico baseada em XYZ
-    # (B, N, 1) + (B, 1, N) - 2 * (B, N, N)
-    r_pred = torch.sum(pred_xyz**2, dim=-1, keepdim=True)
-    r_tgt = torch.sum(target_xyz**2, dim=-1, keepdim=True)
-    mul = torch.bmm(pred_xyz, target_xyz.transpose(1, 2))
-    cost_matrix = r_pred - 2 * mul + r_tgt.transpose(1, 2)
-    cost_matrix = torch.clamp(cost_matrix, min=0.0)  # Estabilidade numérica
+    denom = (prec + rec).clamp(min=1e-8)
+    fs    = 2 * prec * rec / denom                                     # (B,)
 
-    # 2. Algoritmo de Sinkhorn para encontrar a Matriz de Transporte Ótimo (P)
-    # Matriz de Kernel (K)
-    K = torch.exp(-cost_matrix / eps)
+    if reduce == "none":
+        return {"precision": prec, "recall": rec, "f_score": fs}
 
-    # Inicializa os vetores de escala (distribuição uniforme de massa)
-    u = torch.ones(B, N, dtype=pred.dtype, device=device) / N
-    v = torch.ones(B, N, dtype=pred.dtype, device=device) / N
+    return {
+        "precision": prec.mean(),
+        "recall":    rec.mean(),
+        "f_score":   fs.mean(),
+    }
 
-    # Loops de projeção alternada (Sinkhorn Knopp)
-    for _ in range(max_iter):
-        # Evita divisão por zero com micro epsilon
-        u = 1.0 / (N * torch.bmm(K, v.unsqueeze(-1)).squeeze(-1) + 1e-12)
-        v = 1.0 / (
-            N * torch.bmm(K.transpose(1, 2), u.unsqueeze(-1)).squeeze(-1) + 1e-12
-        )
 
-    # P é a matriz de acoplamento ótimo que diz qual ponto predito vai para qual alvo
-    P = u.unsqueeze(-1) * K * v.unsqueeze(1)  # Shape: (B, N, N)
+# ============================================================
+# Normal Consistency
+# ============================================================
 
-    # 3. Loss Geométrica (XYZ) baseada no acoplamento ótimo
-    emd_xyz = torch.sum(P * cost_matrix, dim=(1, 2)).mean()
+def normal_consistency(
+    pred_pts:  Tensor,
+    pred_nrm:  Tensor,
+    tgt_pts:   Tensor,
+    tgt_nrm:   Tensor,
+    reduce:    str = "mean",
+) -> Tensor:
+    """
+    Mean absolute cosine similarity between each predicted point's normal and
+    its nearest neighbour's normal in the target cloud.
 
-    # 4. Alinhamento das Normais usando os pesos de acoplamento de P
-    # Normalização das normais originais para cosseno perfeito
-    pred_norm_u = pred_norm / (pred_norm.norm(dim=-1, keepdim=True) + 1e-8)
-    target_norm_u = target_norm / (target_norm.norm(dim=-1, keepdim=True) + 1e-8)
+    pred_pts, tgt_pts : (B, N, 3)
+    pred_nrm, tgt_nrm : (B, N, 3)  – not necessarily unit-length
+    """
+    pred_nrm = F.normalize(pred_nrm, dim=2)
+    tgt_nrm  = F.normalize(tgt_nrm,  dim=2)
 
-    # Matriz de perda de cosseno entre todas as normais possíveis (B, N, N)
-    # 1.0 - Cosine_Similarity
-    normal_cost = 1.0 - torch.bmm(pred_norm_u, target_norm_u.transpose(1, 2))
+    dist = torch.cdist(pred_pts, tgt_pts)             # (B, N, M)
+    nn_idx = dist.min(dim=2).indices                  # (B, N)
 
-    # Multiplica a perda das normais pela probabilidade de transporte P
-    emd_normal = torch.sum(P * normal_cost, dim=(1, 2)).mean()
+    # gather nearest target normals
+    nn_idx_exp  = nn_idx.unsqueeze(2).expand(-1, -1, 3)
+    nn_nrm      = tgt_nrm.gather(1, nn_idx_exp)      # (B, N, 3)
 
-    # O Sinkhorn altera a escala da loss de coordenadas. Multiplicamos por N
-    # para trazer a emd_xyz de volta à magnitude esperada das distâncias reais.
-    emd_xyz_scaled = emd_xyz * N
+    cos_sim = (pred_nrm * nn_nrm).sum(dim=2).abs()   # (B, N)
 
-    return emd_xyz_scaled, (normal_weight * emd_normal)
+    if reduce == "none":
+        return cos_sim.mean(dim=1)
+    return cos_sim.mean() if reduce == "mean" else cos_sim.sum()
+
+
+# ============================================================
+# KL Divergence  (Gaussian VAE)
+# ============================================================
+
+def kl_divergence(mu: Tensor, logvar: Tensor, reduce: str = "mean") -> Tensor:
+    """
+    Closed-form KL[q(z|x) || p(z)]  where p(z) = N(0, I).
+
+    KL = -0.5 * Σ (1 + logvar - μ² - exp(logvar))
+
+    mu, logvar : (B, latent_dim)
+    """
+    kl = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp())   # (B, latent_dim)
+    kl = kl.sum(dim=1)                                     # (B,)
+
+    if reduce == "none":
+        return kl
+    return kl.mean() if reduce == "mean" else kl.sum()
+
+
+# ============================================================
+# Full VAE ELBO loss
+# ============================================================
+
+def vae_loss(
+    pred_xyz:   Tensor,
+    target_xyz: Tensor,
+    mu:         Tensor,
+    logvar:     Tensor,
+    beta:       float  = 1.0,
+    recon_loss: str    = "chamfer",
+    # optional – used only when recon_loss == "both"
+    emd_weight: float  = 0.5,
+    emd_iters:  int    = 30,
+) -> dict[str, Tensor]:
+    """
+    ELBO = reconstruction_loss + β · KL
+
+    Parameters
+    ----------
+    pred_xyz    : (B, N, 3)  – reconstructed coordinates
+    target_xyz  : (B, N, 3)  – ground-truth coordinates
+    mu, logvar  : (B, latent_dim)
+    beta        : KL weight  (β-VAE)
+    recon_loss  : "chamfer" | "emd" | "both"
+    emd_weight  : weight of EMD when recon_loss == "both"
+
+    Returns
+    -------
+    dict with keys "total", "recon", "kl"  (and optionally "cd", "emd")
+    """
+    # --- reconstruction -----------------------------------------------
+    if recon_loss == "chamfer":
+        recon, cd_f, cd_b = chamfer_distance_knn(pred_xyz, target_xyz)
+        out = {"recon": recon, "cd_forward": cd_f, "cd_backward": cd_b}
+
+    elif recon_loss == "emd":
+        recon = emd_approx(pred_xyz, target_xyz, n_iters=emd_iters)
+        out   = {"recon": recon}
+
+    elif recon_loss == "both":
+        cd, cd_f, cd_b = chamfer_distance_knn(pred_xyz, target_xyz)
+        emd            = emd_approx(pred_xyz, target_xyz, n_iters=emd_iters)
+        recon = (1 - emd_weight) * cd + emd_weight * emd
+        out   = {"recon": recon, "cd": cd, "emd": emd,
+                 "cd_forward": cd_f, "cd_backward": cd_b}
+    else:
+        raise ValueError(f"Unknown recon_loss: '{recon_loss}'. "
+                         f"Choose from 'chamfer', 'emd', 'both'.")
+
+    # --- KL ------------------------------------------------------------
+    kl = kl_divergence(mu, logvar)
+
+    total = recon + beta * kl
+    out.update({"total": total, "kl": kl})
+    return out
