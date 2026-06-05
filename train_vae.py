@@ -1,15 +1,12 @@
 """
 train_vae.py
 ------------
-Training loop for the PVCNN-inspired Point-Cloud VAE.
+Training loop for the LION-inspired Hierarchical Point-Cloud VAE.
 
 Usage
 -----
 python train_vae.py [--config config.yaml]   # YAML overrides (optional)
-python train_vae.py --epochs 200 --latent_dim 512 --beta 1.0
-
-Dataset expected: Ds_point_sampled_already at root "point_clouds/"
-(produced by dataset.py).
+python train_vae.py --epochs 200 --latent_dim 256 --beta 1.0
 """
 from torch.utils.tensorboard import SummaryWriter
 import argparse
@@ -18,128 +15,25 @@ import time
 import math
 import json
 import logging
-from dataclasses import dataclass, asdict, field
+from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, random_split
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 import numpy as np
 
 from src.dataset import Ds_point_sampled_already
-from src.Encoder import Encoder
-from src.Decoder import Decoder
-from src.metric import vae_loss, chamfer_distance_knn, f_score, normal_consistency
+from src.metric import vae_loss, f_score, normal_consistency
+from src.Vae import Vae
 
 
 # ============================================================
 # Configuration
 # ============================================================
-
-# ============================================================
-# TensorBoard helpers
-# ============================================================
-
-def log_metrics_tensorboard(
-    writer: SummaryWriter,
-    metrics: dict[str, float],
-    prefix: str,
-    epoch: int,
-):
-    for k, v in metrics.items():
-        writer.add_scalar(f"{prefix}/{k}", v, epoch)
-
-
-@torch.no_grad()
-def log_reconstructions(
-    writer: SummaryWriter,
-    model: nn.Module,
-    loader: DataLoader,
-    device: torch.device,
-    epoch: int,
-    max_items: int = 4,
-):
-    """
-    Logs reconstructed point clouds to TensorBoard.
-
-    Creates 3D meshes:
-        GT
-        Reconstruction
-        Sampled prior
-
-    TensorBoard mesh format:
-        vertices -> (B, N, 3)
-        colors   -> (B, N, 3)
-    """
-
-    model.eval()
-
-    points = next(iter(loader))
-    points = points.to(device)
-
-    points = normalise_batch(points)
-
-    target_xyz = points[..., :3]
-
-    coarse, refined, normals, mu, logvar = model(points)
-
-    refined = refined.detach().float().cpu()
-    target_xyz = target_xyz.detach().float().cpu()
-
-    B = min(max_items, refined.shape[0])
-
-    # --------------------------------------------------------
-    # Colors
-    # --------------------------------------------------------
-
-    gt_colors = torch.zeros_like(target_xyz[:B])
-    gt_colors[..., 1] = 255
-
-    pred_colors = torch.zeros_like(refined[:B])
-    pred_colors[..., 0] = 255
-
-    # --------------------------------------------------------
-    # GT meshes
-    # --------------------------------------------------------
-
-    writer.add_mesh(
-        tag="reconstruction/ground_truth",
-        vertices=target_xyz[:B],
-        colors=gt_colors,
-        global_step=epoch,
-    )
-
-    # --------------------------------------------------------
-    # Reconstructions
-    # --------------------------------------------------------
-
-    writer.add_mesh(
-        tag="reconstruction/prediction",
-        vertices=refined[:B],
-        colors=pred_colors,
-        global_step=epoch,
-    )
-
-    # --------------------------------------------------------
-    # Prior samples
-    # --------------------------------------------------------
-
-    samples = model.sample(B, device).detach().float().cpu()
-
-    sample_colors = torch.zeros_like(samples)
-    sample_colors[..., 2] = 255
-
-    writer.add_mesh(
-        tag="samples/prior",
-        vertices=samples,
-        colors=sample_colors,
-        global_step=epoch,
-    )
-
-    model.train()
 
 @dataclass
 class TrainConfig:
@@ -150,8 +44,8 @@ class TrainConfig:
 
     # --- architecture ---
     latent_dim:    int   = 256
+    style_dim:     int   = 512
     num_points:    int   = 2048
-    decoder_hidden: int  = 512
 
     # --- training ---
     epochs:        int   = 200
@@ -179,57 +73,87 @@ class TrainConfig:
     log_every:     int   = 50    # log metrics every N batches
     device:        str   = "cuda"
     amp:           bool  = True   # automatic mixed precision
-    resume:        int   = 0     # epoch to resume from (default: 0, i.e. no resume)
+    resume:        int   = 0     # epoch to resume from
 
 
 # ============================================================
-# Full VAE model wrapper
+# TensorBoard helpers
 # ============================================================
 
-class PointCloudVAE(nn.Module):
-    """Thin wrapper that glues Encoder + Decoder."""
+def log_metrics_tensorboard(writer: SummaryWriter, metrics: dict[str, float], prefix: str, epoch: int):
+    for k, v in metrics.items():
+        writer.add_scalar(f"{prefix}/{k}", v, epoch)
 
-    def __init__(self, cfg: TrainConfig):
-        super().__init__()
-        self.encoder = Encoder(latent_dim=cfg.latent_dim, in_channels=6)
-        self.decoder = Decoder(
-            latent_dim=cfg.latent_dim,
-            num_points=cfg.num_points,
-            hidden=cfg.decoder_hidden,
-        )
 
-    # ------------------------------------------------------------------
-    @staticmethod
-    def reparameterise(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
-        """z = μ + ε·exp(0.5·logvar),  ε ~ N(0, I)."""
-        std = (0.5 * logvar).exp()
-        eps = torch.randn_like(std)
-        return mu + eps * std
+@torch.no_grad()
+@torch.no_grad()
+def log_reconstructions(
+    writer: SummaryWriter,
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    epoch: int,
+    max_items: int = 4,
+):
+    model.eval()
 
-    # ------------------------------------------------------------------
-    def forward(
-        self, x: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        x : (B, N, 6)
+    points = next(iter(loader))
+    points = points.to(device)
+    points = normalise_batch(points)
 
-        Returns
-        -------
-        coarse, refined, normals : decoder outputs
-        mu, logvar               : encoder outputs
-        """
-        mu, logvar = self.encoder(x)
-        z          = self.reparameterise(mu, logvar)
-        coarse, refined, normals = self.decoder(z)
-        return coarse, refined, normals, mu, logvar
+    target_xyz = points[..., :3]
 
-    # ------------------------------------------------------------------
-    @torch.no_grad()
-    def sample(self, n: int, device: torch.device) -> torch.Tensor:
-        """Sample n point clouds from the prior p(z) = N(0, I)."""
-        z = torch.randn(n, self.encoder.latent_dim, device=device)
-        _, refined, _ = self.decoder(z)
-        return refined
+    # Reconstrução clássica usando dados reais
+    coords_pred, normals_pred, mu, logvar = model(points)
+
+    refined = coords_pred.detach().float().cpu()
+    target_xyz = target_xyz.detach().float().cpu()
+
+    B = min(max_items, refined.shape[0])
+
+    gt_colors = torch.zeros_like(target_xyz[:B])
+    gt_colors[..., 1] = 255  # Verde para o Ground Truth
+
+    pred_colors = torch.zeros_like(refined[:B])
+    pred_colors[..., 0] = 255  # Vermelho para a Reconstrução
+
+    writer.add_mesh(
+        tag="reconstruction/ground_truth",
+        vertices=target_xyz[:B],
+        colors=gt_colors,
+        global_step=epoch,
+    )
+
+    writer.add_mesh(
+        tag="reconstruction/prediction",
+        vertices=refined[:B],
+        colors=pred_colors,
+        global_step=epoch,
+    )
+
+    # ============================================================
+    # GERADOR DE AMOSTRAS ALEATÓRIAS (PRIOR GENERATION)
+    # ============================================================
+    # Determina a quantidade de pontos configurada (padrão 2048)
+    num_pts = model.decoder.num_points if hasattr(model.decoder, "num_points") else 2048
+    
+    # Gera exatamente 5 objetos tridimensionais inéditos a partir do Prior Gaussiano
+    num_gen = 5
+    generated_xyz, _ = model.generate(num_samples=num_gen, num_points=num_pts, device=device)
+    generated_xyz = generated_xyz.detach().float().cpu()
+
+    # Define a cor azul pura para as amostras geradas
+    gen_colors = torch.zeros_like(generated_xyz)
+    gen_colors[..., 2] = 255  # Azul para amostras inéditas do prior
+
+    writer.add_mesh(
+        tag="samples/random_generation",
+        vertices=generated_xyz,
+        colors=gen_colors,
+        global_step=epoch,
+    )
+
+    model.train()
 
 
 # ============================================================
@@ -237,7 +161,6 @@ class PointCloudVAE(nn.Module):
 # ============================================================
 
 def beta_schedule(epoch: int, cfg: TrainConfig) -> float:
-    """Linear β annealing from beta_start → beta_end over beta_epochs."""
     if epoch >= cfg.beta_epochs:
         return cfg.beta_end
     t = epoch / cfg.beta_epochs
@@ -268,10 +191,6 @@ def count_parameters(model: nn.Module) -> int:
 
 
 def normalise_batch(points: torch.Tensor) -> torch.Tensor:
-    """
-    Centre and scale each point cloud independently.
-    points : (B, N, 6)  [xyz | normals]
-    """
     xyz    = points[..., :3]
     centre = xyz.mean(dim=1, keepdim=True)
     xyz    = xyz - centre
@@ -280,37 +199,32 @@ def normalise_batch(points: torch.Tensor) -> torch.Tensor:
     return torch.cat([xyz, points[..., 3:]], dim=2)
 
 
-# ============================================================
-# Collate – pads to cfg.num_points
-# ============================================================
-
 def make_collate(num_points: int):
     def collate(batch):
         features_list = []
-        for _, feat in batch:                             # feat: (N', 6)
+        for _, feat in batch:
             N = feat.shape[0]
             if N >= num_points:
                 idx  = torch.randperm(N)[:num_points]
                 feat = feat[idx]
             else:
-                # random repeat-pad
                 pad  = num_points - N
                 idx  = torch.randint(0, N, (pad,))
                 feat = torch.cat([feat, feat[idx]], dim=0)
             features_list.append(feat)
-        return torch.stack(features_list, dim=0)          # (B, num_points, 6)
+        return torch.stack(features_list, dim=0)
     return collate
 
 
 # ============================================================
-# Train / Val step
+# Train / Val steps
 # ============================================================
 
 def train_one_epoch(
-    model:     PointCloudVAE,
+    model:     nn.Module,
     loader:    DataLoader,
     optimiser: torch.optim.Optimizer,
-    scaler:    torch.cuda.amp.GradScaler,
+    scaler:    torch.amp.GradScaler,
     cfg:       TrainConfig,
     epoch:     int,
     logger:    logging.Logger,
@@ -324,15 +238,16 @@ def train_one_epoch(
     n_batches = 0
 
     for batch_idx, points in enumerate(loader):
-        points = points.to(device, non_blocking=True)   # (B, N, 6)
+        points = points.to(device, non_blocking=True)
         points = normalise_batch(points)
-        target_xyz = points[..., :3]                    # (B, N, 3)
+        target_xyz = points[..., :3]
 
         with torch.autocast(device_type=device.type, enabled=cfg.amp):
-            coarse, refined, normals, mu, logvar = model(points)
+            # AJUSTE: Removido o 'coarse' que não existe no pipeline hierárquico
+            coords_pred, normals_pred, mu, logvar = model(points)
 
             losses = vae_loss(
-                pred_xyz   = refined,
+                pred_xyz   = coords_pred,
                 target_xyz = target_xyz,
                 mu         = mu,
                 logvar     = logvar,
@@ -348,7 +263,6 @@ def train_one_epoch(
         scaler.step(optimiser)
         scaler.update()
 
-        # accumulate
         for k, v in losses.items():
             totals[k] = totals.get(k, 0.0) + v.item()
         n_batches += 1
@@ -366,7 +280,7 @@ def train_one_epoch(
 
 @torch.no_grad()
 def validate(
-    model:  PointCloudVAE,
+    model:  nn.Module,
     loader: DataLoader,
     cfg:    TrainConfig,
     epoch:  int,
@@ -386,10 +300,10 @@ def validate(
         target_nrm = points[..., 3:]
 
         with torch.autocast(device_type=device.type, enabled=cfg.amp):
-            coarse, refined, normals, mu, logvar = model(points)
+            coords_pred, normals_pred, mu, logvar = model(points)
 
             losses = vae_loss(
-                pred_xyz   = refined,
+                pred_xyz   = coords_pred,
                 target_xyz = target_xyz,
                 mu         = mu,
                 logvar     = logvar,
@@ -398,9 +312,8 @@ def validate(
                 emd_weight = cfg.emd_weight,
             )
 
-        # extra eval metrics (no grad needed)
-        fs  = f_score(refined, target_xyz, threshold=0.01)
-        nc  = normal_consistency(refined, normals, target_xyz, target_nrm)
+        fs  = f_score(coords_pred, target_xyz, threshold=0.01)
+        nc  = normal_consistency(coords_pred, normals_pred, target_xyz, target_nrm)
 
         for k, v in losses.items():
             totals[k] = totals.get(k, 0.0) + v.item()
@@ -412,7 +325,7 @@ def validate(
 
 
 # ============================================================
-# Main
+# Main Execution
 # ============================================================
 
 def main(cfg: TrainConfig) -> None:
@@ -420,7 +333,6 @@ def main(cfg: TrainConfig) -> None:
     Path(cfg.ckpt_dir).mkdir(parents=True, exist_ok=True)
     logger = get_logger(cfg.log_dir)
     writer = SummaryWriter(log_dir=cfg.log_dir)
-    
 
     device = torch.device(
         cfg.device if (cfg.device == "cuda" and torch.cuda.is_available()) else "cpu"
@@ -449,8 +361,14 @@ def main(cfg: TrainConfig) -> None:
     )
     logger.info(f"Dataset: {trn_n} train / {val_n} val samples")
 
-    # ---- model ---------------------------------------------------------
-    model = PointCloudVAE(cfg).to(device)
+    # ---- MODEL INSTANTIATION (AJUSTADO PARA O NOVO VAE) -----------------
+    model = Vae(
+        latent_dim=cfg.latent_dim, 
+        style_dim=cfg.style_dim, 
+        in_channels=6
+    ).to(device)
+    
+    logger.info(f"Hierarchical VAE Initialised successfully.")
     logger.info(f"Parameters: {count_parameters(model):,}")
 
     # ---- optimiser / scheduler ----------------------------------------
@@ -471,10 +389,7 @@ def main(cfg: TrainConfig) -> None:
         milestones=[cfg.warmup_epochs]
     )
 
-    scaler = torch.amp.GradScaler(
-    "cuda",
-    enabled=cfg.amp and device.type == "cuda"
-    )
+    scaler = torch.amp.GradScaler("cuda", enabled=cfg.amp and device.type == "cuda")
 
     # ---- resume --------------------------------------------------------
     start_epoch = 0
@@ -505,7 +420,6 @@ def main(cfg: TrainConfig) -> None:
         scheduler.step()
         elapsed = time.time() - t0
 
-        # log epoch summary
         trn_str = "  ".join(f"trn_{k}={v:.5f}" for k, v in trn_metrics.items())
         val_str = "  ".join(f"val_{k}={v:.5f}" for k, v in val_metrics.items())
         logger.info(
@@ -516,44 +430,20 @@ def main(cfg: TrainConfig) -> None:
             f"  {trn_str}\n"
             f"  {val_str}"
         )
-        # ========================================================
+
         # TensorBoard logging
-        # ========================================================
-
-        writer.add_scalar(
-            "train/lr",
-            scheduler.get_last_lr()[0],
-            epoch
-        )
-
-        writer.add_scalar(
-            "train/beta",
-            beta_schedule(epoch, cfg),
-            epoch
-        )
+        writer.add_scalar("train/lr", scheduler.get_last_lr()[0], epoch)
+        writer.add_scalar("train/beta", beta_schedule(epoch, cfg), epoch)
 
         log_metrics_tensorboard(writer, trn_metrics, "train", epoch)
         log_metrics_tensorboard(writer, val_metrics, "val", epoch)
+        writer.add_scalar("latent/best_val_cd", best_val_cd, epoch)
 
-        # latent stats
-        writer.add_scalar(
-            "latent/best_val_cd",
-            best_val_cd,
-            epoch
-        )
-
-        # reconstruction visualisation
+        # Visualização de reconstrução a cada 5 épocas
         if epoch % 5 == 0:
-            log_reconstructions(
-                writer,
-                model,
-                val_loader,
-                device,
-                epoch,
-                max_items=4,
-            )
+            log_reconstructions(writer, model, val_loader, device, epoch, max_items=4)
 
-                # ---- checkpointing -------------------------------------------
+        # ---- checkpointing -------------------------------------------
         record = {"epoch": epoch, **{f"trn_{k}": v for k, v in trn_metrics.items()},
                   **{f"val_{k}": v for k, v in val_metrics.items()}}
         history.append(record)
@@ -569,17 +459,11 @@ def main(cfg: TrainConfig) -> None:
             "history":     history,
         }
 
-        # always save latest
         torch.save(save_state, os.path.join(cfg.ckpt_dir, "latest.pt"))
 
-        # periodic checkpoint
         if (epoch + 1) % cfg.save_every == 0:
-            torch.save(
-                save_state,
-                os.path.join(cfg.ckpt_dir, f"epoch_{epoch:04d}.pt")
-            )
+            torch.save(save_state, os.path.join(cfg.ckpt_dir, f"epoch_{epoch:04d}.pt"))
 
-        # best model (by val Chamfer distance)
         val_cd_key = "val_cd" if "val_cd" in val_metrics else "val_recon"
         val_cd = val_metrics.get(val_cd_key, math.inf)
         if val_cd < best_val_cd:
@@ -588,29 +472,27 @@ def main(cfg: TrainConfig) -> None:
             torch.save(save_state, os.path.join(cfg.ckpt_dir, "best.pt"))
             logger.info(f"  ✓ New best val CD: {best_val_cd:.6f}")
 
-        # save history JSON
         with open(os.path.join(cfg.log_dir, "history.json"), "w") as f:
             json.dump(history, f, indent=2)
+
     writer.close()
     logger.info("Training complete.")
 
 
 # ============================================================
-# CLI
+# CLI Parser
 # ============================================================
 
 def parse_args() -> TrainConfig:
     cfg = TrainConfig()
-    p   = argparse.ArgumentParser(description="Train PVCNN Point-Cloud VAE")
+    p   = argparse.ArgumentParser(description="Train LION Hierarchical Point-Cloud VAE")
     for field_name, field_val in asdict(cfg).items():
         t = type(field_val)
         if t is bool:
-            p.add_argument(f"--{field_name}", default=field_val,
-                           type=lambda x: x.lower() != "false")
+            p.add_argument(f"--{field_name}", default=field_val, type=lambda x: x.lower() != "false")
         else:
             p.add_argument(f"--{field_name}", default=field_val, type=t)
     
-
     args = vars(p.parse_args())
     return TrainConfig(**args)
 

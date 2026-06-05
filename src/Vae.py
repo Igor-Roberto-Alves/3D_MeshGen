@@ -1,279 +1,77 @@
+from src.Encoder import Encoder, EncoderStyle
+from src.Decoder import LIONDecoder
+# de src.metric import * (adicione se for usar as métricas aqui)
 import torch
 import torch.nn as nn
-from typing import Tuple, Optional
-from src.Encoder import (
-    HierarchicalEncoder,
-    GlobalEncoder,
-    CrossBranchFusion,
-    VAEBottleneck,
-)
 
-from src.GAN import PointNetDiscriminator
-from src.metric import chamfer_distance, earth_movers_distance_sinkhorn
-from src.GAN2 import StablePointNetDiscriminator as PND
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from src.LionDecoder import *
-import numpy as np
-
-
-
-class DualBranchPointVAE(nn.Module):
-
-    """
-    Dual-branch β-VAE + GAN for point cloud generation with MiniLion Decoder.
-    """
-
-    def __init__(
-        self,
-        d_model: int = 384,
-        latent_dim: int = 512,
-        n_out: int = 2048,
-        enc_depth: int = 4,
-        n_heads: int = 6,   
-        beta: float = 1e-3,
-        lambda_adv: float = 0.1,
-        disc_base_ch: int = 64,
-    ):
+class Vae(nn.Module): 
+    def __init__(self, latent_dim: int = 256, style_dim: int = 512, in_channels: int = 6):
+        # 1. CORREÇÃO: Essencial para o PyTorch registrar os parâmetros do modelo
         super().__init__()
-        self.beta = beta
-        self.lambda_adv = lambda_adv
+        
         self.latent_dim = latent_dim
+        self.style_dim = style_dim
 
-        # ── Encoder ───────────────────────────────────────────────────────────
-
-        self.hier_enc = HierarchicalEncoder(
-            d_model=d_model, n_heads=n_heads, depth=enc_depth
-        )
-        self.glob_enc = GlobalEncoder(d_model=d_model, n_heads=n_heads, depth=enc_depth)
-        self.fusion = CrossBranchFusion(d_model=d_model, n_heads=n_heads)
-        self.bottleneck = VAEBottleneck(in_dim=d_model, latent_dim=latent_dim)
-
-        # ── INTEGRATED: New LION Style/AdaGN-based Decoder ────────────────────
-
-     
-        self.decoder = StablePointDecoder(
-            latent_dim=latent_dim,
-            style_dim=d_model,
-            n_out=n_out,
-            hidden=256,
-        )
-
-
-        # ── Discriminator ─────────────────────────────────────────────────────
-
-        self.discriminator = PND(
-            in_ch=6,
-            use_spectral=True,
-        )
-
-        self.adv_loss = nn.BCEWithLogitsLoss()
-
-    # ── helpers ───────────────────────────────────────────────────────────────
-
-    def freeze_D(self) -> None:
-        """Freeze discriminator weights (call before the G/VAE update step)."""
-        for p in self.discriminator.parameters():
-            p.requires_grad_(False)
-
-    def unfreeze_D(self) -> None:
-        """Unfreeze discriminator weights (call before the D update step)."""
-        for p in self.discriminator.parameters():
-            p.requires_grad_(True)
-
-    # ── encode / decode ───────────────────────────────────────────────────────
-
-    def encode(
-        self, xyz: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        h_feat, _ = self.hier_enc(xyz)
-        g_feat = self.glob_enc(xyz)  
+        # 2. CORREÇÃO: Instanciando as redes com seus respectivos hiperparâmetros
+        self.style_encoder = EncoderStyle(in_channels=in_channels, style_dim=style_dim)
+        self.encoder = Encoder(latent_dim=latent_dim, in_channels=in_channels, style_dim=style_dim)
         
-        fused = self.fusion(h_feat, g_feat)
-        z, mu, logvar = self.bottleneck(fused)
+        # O LIONDecoder reconstrói coordenadas (3) + normais (3) = 6 canais de saída
+        self.decoder = LIONDecoder(latent_dim=latent_dim, style_dim=style_dim, out_channels=6)
+    
+    def Encode(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        sty = self.style_encoder(x) # Saída: (B, style_dim)
         
-        return z, mu, logvar, g_feat 
-
-    def decode(self, z: torch.Tensor, style: torch.Tensor) -> dict:
-        # O novo decoder precisa receber tanto o z (pontos latentes) quanto o style
-        return self.decoder(z_local=z, style=style)
-
-    # ── forward ───────────────────────────────────────────────────────────────
-
-    def forward(self, xyz: torch.Tensor) -> dict:
-        z, mu, logvar, style = self.encode(xyz) 
-        decoder_out = self.decode(z, style)     
-        return dict(
-            recon=decoder_out["recon"],
-            z=z,
-            mu=mu,
-            logvar=logvar,
-        )
+        mu, logvar = self.encoder(x, sty) # Saídas: (B, latent_dim)
+        logvar = torch.clamp(logvar, min = -10.0, max = 10.0)
+        # Precisamos retornar o 'sty' também para passá-lo depois para o Decoder!
+        return mu, logvar, sty
     
-    # ── losses ────────────────────────────────────────────────────────────────
-
-
-    def loss_discriminator(
-        self,
-        real: torch.Tensor,
-        fake: torch.Tensor,
-    ) -> dict:
-
-        d_real = self.discriminator(real)
-        d_fake = self.discriminator(fake.detach())
-
-        loss_real = F.relu(1.0 - d_real).mean()
-        loss_fake = F.relu(1.0 + d_fake).mean()
-
-        loss_D = loss_real + loss_fake
-
-        return {
-            "loss_D": loss_D,
-            "loss_D_real": loss_real,
-            "loss_D_fake": loss_fake,
-        }
-
-
-
+    def Decode(self, z: torch.Tensor, style: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        z     : (B, N, latent_dim) -> pontos latentes amostrados
+        style : (B, style_dim)     -> estilo global
+        """
+        coords, normals = self.decoder(z, style)
+        return coords, normals
     
-    def loss_generator(
-        self,
-        out: dict,
-        target: torch.Tensor,
-    ) -> dict:
-
-        cd_loss, _ = chamfer_distance(
-            out["recon"],
-            target,
-        )
-
-        emd_loss, normal_loss = earth_movers_distance_sinkhorn(
-            out["recon"][..., :3],
-            target[..., :3],
-        )
-
-        point_loss = cd_loss + 0.05 * emd_loss
-
-        kl = VAEBottleneck.kl_loss(
-            out["mu"],
-            out["logvar"],
-        )
-
-        g_fake_logits = self.discriminator(
-            out["recon"]
-        )
-
-        loss_adv = -g_fake_logits.mean()
-
-        total = (
-            point_loss
-            + self.beta * kl
-            + self.lambda_adv * loss_adv
-            + normal_loss
-        )
-
-        return dict(
-            total=total,
-            recon_points=point_loss,
-            cd=cd_loss,
-            emd=emd_loss,
-            kl=kl,
-            loss_adv=loss_adv,
-            normal_loss=normal_loss,
-        )
-
-
-
-
-    def loss(self, out: dict, target: torch.Tensor) -> dict:
-
-        cd_loss, _ = chamfer_distance(
-            out["recon"],
-            target,
-        )
-
-        emd_loss, normal_loss = earth_movers_distance_sinkhorn(
-            out["recon"][..., :3],
-            target[..., :3],
-        )
-
-        point_loss = cd_loss + emd_loss
-
-        kl = VAEBottleneck.kl_loss(
-            out["mu"],
-            out["logvar"],
-        )
-
-        total = point_loss + self.beta * kl + normal_loss
-
-        return dict(
-            total=total,
-            recon_points=point_loss,
-            cd=cd_loss,
-            emd=emd_loss,
-            kl=kl,
-            normal_loss=normal_loss,
-        )
-
-
-    # ── generation ────────────────────────────────────────────────────────────
-
-    @torch.no_grad()
-    def sample(self, n: int, device: torch.device) -> torch.Tensor:
-        z = torch.randn(n, self.latent_dim, device=device)
-        return self.decode(z)["recon"]
-
-    @torch.no_grad()
-    def interpolate(
-        self,
-        xyz_a: torch.Tensor,
-        xyz_b: torch.Tensor,
-        steps: int = 8,
-        use_slerp: bool = False,
-    ) -> torch.Tensor:
-        _, mu_a, _ = self.encode(xyz_a)
-        _, mu_b, _ = self.encode(xyz_b)
-        alphas = torch.linspace(0, 1, steps, device=xyz_a.device)
-        shapes = []
-        for a in alphas:
-            if use_slerp:
-                dot = (mu_a * mu_b).sum(dim=-1, keepdim=True).clamp(-1, 1)
-                omega = torch.acos(dot)
-                sin_omega = torch.sin(omega).clamp(min=1e-8)
-                z = (torch.sin((1 - a) * omega) / sin_omega) * mu_a + (
-                    torch.sin(a * omega) / sin_omega
-                ) * mu_b
-            else:
-                z = (1 - a) * mu_a + a * mu_b
-            shapes.append(self.decode(z)["recon"])
-        return torch.stack(shapes, dim=1)
-
-    def report_parameters(self) -> None:
-        def count_module_params(module: nn.Module):
-            tot = sum(p.numel() for p in module.parameters())
-            train = sum(p.numel() for p in module.parameters() if p.requires_grad)
-            return tot, train
-
-        h_tot, h_train = count_module_params(self.hier_enc)
-        g_tot, g_train = count_module_params(self.glob_enc)
-        f_tot, f_train = count_module_params(self.fusion)
-        b_tot, b_train = count_module_params(self.bottleneck)
-        dec_tot, dec_train = count_module_params(self.decoder)
-        disc_tot, disc_train = count_module_params(self.discriminator)
-
-        global_tot, global_train = count_module_params(self)
-
-        print("\n" + "=" * 65)
-        print(f"{'SUBMODULE':<25} | {'TOTAL PARAMS':<16} | {'TRAINABLE PARAMS':<16}")
-        print("=" * 65)
-        print(f"{'Hierarchical Encoder':<25} | {h_tot:>14,} | {h_train:>16,}")
-        print(f"{'Global Encoder':<25} | {g_tot:>14,} | {g_train:>16,}")
-        print(f"{'Cross-Branch Fusion':<25} | {f_tot:>14,} | {f_train:>16,}")
-        print(f"{'VAE Bottleneck':<25} | {b_tot:>14,} | {b_train:>16,}")
-        print(f"{'Point Decoder (LION)':<25} | {dec_tot:>14,} | {dec_train:>16,}")
-        print(f"{'Discriminator (PointNet)':<25} | {disc_tot:>14,} | {disc_train:>16,}")
-        print("-" * 65)
-        print(f"{'GLOBAL SYSTEM TOTAL':<25} | {global_tot:>14,} | {global_train:>16,}")
-        print("=" * 65 + "\n")
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+  
+        mu, logvar, sty = self.Encode(x)
+        
+        # O reparameterization ocorre de forma única para cada ponto espacial da nuvem
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        z_points = mu + eps * std  # Nuvem Latente Real de alta resolução: (B, N, latent_dim)
+        
+        # --- REMOVA OU COMENTE ESSAS LINHAS ARTIFICIAIS ---
+        # N = x.shape[1]
+        # z_points = z.unsqueeze(1).expand(-1, N, -1) 
+        
+        # Executa o decoder passando a textura latente rica e o estilo global
+        coords_pred, normals_pred = self.Decode(z_points, sty)
+        
+        return coords_pred, normals_pred, mu, logvar
+    
+    def generate(self, num_samples: int, num_points: int = 2048, device: torch.device = None) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Gera nuvens de pontos puras amostrando diretamente do prior Gaussiano padrão N(0, I).
+        
+        num_samples : Quantidade de objetos 3D a gerar
+        num_points  : Quantidade de pontos espaciais por objeto
+        """
+        if device is None:
+            device = next(self.parameters()).device
+            
+        self.eval()
+        with torch.no_grad():
+            # 1. Amostra a textura latente local por ponto do Prior Padrão
+            z_points = torch.randn(num_samples, num_points, self.latent_dim, device=device)
+            
+            # 2. Amostra o vetor de estilo macro global do Prior Padrão
+            sty_sample = torch.randn(num_samples, self.style_dim, device=device)
+            
+            # 3. Decodifica os vetores latentes em coordenadas e normais físicas
+            coords_pred, normals_pred = self.Decode(z_points, sty_sample)
+            
+        return coords_pred, normals_pred

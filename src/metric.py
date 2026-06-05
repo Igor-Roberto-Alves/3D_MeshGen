@@ -92,7 +92,8 @@ def chamfer_distance_knn(
 
     Parameters are identical to chamfer_distance.
     """
-    dist = torch.cdist(pred.float(), target.float())                  # (B, N, M)
+    with torch.autocast(device_type=pred.device.type, enabled=False):
+        dist = torch.cdist(pred.float(), target.float())
 
     cd_pred = dist.topk(k, dim=2, largest=False).values.mean(dim=2)  # (B, N)
     cd_tgt  = dist.topk(k, dim=1, largest=False).values.mean(dim=1)  # (B, M)
@@ -239,14 +240,17 @@ def normal_consistency(
 
 def kl_divergence(mu: Tensor, logvar: Tensor, reduce: str = "mean") -> Tensor:
     """
-    Closed-form KL[q(z|x) || p(z)]  where p(z) = N(0, I).
-
-    KL = -0.5 * Σ (1 + logvar - μ² - exp(logvar))
-
-    mu, logvar : (B, latent_dim)
+    Closed-form KL[q(z|x) || p(z)] adaptado para espaços latentes de nuvens de pontos.
+    Suporta tanto formato de vetor plano (B, D) quanto formato LION (B, N, D).
     """
-    kl = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp())   # (B, latent_dim)
-    kl = kl.sum(dim=1)                                     # (B,)
+    # Calcula o KL element-wise
+    kl = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp())
+    
+    # Se o tensor for 3D (B, N, latent_dim), precisamos somar nos eixos 1 e 2
+    if kl.dim() == 3:
+        kl = kl.sum(dim=(1, 2)) # Soma os pontos e os canais latentes -> Saída: (B,)
+    else:
+        kl = kl.sum(dim=1)      # Comportamento antigo para vetores planos -> Saída: (B,)
 
     if reduce == "none":
         return kl

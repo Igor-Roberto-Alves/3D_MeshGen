@@ -25,6 +25,7 @@ class SharedMLP(nn.Sequential):
 # ---------------------------------------------------------------------------
 
 class VoxelBranch(nn.Module):
+
     """
     Voxelises a point cloud, applies 3-D convolutions, then trilinearly
     samples the voxel features back onto the original point positions.
@@ -52,12 +53,14 @@ class VoxelBranch(nn.Module):
     # ------------------------------------------------------------------
     def _voxelise(self, coords: torch.Tensor, features: torch.Tensor,
                   R: int) -> torch.Tensor:
+        
         """
         Scatter-average features into a (B, C, R, R, R) voxel grid.
 
         coords   : (B, 3, N)  – already normalised to [0, R-1]
         features : (B, C, N)
         """
+
         B, C, N = features.shape
         device = features.device
 
@@ -94,7 +97,7 @@ class VoxelBranch(nn.Module):
         # normalise xyz to voxel grid indices
         xyz_min = coords.min(dim=2, keepdim=True).values
         xyz_max = coords.max(dim=2, keepdim=True).values
-        scale   = (xyz_max - xyz_min).clamp(min=1e-6)
+        scale   = (xyz_max - xyz_min).clamp(min=1e-4)
         norm_coords = (coords - xyz_min) / scale * (R - 1)  # [0, R-1]
 
         # voxelise → 3-D conv → sample back
@@ -103,9 +106,11 @@ class VoxelBranch(nn.Module):
 
         # trilinear sampling
         sample_grid  = norm_coords / (R - 1) * 2 - 1             # [-1, 1]
+        sample_grid  = torch.clamp(sample_grid, min=-1.0, max=1.0)
         sample_grid  = sample_grid.permute(0, 2, 1).unsqueeze(1).unsqueeze(1)
         # grid_sample expects (B, D_out, H_out, W_out, 3)
         sample_grid  = sample_grid.expand(-1, 1, 1, N, 3)        # (B, 1, 1, N, 3)
+        
 
         sampled = F.grid_sample(
             voxel_feats, sample_grid,
@@ -170,22 +175,39 @@ class PVConvBlock(nn.Module):
 # Encoder
 # ---------------------------------------------------------------------------
 
+class EncoderStyle(nn.Module):
+    """
+    Este bloco recebe a nuvem bruta (B, N, 6), passa pelas convoluções
+    e colapsa os pontos para gerar o vetor de estilo global.
+    """
+    def __init__(self, in_channels: int = 6, style_dim: int = 512):
+        super().__init__()
+        # Usamos os mesmos blocos PVCNN para entender a geometria
+        self.stage0 = PVConvBlock(in_channels, 64,  resolution=32)
+        self.stage1 = PVConvBlock(64,          128, resolution=16)
+        self.stage2 = PVConvBlock(128,         256, resolution=8)
+        
+        # Uma MLP que vai moldar o vetor após o Max-Pooling
+        self.style_mlp = nn.Sequential(
+            nn.Linear(256, 512),
+            nn.GELU(),
+            nn.Linear(512, style_dim),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, N, 6)
+        x = self.stage0(x)               # (B, N, 64)
+        x = self.stage1(x)               # (B, N, 128)
+        x = self.stage2(x)               # (B, N, 256)
+        
+        # Max-pool sobre a dimensão dos pontos para torná-lo GLOBAL
+        g = x.max(dim=1).values          # (B, 256)
+        
+        # Gera o vetor de estilo (B, style_dim)
+        return self.style_mlp(g)
+    
 class Encoder(nn.Module):
-    """
-    PVCNN-inspired hierarchical encoder that maps a point cloud
-    (B, N, 6) → latent mean μ and log-variance log σ²  of shape (B, latent_dim).
-
-    Architecture
-    ------------
-    Stage 0 : PVConvBlock  6   → 64   (res=32)
-    Stage 1 : PVConvBlock  64  → 128  (res=16)
-    Stage 2 : PVConvBlock  128 → 256  (res=8)
-    Stage 3 : SharedMLP    256 → 512
-    Global  : max-pool over N
-    Head    : Linear → (μ, log σ²)
-    """
-
-    def __init__(self, latent_dim: int = 256, in_channels: int = 6):
+    def __init__(self, latent_dim: int = 256, in_channels: int = 6, style_dim: int = 512):
         super().__init__()
         self.latent_dim = latent_dim
 
@@ -193,6 +215,10 @@ class Encoder(nn.Module):
         self.stage1 = PVConvBlock(64,          128, resolution=16)
         self.stage2 = PVConvBlock(128,         256, resolution=8)
 
+        # Projeta o estilo global de volta para os 256 canais que saem do stage2
+        self.style_projection = nn.Linear(style_dim, 256)
+
+        # Recebe os 256 canais (já misturados com o estilo) e expande para 512
         self.local_mlp = SharedMLP([256, 512])
 
         # global aggregation head
@@ -203,30 +229,34 @@ class Encoder(nn.Module):
             nn.GELU(),
         )
 
-        self.fc_mu     = nn.Linear(512, latent_dim)
-        self.fc_logvar = nn.Linear(512, latent_dim)
+        #self.fc_mu     = nn.Linear(512, latent_dim)
+        #self.fc_logvar = nn.Linear(512, latent_dim)
+        self.fc_mu     = nn.Conv1d(512, latent_dim, kernel_size=1)
+        self.fc_logvar = nn.Conv1d(512, latent_dim, kernel_size=1)
 
     # ------------------------------------------------------------------
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        x : (B, N, 6)  – concatenation of xyz and normals
-
-        Returns
-        -------
-        mu     : (B, latent_dim)
-        logvar : (B, latent_dim)
-        """
+    # CORREÇÃO 1: Adicionado o parâmetro 'style' na assinatura
+    def forward(self, x: torch.Tensor, style: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         x = self.stage0(x)               # (B, N, 64)
         x = self.stage1(x)               # (B, N, 128)
         x = self.stage2(x)               # (B, N, 256)
 
-        # point-wise MLP
+        s = self.style_projection(style) # (B, 256)
+        x = x + s.unsqueeze(1)           # (B, N, 256)
+
         x = self.local_mlp(x.permute(0, 2, 1)).permute(0, 2, 1)  # (B, N, 512)
 
-        # global max-pool
-        g = x.max(dim=1).values           # (B, 512)
-        g = self.global_mlp(g)            # (B, 512)
+        # --- REMOVA OU COMENTE O POOLING E A MLP GLOBAL ---
+        # g = x.max(dim=1).values            
+        # g = self.global_mlp(g)             
+        # mu     = self.fc_mu(g)            
+        # logvar = self.fc_logvar(g)        
 
-        mu     = self.fc_mu(g)            # (B, latent_dim)
-        logvar = self.fc_logvar(g)        # (B, latent_dim)
+        # +++ ADICIONE A PREDIÇÃO POR PONTO +++
+        # Permutamos para (B, Canais, Pontos) pois nn.Conv1d opera no eixo 1
+        x_features = x.permute(0, 2, 1) # (B, 512, N)
+        
+        # Mapeia os 512 canais de cada ponto para a dimensão latente desejada
+        mu     = self.fc_mu(x_features).permute(0, 2, 1)     # (B, N, latent_dim)
+        logvar = self.fc_logvar(x_features).permute(0, 2, 1)  # (B, N, latent_dim)
         return mu, logvar

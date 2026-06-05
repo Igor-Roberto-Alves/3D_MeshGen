@@ -1,190 +1,109 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-
+from src.Encoder import *
 # ---------------------------------------------------------------------------
-# Helpers
+# Módulo de Modulação de Estilo (AdaGN / MLP Modulation)
 # ---------------------------------------------------------------------------
-
-class ResidualMLP(nn.Module):
-    """Point-wise residual block (B, C, N)."""
-    def __init__(self, channels: int):
+class StyleModulation(nn.Module):
+    """
+    Modula as feições dos pontos locais usando o vetor de estilo global.
+    Aplica: out = x * scale(style) + shift(style)
+    """
+    def __init__(self, style_dim: int, feat_channels: int):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv1d(channels, channels, 1, bias=False),
-            nn.BatchNorm1d(channels),
-            nn.GELU(),
-            nn.Conv1d(channels, channels, 1, bias=False),
-            nn.BatchNorm1d(channels),
-        )
-        self.act = nn.GELU()
+        self.to_scale = nn.Linear(style_dim, feat_channels)
+        self.to_shift = nn.Linear(style_dim, feat_channels)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.act(x + self.net(x))
+    def forward(self, x: torch.Tensor, style: torch.Tensor) -> torch.Tensor:
+        # x: (B, N, feat_channels) | style: (B, style_dim)
+        scale = torch.tanh(self.to_scale(style)).unsqueeze(1)
+        shift = 0.1 * torch.tanh(self.to_shift(style)).unsqueeze(1)
 
-
-class FoldingLayer(nn.Module):
-    """
-    Single folding step: maps (z_exp || grid || prev) → new 3-D coords.
-
-    in_channels  : z_dim + grid_dim + prev_coord_dim
-    hidden       : hidden layer width
-    """
-    def __init__(self, in_channels: int, hidden: int = 512):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv1d(in_channels, hidden,  1, bias=False),
-            nn.BatchNorm1d(hidden),
-            nn.GELU(),
-            nn.Conv1d(hidden,      hidden,  1, bias=False),
-            nn.BatchNorm1d(hidden),
-            nn.GELU(),
-            nn.Conv1d(hidden,      3,       1),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
+        return x * (1 + scale) + shift
 
 
 # ---------------------------------------------------------------------------
-# Decoder
+# LION Decoder Core
 # ---------------------------------------------------------------------------
-
-class Decoder(nn.Module):
+class LIONDecoder(nn.Module):
     """
-    FoldingNet-style decoder conditioned on a latent vector z.
+    LION Decoder oficial baseado em pontos condicionais.
+    Transforma pontos latentes h0 (B, N, latent_dim) guiados por um 
+    vetor de estilo global z0 (B, style_dim) na nuvem 3D final com normais.
 
-    Pipeline
-    --------
-    1. Expand z to every point: (B, latent_dim) → (B, latent_dim, N)
-    2. Build a 2-D canonical grid of N points (flattened √N × √N).
-    3. Two folding steps produce coarse 3-D coordinates.
-    4. A refinement MLP predicts per-point residuals (normal-like offsets).
-    5. Output: coarse point cloud  (B, N, 3)
-               refined point cloud (B, N, 3)   ← primary output
-               per-point normals   (B, N, 3)
-
-    Args
-    ----
-    latent_dim    : dimension of the input latent code z
-    num_points    : number of output points (must be a perfect square)
-    hidden        : hidden MLP width in folding layers
+    Arquitetura Reversa
+    -------------------
+    Stage 0 : Modulação inicial + PVConvBlock 256 → 128 (res=8)
+    Stage 1 : Modulação intermediária + PVConvBlock 128 → 64  (res=16)
+    Stage 2 : PVConvBlock 64 → 32  (res=32)
+    Head    : SharedMLP 32 → 6 (XYZ + Normais)
     """
-
-   
     def __init__(
         self,
-        latent_dim: int = 256,
-        num_points: int = 2048,
-        hidden: int = 512,
+        latent_dim: int = 256,   # dimensão dos pontos latentes locais (h0)
+        style_dim: int = 512,    # dimensão do vetor de estilo global (z0)
+        out_channels: int = 6     # XYZ (3) + Normais (3)
     ):
         super().__init__()
 
-        self.latent_dim = latent_dim
-        self.num_points = num_points
+        # Camada de projeção inicial para alinhar os canais latentes locais
+        self.input_projection = SharedMLP([latent_dim, 256])
 
-        # ------------------------------------------------------------------
-        # Flexible 2-D grid (works for ANY num_points)
-        # ------------------------------------------------------------------
+        # Módulos de Modulação Adaptativa de Estilo para cada estágio do Decoder
+        self.mod0 = StyleModulation(style_dim, 256)
+        self.mod1 = StyleModulation(style_dim, 128)
 
-        h = int(num_points ** 0.5)
-        w = (num_points + h - 1) // h
+        # Blocos PVCNN Reversos (Up-sampling / Refinamento hierárquico)
+        # Nota: No decoder, as resoluções dos voxels aumentam para suavizar a topologia
+        self.stage0 = PVConvBlock(256, 128, resolution=8)
+        self.stage1 = PVConvBlock(128, 64,  resolution=16)
+        self.stage2 = PVConvBlock(64,  32,  resolution=32)
 
-        self.grid_h = h
-        self.grid_w = w
-
-        # canonical 2-D grid
-        u = torch.linspace(-1, 1, h)
-        v = torch.linspace(-1, 1, w)
-
-        grid_u, grid_v = torch.meshgrid(u, v, indexing="ij")
-
-        grid = torch.stack(
-            [
-                grid_u.flatten(),
-                grid_v.flatten(),
-            ],
-            dim=0,
-        )  # (2, h*w)
-
-        # trim excess points
-        grid = grid[:, :num_points]
-
-        self.register_buffer("grid", grid)
-
-        grid_dim = 2
-
-
-        # ---- latent projection ----------------------------------------
-        self.z_proj = nn.Sequential(
-            nn.Linear(latent_dim, hidden),
+        # Cabeçalho de saída ponto a ponto
+        self.output_head = nn.Sequential(
+            nn.Conv1d(32, 16, 1, bias=False),
+            nn.BatchNorm1d(16),
             nn.GELU(),
-            nn.Linear(hidden, hidden),
-            nn.GELU(),
+            nn.Conv1d(16, out_channels, 1) # Projeta para XYZ + Normais
         )
 
-        # ---- fold 1: (z || grid) → coarse coords ----------------------
-        self.fold1 = FoldingLayer(hidden + grid_dim, hidden)
-
-        # ---- fold 2: (z || fold1_out) → refined coarse coords ----------
-        self.fold2 = FoldingLayer(hidden + 3, hidden)
-
-        # ---- per-point feature refinement for residuals ----------------
-        self.refine_backbone = nn.Sequential(
-            nn.Conv1d(hidden + 3, hidden, 1, bias=False),
-            nn.BatchNorm1d(hidden),
-            nn.GELU(),
-            ResidualMLP(hidden),
-            ResidualMLP(hidden),
-        )
-
-        self.refine_xyz     = nn.Conv1d(hidden, 3, 1)   # residual Δxyz
-        self.refine_normals = nn.Conv1d(hidden, 3, 1)   # predicted normals
-
-    # ------------------------------------------------------------------
-    def forward(
-        self, z: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(self, latent_points: torch.Tensor, style: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        z : (B, latent_dim)
+        latent_points : (B, N, latent_dim) -> h0 gerado pelo modelo de difusão
+        style         : (B, style_dim)     -> z0 gerado pelo modelo de difusão global
 
         Returns
         -------
-        coarse   : (B, N, 3)  – after fold2
-        refined  : (B, N, 3)  – coarse + residual
-        normals  : (B, N, 3)  – unit normals (not normalised here; loss handles it)
+        coords  : (B, N, 3) – Coordenadas XYZ finais reconstruídas
+        normals : (B, N, 3) – Vetores normais da superfície calculados por ponto
         """
-        B  = z.shape[0]
-        N  = self.num_points
+        # 1. Projeção Inicial dos canais latentes
+        # Passa de (B, N, latent_dim) -> (B, N, 256)
+        x = latent_points.permute(0, 2, 1)
+        x = self.input_projection(x).permute(0, 2, 1)
 
-        # project latent → (B, hidden)
-        z_feat = self.z_proj(z)                              # (B, hidden)
+        # 2. Estágio 0: Modula com o Estilo + Processamento PVCNN
+        x = self.mod0(x, style)
+        x = self.stage0(x)               # (B, N, 128)
 
-        # expand to all points → (B, hidden, N)
-        z_exp  = z_feat.unsqueeze(2).expand(-1, -1, N)
+        # 3. Estágio 1: Segunda rodada de Modulação + Processamento PVCNN
+        x = self.mod1(x, style)
+        x = self.stage1(x)               # (B, N, 64)
 
-        # canonical grid → (B, 2, N)
-        grid   = self.grid.unsqueeze(0).expand(B, -1, -1)
+        # 4. Estágio 2: Refinamento Geométrico Final de Alta Resolução
+        x = self.stage2(x)               # (B, N, 32)
 
-        # ---- fold 1 ---------------------------------------------------
-        inp1   = torch.cat([z_exp, grid], dim=1)            # (B, hidden+2, N)
-        f1     = self.fold1(inp1)                            # (B, 3, N)
+        # 5. Projeção para o espaço 3D físico
+        # Transforma os 32 canais abstratos em 6 canais reais (B, 6, N)
+        feat_out = self.output_head(x.permute(0, 2, 1))
+        feat_out = feat_out.permute(0, 2, 1) # Retorna para (B, N, 6)
 
-        # ---- fold 2 ---------------------------------------------------
-        inp2   = torch.cat([z_exp, f1], dim=1)              # (B, hidden+3, N)
-        f2     = self.fold2(inp2)                            # (B, 3, N)
+        # Separando o output de coordenadas físicas e vetores normais
+        coords  = feat_out[:, :, :3]    # Primeiras 3 colunas: X, Y, Z
+        normals = feat_out[:, :, 3:]    # Últimas 3 colunas: Nx, Ny, Nz
+        coords = torch.tanh(feat_out[:, :, :3])
+        # Força as normais a possuírem comprimento unitário matemático (Normalização L2)
+        normals = F.normalize(normals, p=2, dim=-1)
 
-        coarse = f2.permute(0, 2, 1)                        # (B, N, 3)
-
-        # ---- refinement -----------------------------------------------
-        ref_in  = torch.cat([z_exp, f2], dim=1)             # (B, hidden+3, N)
-        ref_h   = self.refine_backbone(ref_in)               # (B, hidden, N)
-
-        delta   = self.refine_xyz(ref_h)                    # (B, 3, N)
-        normals = self.refine_normals(ref_h)                 # (B, 3, N)
-
-        refined = (f2 + delta).permute(0, 2, 1)             # (B, N, 3)
-        normals = normals.permute(0, 2, 1)                   # (B, N, 3)
-
-        return coarse, refined, normals
+        return coords, normals
