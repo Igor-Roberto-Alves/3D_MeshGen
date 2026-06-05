@@ -60,10 +60,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class NvidiaStyleLatentDecoder(nn.Module):
+
     """
     Decoder robusto baseado no modelo da NVIDIA.
     Compatível com o Bottleneck flat de 512 dimensões.
     """
+
     def __init__(self, latent_dim=512, style_dim=384, n_out=2048, n_seed=256):
         super().__init__()
         self.n_out = n_out
@@ -138,3 +140,231 @@ class NvidiaStyleLatentDecoder(nn.Module):
         final_normals = final_normals / (final_normals.norm(dim=-1, keepdim=True) + 1e-8)
         
         return {"recon": torch.cat([final_xyz, final_normals], dim=-1)}
+
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class ResidualBlock1D(nn.Module):
+
+    def __init__(self, channels):
+        super().__init__()
+
+        self.conv1 = nn.Conv1d(channels, channels, 1)
+        self.norm1 = nn.GroupNorm(8, channels)
+
+        self.conv2 = nn.Conv1d(channels, channels, 1)
+        self.norm2 = nn.GroupNorm(8, channels)
+
+    def forward(self, x):
+
+        res = x
+
+        x = F.gelu(self.norm1(self.conv1(x)))
+        x = self.norm2(self.conv2(x))
+
+        return F.gelu(x + res)
+
+
+class StablePointDecoder(nn.Module):
+
+    """
+    Lightweight reconstruction decoder.
+
+    ~5M params instead of hundreds of millions.
+    """
+
+    def __init__(
+        self,
+        latent_dim=512,
+        style_dim=384,
+        n_out=2048,
+        n_seed=256,
+        hidden=128,
+    ):
+        super().__init__()
+
+        self.n_out = n_out
+        self.n_seed = n_seed
+        self.expand_ratio = n_out // n_seed
+        self.hidden = hidden
+
+        # ------------------------------------------------------------
+        # Small latent expansion
+        # ------------------------------------------------------------
+
+        self.fc = nn.Sequential(
+            nn.Linear(latent_dim + style_dim, 1024),
+            nn.GELU(),
+
+            nn.Linear(1024, n_seed * hidden),
+            nn.GELU(),
+        )
+
+        # ------------------------------------------------------------
+        # Learned coarse seed positions
+        # ------------------------------------------------------------
+
+        self.seed_xyz = nn.Parameter(
+            torch.randn(1, 3, n_seed) * 0.02
+        )
+
+        # ------------------------------------------------------------
+        # Geometry refinement
+        # ------------------------------------------------------------
+
+        self.refine = nn.Sequential(
+            ResidualBlock1D(hidden),
+            ResidualBlock1D(hidden),
+            ResidualBlock1D(hidden),
+        )
+
+        # ------------------------------------------------------------
+        # Upsampling features
+        # ------------------------------------------------------------
+
+        self.upsample = nn.Conv1d(
+            hidden,
+            hidden * self.expand_ratio,
+            kernel_size=1
+        )
+
+        # ------------------------------------------------------------
+        # XYZ prediction
+        # ------------------------------------------------------------
+
+        self.xyz_head = nn.Sequential(
+            nn.Conv1d(hidden, hidden, 1),
+            nn.GELU(),
+
+            nn.Conv1d(hidden, 3, 1),
+        )
+
+        # ------------------------------------------------------------
+        # Normal prediction
+        # ------------------------------------------------------------
+
+        self.normal_head = nn.Sequential(
+            nn.Conv1d(hidden, hidden, 1),
+            nn.GELU(),
+
+            nn.Conv1d(hidden, 3, 1),
+        )
+
+    def forward(self, z_local, style):
+
+        B = z_local.shape[0]
+
+        # ------------------------------------------------------------
+        # Merge latent + style
+        # ------------------------------------------------------------
+
+        latent = torch.cat(
+            [z_local, style],
+            dim=-1
+        )
+
+        # ------------------------------------------------------------
+        # Create coarse features
+        # ------------------------------------------------------------
+
+        feat = self.fc(latent)
+
+        feat = feat.view(
+            B,
+            self.n_seed,
+            self.hidden
+        )
+
+        feat = feat.transpose(1, 2)
+
+        # ------------------------------------------------------------
+        # Refine coarse geometry
+        # ------------------------------------------------------------
+
+        feat = self.refine(feat)
+
+        # ------------------------------------------------------------
+        # Upsample point features
+        # ------------------------------------------------------------
+
+        feat = self.upsample(feat)
+
+        feat = feat.view(
+            B,
+            self.hidden,
+            self.expand_ratio,
+            self.n_seed
+        )
+
+        feat = feat.permute(0, 1, 3, 2)
+
+        feat = feat.reshape(
+            B,
+            self.hidden,
+            self.n_out
+        )
+
+        # ------------------------------------------------------------
+        # Predict local offsets
+        # ------------------------------------------------------------
+
+        xyz_offset = self.xyz_head(feat)
+
+        normals = self.normal_head(feat)
+
+        normals = F.normalize(
+            normals,
+            dim=1
+        )
+
+        # ------------------------------------------------------------
+        # Expand coarse anchors
+        # ------------------------------------------------------------
+
+        anchors = self.seed_xyz.expand(
+            B,
+            -1,
+            -1
+        )
+
+        anchors = anchors.unsqueeze(-1)
+
+        anchors = anchors.expand(
+            -1,
+            -1,
+            -1,
+            self.expand_ratio
+        )
+
+        anchors = anchors.reshape(
+            B,
+            3,
+            self.n_out
+        )
+
+        xyz = anchors + xyz_offset
+
+        # ------------------------------------------------------------
+        # Output format
+        # ------------------------------------------------------------
+        xyz = xyz.clamp(-1.0, 1.0)
+        xyz = xyz.transpose(1, 2)
+
+        normals = normals.transpose(1, 2)
+
+        recon = torch.cat(
+            [xyz, normals],
+            dim=-1
+        )
+
+        return {
+            "recon": recon
+        }

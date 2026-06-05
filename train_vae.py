@@ -145,7 +145,7 @@ def train(args: argparse.Namespace) -> None:
         latent_dim=args.latent_dim,
         n_out=args.n_out,
         enc_depth=args.enc_depth,
-        dec_depth=args.dec_depth,
+
         n_heads=args.n_heads,
         beta=args.beta_target,
         lambda_adv=args.lambda_adv,
@@ -207,7 +207,7 @@ def train(args: argparse.Namespace) -> None:
         acc: dict[str, float] = {
             "loss_G": 0.0, "cd": 0.0, "kl": 0.0, "normal_loss": 0.0,
             "loss_D": 0.0, "loss_D_real": 0.0, "loss_D_fake": 0.0,
-            "gp": 0.0, "tnet_reg": 0.0,
+            "gp": 0.0,
         }
         n_batches = 0
 
@@ -241,17 +241,8 @@ def train(args: argparse.Namespace) -> None:
                     loss_D = loss_D + gp
                     acc["gp"] += gp.item()
 
-                # T-Net orthogonality regularisation
-                if (
-                    model.discriminator.use_tnet
-                    and model.discriminator.last_tnet_mat is not None
-                ):
-                    tnet_reg = (
-                        args.lambda_tnet
-                        * _MiniTNet_reg(model.discriminator.last_tnet_mat)
-                    )
-                    loss_D = loss_D + tnet_reg
-                    acc["tnet_reg"] += tnet_reg.item()
+        
+                
 
                 loss_D.backward()
                 torch.nn.utils.clip_grad_norm_(disc_params, max_norm=1.0)
@@ -315,7 +306,7 @@ def train(args: argparse.Namespace) -> None:
         writer.add_scalar("train/loss_D_real", avg["loss_D_real"], global_step)
         writer.add_scalar("train/loss_D_fake", avg["loss_D_fake"], global_step)
         writer.add_scalar("train/grad_penalty",avg["gp"],          global_step)
-        writer.add_scalar("train/tnet_reg",    avg["tnet_reg"],    global_step)
+
         writer.add_scalar("train/beta",        beta_now,           global_step)
         writer.add_scalar("train/phase",       float(phase),       global_step)
         writer.add_scalar("lr/generator",
@@ -409,36 +400,52 @@ def train(args: argparse.Namespace) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 # Validation
 # ─────────────────────────────────────────────────────────────────────────────
+from src.metric import *
 
-def _validate(model: DualBranchPointVAE, loader: DataLoader, device: torch.device) -> float:
-    """
-    Computes mean chamfer distance (CD) on the validation split.
-    Returns average CD (lower is better).
-    """
+def _validate(
+    model: DualBranchPointVAE,
+    loader: DataLoader,
+    device: torch.device,
+) -> float:
+
     model.eval()
-    total_cd = 0.0
+
+    total_loss = 0.0
     n = 0
+
     with torch.no_grad():
+
         for _, pcd in loader:
+
             xyz = pcd.to(device)
+
             out = model(xyz)
-            from src.metric import chamfer_distance
-            cd, _ = chamfer_distance(out["recon"], xyz)
-            total_cd += cd.item()
+
+            pred_xyz = out["recon"][..., :3]
+            gt_xyz = xyz[..., :3]
+
+            cd_loss, _ = chamfer_distance(
+                out["recon"],
+                xyz
+            )
+
+            emd_loss, normal_loss = earth_movers_distance_sinkhorn(
+                out["recon"],
+                xyz
+            )
+
+            val_loss = cd_loss + 0.05 * emd_loss
+
+            total_loss += val_loss.item()
+
             n += 1
+
     model.train()
-    return total_cd / max(n, 1)
+
+    return total_loss / max(n, 1)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# T-Net reg helper (avoids circular import)
-# ─────────────────────────────────────────────────────────────────────────────
 
-def _MiniTNet_reg(mat: torch.Tensor) -> torch.Tensor:
-    B = mat.size(0)
-    I = torch.eye(3, device=mat.device).unsqueeze(0).expand(B, -1, -1)
-    diff = I - torch.bmm(mat, mat.transpose(1, 2))
-    return (diff ** 2).sum(dim=(1, 2)).mean()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -488,8 +495,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lambda_adv",   type=float, default=0.1)
     p.add_argument("--lambda_gp",    type=float, default=10.0,
                    help="Gradient penalty coefficient (WGAN-GP)")
-    p.add_argument("--lambda_tnet",  type=float, default=1e-3,
-                   help="T-Net orthogonality reg coefficient")
     p.add_argument("--use_gp",       action="store_true",
                    help="Enable WGAN-GP gradient penalty (phase 2 onwards)")
 

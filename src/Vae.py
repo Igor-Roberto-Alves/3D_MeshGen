@@ -8,19 +8,20 @@ from src.Encoder import (
     VAEBottleneck,
 )
 
-# Keep your original GAN and loss modules
 from src.GAN import PointNetDiscriminator
 from src.metric import chamfer_distance, earth_movers_distance_sinkhorn
-
+from src.GAN2 import StablePointNetDiscriminator as PND
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from src.LionDecoder import *
+import numpy as np
 
 
 
 class DualBranchPointVAE(nn.Module):
+
     """
     Dual-branch β-VAE + GAN for point cloud generation with MiniLion Decoder.
     """
@@ -31,8 +32,7 @@ class DualBranchPointVAE(nn.Module):
         latent_dim: int = 512,
         n_out: int = 2048,
         enc_depth: int = 4,
-        dec_depth: int = 4,  # Kept for signature backward compatibility
-        n_heads: int = 6,    # Kept for signature backward compatibility
+        n_heads: int = 6,   
         beta: float = 1e-3,
         lambda_adv: float = 0.1,
         disc_base_ch: int = 64,
@@ -43,6 +43,7 @@ class DualBranchPointVAE(nn.Module):
         self.latent_dim = latent_dim
 
         # ── Encoder ───────────────────────────────────────────────────────────
+
         self.hier_enc = HierarchicalEncoder(
             d_model=d_model, n_heads=n_heads, depth=enc_depth
         )
@@ -51,21 +52,23 @@ class DualBranchPointVAE(nn.Module):
         self.bottleneck = VAEBottleneck(in_dim=d_model, latent_dim=latent_dim)
 
         # ── INTEGRATED: New LION Style/AdaGN-based Decoder ────────────────────
-        self.decoder = NvidiaStyleLatentDecoder(
+
+     
+        self.decoder = StablePointDecoder(
             latent_dim=latent_dim,
             style_dim=d_model,
             n_out=n_out,
-            n_seed=256,  # Can be tuned for quality/speed trade-off
+            hidden=256,
         )
 
+
         # ── Discriminator ─────────────────────────────────────────────────────
-        self.discriminator = PointNetDiscriminator(
+
+        self.discriminator = PND(
             in_ch=6,
-            base_ch=disc_base_ch,
             use_spectral=True,
         )
 
-        # BCE loss used for both D and G adversarial steps
         self.adv_loss = nn.BCEWithLogitsLoss()
 
     # ── helpers ───────────────────────────────────────────────────────────────
@@ -86,12 +89,12 @@ class DualBranchPointVAE(nn.Module):
         self, xyz: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         h_feat, _ = self.hier_enc(xyz)
-        g_feat = self.glob_enc(xyz)  # <--- Este é o seu STYLE original (B, d_model)
+        g_feat = self.glob_enc(xyz)  
         
         fused = self.fusion(h_feat, g_feat)
         z, mu, logvar = self.bottleneck(fused)
         
-        return z, mu, logvar, g_feat  # <--- Passamos o g_feat para fora
+        return z, mu, logvar, g_feat 
 
     def decode(self, z: torch.Tensor, style: torch.Tensor) -> dict:
         # O novo decoder precisa receber tanto o z (pontos latentes) quanto o style
@@ -100,61 +103,120 @@ class DualBranchPointVAE(nn.Module):
     # ── forward ───────────────────────────────────────────────────────────────
 
     def forward(self, xyz: torch.Tensor) -> dict:
-        z, mu, logvar, style = self.encode(xyz) # <--- Captura o style aqui
-        decoder_out = self.decode(z, style)     # <--- Passa o style para o decode
+        z, mu, logvar, style = self.encode(xyz) 
+        decoder_out = self.decode(z, style)     
         return dict(
             recon=decoder_out["recon"],
             z=z,
             mu=mu,
             logvar=logvar,
         )
+    
     # ── losses ────────────────────────────────────────────────────────────────
+
 
     def loss_discriminator(
         self,
         real: torch.Tensor,
         fake: torch.Tensor,
     ) -> dict:
-        # Usando Hinge Loss para o Discriminador
-        d_real_logits = self.discriminator(real)
-        d_fake_logits = self.discriminator(fake.detach())
 
-        loss_real = F.relu(1.0 - d_real_logits).mean()
-        loss_fake = F.relu(1.0 + d_fake_logits).mean()
+        d_real = self.discriminator(real)
+        d_fake = self.discriminator(fake.detach())
+
+        loss_real = F.relu(1.0 - d_real).mean()
+        loss_fake = F.relu(1.0 + d_fake).mean()
 
         loss_D = loss_real + loss_fake
-        return dict(loss_D=loss_D, loss_D_real=loss_real, loss_D_fake=loss_fake)
 
+        return {
+            "loss_D": loss_D,
+            "loss_D_real": loss_real,
+            "loss_D_fake": loss_fake,
+        }
+
+
+
+    
     def loss_generator(
         self,
         out: dict,
         target: torch.Tensor,
     ) -> dict:
-        B = out["recon"].size(0)
-        
-        point_loss, normal_loss = chamfer_distance(out["recon"], target)
-        kl = VAEBottleneck.kl_loss(out["mu"], out["logvar"])
 
-        # Hinge Loss para o Gerador
-        g_fake_logits = self.discriminator(out["recon"])
+        cd_loss, _ = chamfer_distance(
+            out["recon"],
+            target,
+        )
+
+        emd_loss, normal_loss = earth_movers_distance_sinkhorn(
+            out["recon"][..., :3],
+            target[..., :3],
+        )
+
+        point_loss = cd_loss + 0.05 * emd_loss
+
+        kl = VAEBottleneck.kl_loss(
+            out["mu"],
+            out["logvar"],
+        )
+
+        g_fake_logits = self.discriminator(
+            out["recon"]
+        )
+
         loss_adv = -g_fake_logits.mean()
 
-        total = point_loss + self.beta * kl + self.lambda_adv * loss_adv + normal_loss
+        total = (
+            point_loss
+            + self.beta * kl
+            + self.lambda_adv * loss_adv
+            + normal_loss
+        )
 
         return dict(
             total=total,
-            cd=point_loss,
+            recon_points=point_loss,
+            cd=cd_loss,
+            emd=emd_loss,
             kl=kl,
             loss_adv=loss_adv,
             normal_loss=normal_loss,
         )
 
+
+
+
     def loss(self, out: dict, target: torch.Tensor) -> dict:
-        """Plain β-VAE loss (no adversarial term). Useful for warm-up epochs."""
-        point_loss, normal_loss = chamfer_distance(out["recon"], target)
-        kl = VAEBottleneck.kl_loss(out["mu"], out["logvar"])
+
+        cd_loss, _ = chamfer_distance(
+            out["recon"],
+            target,
+        )
+
+        emd_loss, normal_loss = earth_movers_distance_sinkhorn(
+            out["recon"][..., :3],
+            target[..., :3],
+        )
+
+        point_loss = cd_loss + emd_loss
+
+        kl = VAEBottleneck.kl_loss(
+            out["mu"],
+            out["logvar"],
+        )
+
         total = point_loss + self.beta * kl + normal_loss
-        return dict(total=total, cd=point_loss, kl=kl, normal_loss=normal_loss)
+
+        return dict(
+            total=total,
+            recon_points=point_loss,
+            cd=cd_loss,
+            emd=emd_loss,
+            kl=kl,
+            normal_loss=normal_loss,
+        )
+
 
     # ── generation ────────────────────────────────────────────────────────────
 
