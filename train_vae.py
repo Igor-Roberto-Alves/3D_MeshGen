@@ -340,14 +340,25 @@ def main(cfg: TrainConfig) -> None:
     logger.info(f"Using device: {device}")
 
     # ---- dataset -------------------------------------------------------
-    full_ds = Ds_point_sampled_already(root=cfg.data_root)
-    val_n   = max(1, int(len(full_ds) * cfg.val_split))
-    trn_n   = len(full_ds) - val_n
-    trn_ds, val_ds = random_split(
-        full_ds, [trn_n, val_n],
-        generator=torch.Generator().manual_seed(cfg.seed)
+    base_ds = Ds_point_sampled_already(root=cfg.data_root, augment=False)
+
+    indices = torch.randperm(len(base_ds), generator=torch.Generator().manual_seed(cfg.seed)).tolist()
+
+    val_n = max(1, int(len(base_ds) * cfg.val_split))
+
+    train_idx = indices[val_n:]
+    val_idx   = indices[:val_n]
+
+    trn_ds = torch.utils.data.Subset(
+        Ds_point_sampled_already(root=cfg.data_root, augment=True),
+        train_idx
     )
 
+    val_ds = torch.utils.data.Subset(
+        Ds_point_sampled_already(root=cfg.data_root, augment=False),
+        val_idx
+    )
+   
     collate = make_collate(cfg.num_points)
     trn_loader = DataLoader(
         trn_ds, batch_size=cfg.batch_size, shuffle=True,
@@ -359,7 +370,7 @@ def main(cfg: TrainConfig) -> None:
         num_workers=cfg.num_workers, pin_memory=cfg.pin_memory,
         collate_fn=collate,
     )
-    logger.info(f"Dataset: {trn_n} train / {val_n} val samples")
+    logger.info(f"Dataset: {len(train_idx)} train / {len(val_idx)} val samples")
 
     # ---- MODEL INSTANTIATION (AJUSTADO PARA O NOVO VAE) -----------------
     model = Vae(

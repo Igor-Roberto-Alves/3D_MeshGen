@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from src.utils import *
 
 
 # ---------------------------------------------------------------------------
@@ -43,10 +44,10 @@ class VoxelBranch(nn.Module):
 
         self.voxel_net = nn.Sequential(
             nn.Conv3d(in_channels, mid, 3, padding=1, bias=False),
-            nn.BatchNorm3d(mid),
+            nn.GroupNorm(num_groups=8, num_channels=mid),
             nn.GELU(),
             nn.Conv3d(mid, out_channels, 3, padding=1, bias=False),
-            nn.BatchNorm3d(out_channels),
+            nn.GroupNorm(num_groups=8, num_channels=out_channels),
             nn.GELU(),
         )
 
@@ -207,10 +208,10 @@ class EncoderStyle(nn.Module):
         return self.style_mlp(g)
     
 class Encoder(nn.Module):
-    def __init__(self, latent_dim: int = 256, in_channels: int = 6, style_dim: int = 512):
+    def __init__(self, latent_dim: int = 256, in_channels: int = 6, style_dim: int = 512, num_latent_points: int = 512):
         super().__init__()
         self.latent_dim = latent_dim
-
+        self.num_latent_points = num_latent_points
         self.stage0 = PVConvBlock(in_channels, 64,  resolution=32)
         self.stage1 = PVConvBlock(64,          128, resolution=16)
         self.stage2 = PVConvBlock(128,         256, resolution=8)
@@ -237,6 +238,16 @@ class Encoder(nn.Module):
     # ------------------------------------------------------------------
     # CORREÇÃO 1: Adicionado o parâmetro 'style' na assinatura
     def forward(self, x: torch.Tensor, style: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        
+        xyz = x[:, :, :3] # Shape: (B, N_original, 3)
+        fps_indices = farthest_point_sample(xyz, self.num_latent_points) # (B, num_latent_points)
+        
+        # Filtra a nuvem original usando os índices, mantendo todos os 6 canais (XYZ + Normais)
+        x = index_points(x, fps_indices) # Agora x passa a ter formato: (B, num_latent_points, 6)
+
+        # --- NOVA LINHA MANDATÓRIA: Guarda o XYZ filtrado pelo FPS para colar no final ---
+        latent_xyz = x[:, :, :3] # Shape: (B, num_latent_points, 3)
+
         x = self.stage0(x)               # (B, N, 64)
         x = self.stage1(x)               # (B, N, 128)
         x = self.stage2(x)               # (B, N, 256)
@@ -246,17 +257,19 @@ class Encoder(nn.Module):
 
         x = self.local_mlp(x.permute(0, 2, 1)).permute(0, 2, 1)  # (B, N, 512)
 
-        # --- REMOVA OU COMENTE O POOLING E A MLP GLOBAL ---
-        # g = x.max(dim=1).values            
-        # g = self.global_mlp(g)             
-        # mu     = self.fc_mu(g)            
-        # logvar = self.fc_logvar(g)        
-
-        # +++ ADICIONE A PREDIÇÃO POR PONTO +++
         # Permutamos para (B, Canais, Pontos) pois nn.Conv1d opera no eixo 1
         x_features = x.permute(0, 2, 1) # (B, 512, N)
         
-        # Mapeia os 512 canais de cada ponto para a dimensão latente desejada
-        mu     = self.fc_mu(x_features).permute(0, 2, 1)     # (B, N, latent_dim)
-        logvar = self.fc_logvar(x_features).permute(0, 2, 1)  # (B, N, latent_dim)
+        # Mapeia os 512 canais de cada ponto para a dimensão latente desejada (256 canais)
+        mu_feat     = self.fc_mu(x_features).permute(0, 2, 1)     # (B, N, latent_dim)
+        logvar_feat = self.fc_logvar(x_features).permute(0, 2, 1)  # (B, N, latent_dim)
+
+        # --- AJUSTE DE ARQUITETURA LION (NVIDIA) ---
+        # Colamos o latent_xyz físico na frente do mu (3 + 256 = 259 canais)
+        mu = torch.cat([latent_xyz, mu_feat], dim=-1) # Shape: (B, N, 259)
+        
+        # Para o logvar, colocamos variância zero (zeros) na parte das coordenadas fixas
+        zeros_padding = torch.zeros_like(latent_xyz)
+        logvar = torch.cat([zeros_padding, logvar_feat], dim=-1) # Shape: (B, N, 259)
+
         return mu, logvar

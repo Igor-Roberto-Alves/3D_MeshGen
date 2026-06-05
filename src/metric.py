@@ -240,17 +240,20 @@ def normal_consistency(
 
 def kl_divergence(mu: Tensor, logvar: Tensor, reduce: str = "mean") -> Tensor:
     """
-    Closed-form KL[q(z|x) || p(z)] adaptado para espaços latentes de nuvens de pontos.
-    Suporta tanto formato de vetor plano (B, D) quanto formato LION (B, N, D).
+    KL[q(z|x) || p(z)] para formatos (B, D) ou (B, N, D), com prevenção de NaNs.
     """
-    # Calcula o KL element-wise
+    # Clamp para evitar overflow em exp
+    logvar = torch.clamp(logvar, -10.0, 10.0)
+    mu     = torch.clamp(mu, -10.0, 10.0)
+
+    # KL element-wise
     kl = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp())
-    
-    # Se o tensor for 3D (B, N, latent_dim), precisamos somar nos eixos 1 e 2
+
     if kl.dim() == 3:
-        kl = kl.sum(dim=(1, 2)) # Soma os pontos e os canais latentes -> Saída: (B,)
+        # Normaliza somando e dividindo pelo número de pontos
+        kl = kl.sum(dim=(1, 2)) / kl.shape[1]  # ou use kl.mean(dim=(1,2))
     else:
-        kl = kl.sum(dim=1)      # Comportamento antigo para vetores planos -> Saída: (B,)
+        kl = kl.sum(dim=1)
 
     if reduce == "none":
         return kl
