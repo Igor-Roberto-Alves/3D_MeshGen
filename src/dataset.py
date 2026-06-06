@@ -199,13 +199,16 @@ class Ds_point_sampled_already:
                 if file.endswith(".ply"):
                     self.files.append(os.path.join(rt, file))
         self.augment = data_augs
+
     def __len__(self):
         return len(self.files)
 
     def __getitem__(self, idx):
-
-        class_name, file_path = self.model[idx]
-        file_path = "point_clouds/" + f"{class_name}_{idx}.ply"
+        content = self.files[idx][13:-4]
+        class_name, _ = content.split("_")
+    
+   
+        file_path = self.files[idx]
         pcd = o3d.io.read_point_cloud(file_path)
 
         points = np.asarray(pcd.points, dtype=np.float32)
