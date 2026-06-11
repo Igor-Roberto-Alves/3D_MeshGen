@@ -45,6 +45,11 @@ class Vae(nn.Module):
         
         return coords_pred, normals_pred, mu, logvar
     
+    def z(self, mu, logvar):
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        z_points = mu + eps * std  # Nuvem Latente: (B, N, 259)
+
     def generate(self, num_samples: int, num_points: int = 512, device: torch.device = None) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Gera nuvens de pontos puras amostrando diretamente do prior Gaussiano padrão N(0, I).
