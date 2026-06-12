@@ -265,33 +265,28 @@ def kl_divergence(mu: Tensor, logvar: Tensor, reduce: str = "mean") -> Tensor:
 # ============================================================
 
 def vae_loss(
-    pred_xyz:   Tensor,
-    target_xyz: Tensor,
-    mu:         Tensor,
-    logvar:     Tensor,
-    beta:       float  = 1.0,
-    recon_loss: str    = "chamfer",
-    # optional – used only when recon_loss == "both"
-    emd_weight: float  = 0.5,
-    emd_iters:  int    = 30,
+    pred_xyz:      Tensor,
+    normals_pred:  Tensor,
+    target_xyz:    Tensor,
+    normal_target: Tensor,
+    mu_points:     Tensor,
+    logvar_points: Tensor,
+    mu_style:      Tensor,
+    logvar_style:  Tensor,
+    beta_points:   float  = 1.0,        # Peso KL para a nuvem latente local
+    beta_style:    float  = 1.0,        # Peso KL para o vetor de estilo global
+    normal_weight: float  = 1.0,        # Peso para a perda de orientação vetorial
+    recon_loss:    str    = "chamfer",
+    beta: float = 1,
+    # opcionais – usados apenas se recon_loss == "both"
+    emd_weight:    float  = 0.5,
+    emd_iters:     int    = 30,
 ) -> dict[str, Tensor]:
     """
-    ELBO = reconstruction_loss + β · KL
-
-    Parameters
-    ----------
-    pred_xyz    : (B, N, 3)  – reconstructed coordinates
-    target_xyz  : (B, N, 3)  – ground-truth coordinates
-    mu, logvar  : (B, latent_dim)
-    beta        : KL weight  (β-VAE)
-    recon_loss  : "chamfer" | "emd" | "both"
-    emd_weight  : weight of EMD when recon_loss == "both"
-
-    Returns
-    -------
-    dict with keys "total", "recon", "kl"  (and optionally "cd", "emd")
+    Função de Custo Hierárquica do LION VAE.
+    ELBO = recon_loss + (normal_weight · normal_loss) + (beta_points · kl_points) + (beta_style · kl_style)
     """
-    # --- reconstruction -----------------------------------------------
+    # --- 1. Métrica de Reconstrução Coordenada -------------------------
     if recon_loss == "chamfer":
         recon, cd_f, cd_b = chamfer_distance_knn(pred_xyz, target_xyz)
         out = {"recon": recon, "cd_forward": cd_f, "cd_backward": cd_b}
@@ -310,9 +305,27 @@ def vae_loss(
         raise ValueError(f"Unknown recon_loss: '{recon_loss}'. "
                          f"Choose from 'chamfer', 'emd', 'both'.")
 
-    # --- KL ------------------------------------------------------------
-    kl = kl_divergence(mu, logvar)
+    # --- 2. Perda de Normais de Superfície -----------------------------
+    n_consistency = normal_consistency(pred_xyz, normals_pred, target_xyz, normal_target)
+    n_loss = 1.0 - n_consistency
+    out.update({"normal_loss": n_loss})
 
-    total = recon + beta * kl
-    out.update({"total": total, "kl": kl})
+    # --- 3. Regularização Estatística KL (Hierárquica) -----------------
+    # KL 1: Divergência dos pontos latentes locais h0
+    kl_pts = beta*kl_divergence(mu_points, logvar_points)
+    out.update({"kl_points": kl_pts})
+
+    # KL 2: Divergência do vetor de estilo global z0
+    kl_sty = beta*kl_divergence(mu_style, logvar_style)
+    out.update({"kl_style": kl_sty})
+
+    # --- 4. Combinação Total da Função de Custo LION VAE ---------------
+    total = (
+        recon 
+        + (normal_weight * n_loss) 
+        + (beta_points * kl_pts) 
+        + (beta_style * kl_sty)
+    )
+    out.update({"total": total})
+    
     return out
