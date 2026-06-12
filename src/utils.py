@@ -45,3 +45,37 @@ def index_points(points: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
     repeat_shape[0] = 1
     batch_indices = torch.arange(B, dtype=torch.long, device=device).view(view_shape).repeat(repeat_shape)
     return points[batch_indices, idx, :]
+
+from torch import nn
+class AdaGN(nn.Module):
+    """
+    Adaptive Group Normalization.
+    Normaliza os recursos dos pontos e aplica escala (gamma) e translação (beta)
+    gerados dinamicamente a partir do vetor de estilo global.
+    """
+    def __init__(self, num_channels: int, style_dim: int, num_groups: int = 32):
+        super().__init__()
+        self.num_channels = num_channels
+        # GroupNorm padrão (filtros, canais, eps)
+        self.gn = nn.GroupNorm(num_groups, num_channels, eps=1e-5)
+        
+        # MLP que transforma o estilo global nos parâmetros lineares (gamma e beta)
+        # Inicializamos o peso da escala em zero para começar como uma identidade
+        self.fc = nn.Linear(style_dim, num_channels * 2)
+        nn.init.zeros_(self.fc.weight)
+        nn.init.zeros_(self.fc.bias)
+
+    def forward(self, x: torch.Tensor, style: torch.Tensor) -> torch.Tensor:
+        # x: (B, num_channels, N) - Formato padrão de Conv1d / GroupNorm
+        # style: (B, style_dim)
+        
+        # 1. Aplica a normalização por grupo padrão
+        x_norm = self.gn(x)
+        
+        # 2. Gera os coeficientes a partir do estilo
+        style_effects = self.fc(style).unsqueeze(-1) # (B, num_channels * 2, 1)
+        gamma, beta = torch.chunk(style_effects, 2, dim=1) # Divide ao meio
+        
+        # Como inicializamos os pesos em zero, somamos 1 ao gamma 
+        # para que o comportamento inicial seja multiplicar por 1 (identidade)
+        return x_norm * (1 + gamma) + beta
