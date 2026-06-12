@@ -47,6 +47,7 @@ class TrainConfig:
     beta_epochs:   int   = 100    # epochs to reach beta_end
     recon_loss:    str   = "chamfer"   # "chamfer" | "emd" | "both"
     emd_weight:    float = 0.5    # used only when recon_loss="both"
+    normal_weght: float = 0.5 # Weight for normal reconstruction
 
     # --- data ---
     val_split:     float = 0.1
@@ -55,8 +56,8 @@ class TrainConfig:
 
     # --- misc ---
     seed:          int   = 495241 #IRA
-    save_every:    int   = 2    # save checkpoint every N epochs
-    log_every:     int   = 50    # log metrics every N batches
+    save_every:    int   = 2    # save checkpoint every 2 epochs
+    log_every:     int   = 50    # log metrics every 50 batches
     device:        str   = "cuda"
     amp:           bool  = True   # automatic mixed precision
     resume:        int   = 0     # epoch to resume from
@@ -82,7 +83,6 @@ def log_reconstructions(
 
     points = next(iter(loader))
     points = points.to(device)
-    points = normalise_batch(points)
 
     target_xyz = points[..., :3]
 
@@ -191,6 +191,7 @@ def train_one_epoch(
     for batch_idx, points in enumerate(loader):
         points = points.to(device, non_blocking=True)
         target_xyz = points[..., :3]
+        target_normals = points[..., 3:]
 
         with torch.autocast(device_type=device.type, enabled=cfg.amp):
             coords_pred, normals_pred, mu, logvar = model(points)
@@ -201,9 +202,11 @@ def train_one_epoch(
                 mu         = mu,
                 logvar     = logvar,
                 beta       = beta,
+                normals_pred = normals_pred, # ADD in src.metric
+                target_normals = target_normals,
                 recon_loss = cfg.recon_loss,
                 emd_weight = cfg.emd_weight,
-                normal_weight = cfg.normal_weight # ADD in src.metric
+                normal_weight = cfg.normal_weight # ADD in src.metric, ADD in cfg structure
             )
 
         optimiser.zero_grad(set_to_none=True)
