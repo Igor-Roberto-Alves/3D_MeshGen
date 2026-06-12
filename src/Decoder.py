@@ -18,10 +18,6 @@ class StyleModulation(nn.Module):
         return x * (1 + scale) + shift
 
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
 
 class PointUpsampleBlock(nn.Module):
     """
@@ -68,7 +64,6 @@ class LIONDecoder(nn.Module):
         latent_dim: int = 256,   # Dimensão das características abstratas (mochila)
         style_dim: int = 512,    # Dimensão do vetor de estilo global (z0)
         input_dim: int = 3,       # Coordenadas físicas da entrada (XYZ = 3 ou XYZ+Normais = 6)
-        out_channels: int = 0,
         up_factor: int = 4
     ):
         super().__init__()
@@ -101,11 +96,11 @@ class LIONDecoder(nn.Module):
 
     def forward(self, latent_points: torch.Tensor, style: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        latent_points : (B, N, latent_dim + input_dim) -> Ex: (B, 512, 259)
+        latent_points : (B, N, latent_dim + input_dim) -> Ex: (B, 128, 259)
         style         : (B, style_dim)
         """
         # --- BASE FÍSICA ---
-        base_coords = latent_points[:, :, :self.input_dim]  # (B, N, 3)
+        base_coords = latent_points[:, :, :3]  # (B, N, 3)
 
         # --- PROJEÇÃO INICIAL ---
         x = latent_points.permute(0, 2, 1)
@@ -120,7 +115,7 @@ class LIONDecoder(nn.Module):
 
         x = self.stage2(x)  # (B, N, 32)
 
-        # --- UPSAMPLING 512 -> 2048 ---
+        # --- UPSAMPLING 128 -> 2048 ---
         coords_up = self.upsample(base_coords, x)  # (B, N*4, 3)
         
         # Expand features para cada ponto novo
