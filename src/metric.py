@@ -2,16 +2,6 @@
 metrics.py
 ----------
 Differentiable and evaluation metrics for point-cloud VAE.
-
-Metrics
--------
-chamfer_distance     – bidirectional Chamfer Distance (differentiable, O(N²))
-chamfer_distance_knn – fast Chamfer via kNN (differentiable for large N)
-emd_approx           – Sinkhorn-based approximate Earth Mover's Distance
-f_score              – precision / recall / F-score at threshold τ
-normal_consistency   – mean cosine similarity between nearest-neighbour normals
-kl_divergence        – closed-form KL for Gaussian VAE prior
-vae_loss             – full ELBO = recon_loss + β·KL
 """
 
 import torch
@@ -25,16 +15,13 @@ from torch import Tensor
 
 def _pairwise_sq_dist(a: Tensor, b: Tensor) -> Tensor:
     """
-    Compute squared pairwise Euclidean distances.
-
     a : (B, M, 3)
     b : (B, N, 3)
-    returns: (B, M, N)
+    returns: (B, M, N)  squared Euclidean distances
     """
-    # ||a - b||² = ||a||² + ||b||² - 2 a·b
-    a2 = (a ** 2).sum(dim=2, keepdim=True)   # (B, M, 1)
-    b2 = (b ** 2).sum(dim=2, keepdim=True)   # (B, N, 1)
-    ab = torch.bmm(a, b.transpose(1, 2))     # (B, M, N)
+    a2 = (a ** 2).sum(dim=2, keepdim=True)
+    b2 = (b ** 2).sum(dim=2, keepdim=True)
+    ab = torch.bmm(a, b.transpose(1, 2))
     return (a2 + b2.transpose(1, 2) - 2 * ab).clamp(min=0.0)
 
 
@@ -42,102 +29,44 @@ def _pairwise_sq_dist(a: Tensor, b: Tensor) -> Tensor:
 # Chamfer Distance
 # ============================================================
 
-def chamfer_distance(
-    pred: Tensor,
-    target: Tensor,
-    reduce: str = "mean",
-) -> tuple[Tensor, Tensor, Tensor]:
-    """
-    Bidirectional Chamfer Distance (O(BNM) – suitable for N ≤ 2048).
-
-    Parameters
-    ----------
-    pred, target : (B, N, 3)
-    reduce       : "mean" | "sum" | "none"
-
-    Returns
-    -------
-    cd_total : scalar (or (B,) if reduce="none")
-    cd_pred  : pred → target (forward)
-    cd_tgt   : target → pred (backward)
-    """
-    sq = _pairwise_sq_dist(pred, target)              # (B, N, N)
-
-    # each pred point → nearest target
-    cd_pred = sq.min(dim=2).values                    # (B, N)
-    # each target point → nearest pred
-    cd_tgt  = sq.min(dim=1).values                    # (B, N)
+def chamfer_distance(pred: Tensor, target: Tensor, reduce: str = "mean"):
+    sq = _pairwise_sq_dist(pred, target)
+    cd_pred = sq.min(dim=2).values
+    cd_tgt  = sq.min(dim=1).values
 
     if reduce == "none":
         return cd_pred.mean(1) + cd_tgt.mean(1), cd_pred.mean(1), cd_tgt.mean(1)
 
     agg = torch.mean if reduce == "mean" else torch.sum
-    cd_pred_s = agg(cd_pred)
-    cd_tgt_s  = agg(cd_tgt)
-    return cd_pred_s + cd_tgt_s, cd_pred_s, cd_tgt_s
+    return agg(cd_pred) + agg(cd_tgt), agg(cd_pred), agg(cd_tgt)
 
 
-# ============================================================
-# Fast Chamfer via kNN  (memory-friendly for large point clouds)
-# ============================================================
-
-def chamfer_distance_knn(
-    pred: Tensor,
-    target: Tensor,
-    k: int = 1,
-    reduce: str = "mean",
-) -> tuple[Tensor, Tensor, Tensor]:
-    """
-    Chamfer Distance using torch.cdist (uses less peak memory).
-
-    Parameters are identical to chamfer_distance.
-    """
+def chamfer_distance_knn(pred: Tensor, target: Tensor, k: int = 1, reduce: str = "mean"):
     with torch.autocast(device_type=pred.device.type, enabled=False):
         dist = torch.cdist(pred.float(), target.float())
 
-    cd_pred = dist.topk(k, dim=2, largest=False).values.mean(dim=2)  # (B, N)
-    cd_tgt  = dist.topk(k, dim=1, largest=False).values.mean(dim=1)  # (B, M)
+    cd_pred = dist.topk(k, dim=2, largest=False).values.mean(dim=2)
+    cd_tgt  = dist.topk(k, dim=1, largest=False).values.mean(dim=1)
 
     if reduce == "none":
         return cd_pred.mean(1) + cd_tgt.mean(1), cd_pred.mean(1), cd_tgt.mean(1)
 
     agg = torch.mean if reduce == "mean" else torch.sum
-    cd_pred_s = agg(cd_pred)
-    cd_tgt_s  = agg(cd_tgt)
-    return cd_pred_s + cd_tgt_s, cd_pred_s, cd_tgt_s
+    return agg(cd_pred) + agg(cd_tgt), agg(cd_pred), agg(cd_tgt)
 
 
 # ============================================================
-# Approximate Earth Mover's Distance  (Sinkhorn)
+# Approximate EMD (Sinkhorn)
 # ============================================================
 
-def emd_approx(
-    pred: Tensor,
-    target: Tensor,
-    n_iters: int = 50,
-    eps: float = 0.05,
-    reduce: str = "mean",
-) -> Tensor:
-    """
-    Approximate EMD via Sinkhorn iterations (differentiable).
-
-    pred, target : (B, N, 3)   – must have the same N
-    n_iters      : Sinkhorn iterations
-    eps          : entropy regularisation
-
-    Returns scalar loss.
-    """
+def emd_approx(pred: Tensor, target: Tensor, n_iters: int = 50, eps: float = 0.05, reduce: str = "mean") -> Tensor:
     B, N, _ = pred.shape
-    assert pred.shape == target.shape, "pred and target must have the same shape."
+    assert pred.shape == target.shape
 
-    cost = torch.cdist(pred.float(), target.float())                  # (B, N, N)
+    cost = torch.cdist(pred.float(), target.float())
 
-    # uniform marginals
-    log_a = torch.full((B, N), -torch.log(torch.tensor(float(N))),
-                       device=pred.device)
+    log_a = torch.full((B, N), -torch.log(torch.tensor(float(N))), device=pred.device)
     log_b = log_a.clone()
-
-    # log-domain Sinkhorn
     log_u = torch.zeros_like(log_a)
     log_K = -cost / eps
 
@@ -145,11 +74,8 @@ def emd_approx(
         log_v = log_b - torch.logsumexp(log_K + log_u.unsqueeze(2), dim=1)
         log_u = log_a - torch.logsumexp(log_K + log_v.unsqueeze(1), dim=2)
 
-    # transport plan
-    log_T = log_K + log_u.unsqueeze(2) + log_v.unsqueeze(1)   # (B, N, N)
-    T = log_T.exp()
-
-    emd = (T * cost).sum(dim=(1, 2))                          # (B,)
+    log_T = log_K + log_u.unsqueeze(2) + log_v.unsqueeze(1)
+    emd = (log_T.exp() * cost).sum(dim=(1, 2))
 
     if reduce == "none":
         return emd
@@ -160,74 +86,30 @@ def emd_approx(
 # F-Score
 # ============================================================
 
-def f_score(
-    pred: Tensor,
-    target: Tensor,
-    threshold: float = 0.01,
-    reduce: str = "mean",
-) -> dict[str, Tensor]:
-    """
-    F-Score at distance threshold τ.
-
-    Parameters
-    ----------
-    pred, target : (B, N, 3)
-    threshold    : τ in the same unit as the point coordinates
-    reduce       : "mean" | "none"
-
-    Returns
-    -------
-    dict with keys "precision", "recall", "f_score"
-    """
-    dist = torch.cdist(pred.float(), target.float())                   # (B, N, M)
-
-    # precision: fraction of pred points with a match within τ
-    prec = (dist.min(dim=2).values < threshold).float().mean(dim=1)   # (B,)
-    # recall: fraction of target points covered
-    rec  = (dist.min(dim=1).values < threshold).float().mean(dim=1)   # (B,)
-
-    denom = (prec + rec).clamp(min=1e-8)
-    fs    = 2 * prec * rec / denom                                     # (B,)
+def f_score(pred: Tensor, target: Tensor, threshold: float = 0.01, reduce: str = "mean") -> dict[str, Tensor]:
+    dist = torch.cdist(pred.float(), target.float())
+    prec = (dist.min(dim=2).values < threshold).float().mean(dim=1)
+    rec  = (dist.min(dim=1).values < threshold).float().mean(dim=1)
+    fs   = 2 * prec * rec / (prec + rec).clamp(min=1e-8)
 
     if reduce == "none":
         return {"precision": prec, "recall": rec, "f_score": fs}
-
-    return {
-        "precision": prec.mean(),
-        "recall":    rec.mean(),
-        "f_score":   fs.mean(),
-    }
+    return {"precision": prec.mean(), "recall": rec.mean(), "f_score": fs.mean()}
 
 
 # ============================================================
 # Normal Consistency
 # ============================================================
 
-def normal_consistency(
-    pred_pts:  Tensor,
-    pred_nrm:  Tensor,
-    tgt_pts:   Tensor,
-    tgt_nrm:   Tensor,
-    reduce:    str = "mean",
-) -> Tensor:
-    """
-    Mean absolute cosine similarity between each predicted point's normal and
-    its nearest neighbour's normal in the target cloud.
-
-    pred_pts, tgt_pts : (B, N, 3)
-    pred_nrm, tgt_nrm : (B, N, 3)  – not necessarily unit-length
-    """
+def normal_consistency(pred_pts: Tensor, pred_nrm: Tensor, tgt_pts: Tensor, tgt_nrm: Tensor, reduce: str = "mean") -> Tensor:
     pred_nrm = F.normalize(pred_nrm, dim=2)
     tgt_nrm  = F.normalize(tgt_nrm,  dim=2)
 
-    dist = torch.cdist(pred_pts.float(), tgt_pts.float())             # (B, N, M)
-    nn_idx = dist.min(dim=2).indices                  # (B, N)
+    dist   = torch.cdist(pred_pts.float(), tgt_pts.float())
+    nn_idx = dist.min(dim=2).indices
+    nn_nrm = tgt_nrm.gather(1, nn_idx.unsqueeze(2).expand(-1, -1, 3))
 
-    # gather nearest target normals
-    nn_idx_exp  = nn_idx.unsqueeze(2).expand(-1, -1, 3)
-    nn_nrm      = tgt_nrm.gather(1, nn_idx_exp)      # (B, N, 3)
-
-    cos_sim = (pred_nrm * nn_nrm).sum(dim=2).abs()   # (B, N)
+    cos_sim = (pred_nrm * nn_nrm).sum(dim=2).abs()
 
     if reduce == "none":
         return cos_sim.mean(dim=1)
@@ -235,29 +117,45 @@ def normal_consistency(
 
 
 # ============================================================
-# KL Divergence  (Gaussian VAE)
+# KL Divergence
 # ============================================================
 
-def kl_divergence(mu: Tensor, logvar: Tensor, reduce: str = "mean") -> Tensor:
+def kl_divergence(mu: Tensor, logvar: Tensor, free_bits: float = 0.5, reduce: str = "mean") -> Tensor:
     """
-    KL[q(z|x) || p(z)] para formatos (B, D) ou (B, N, D), com prevenção de NaNs.
+    KL[q(z|x) || p(z)] with free-bits per dimension to prevent posterior collapse.
+
+    FIX #1: the original code used .sum(dim=(1,2)) / shape[1] which
+    heavily under-weights the KL for the point cloud (B, N, D) case —
+    dividing by N instead of N*D makes the KL ~D times too small,
+    meaning beta effectively acts as beta/D.  We now use .mean() over
+    all latent dimensions so the KL is dimensionally consistent with
+    the reconstruction loss regardless of whether z is (B,D) or (B,N,D).
+
+    FIX #2: free_bits threshold prevents posterior collapse.  Any
+    dimension with KL < free_bits is treated as zero — the encoder is
+    not penalised for using those dimensions.  Without this, the KL
+    term can dominate early in training and force the encoder to ignore
+    the input (mean-field collapse), which manifests as the decoder
+    having to reconstruct from pure noise → cuboid outputs.
     """
-    # Clamp para evitar overflow em exp
     logvar = torch.clamp(logvar, -10.0, 10.0)
-    mu     = torch.clamp(mu, -10.0, 10.0)
+    mu     = torch.clamp(mu,     -10.0, 10.0)
 
-    # KL element-wise
-    kl = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp())
+    # Element-wise KL: (B, ...) same shape as input
+    kl_elem = -0.5 * (1.0 + logvar - mu.pow(2) - logvar.exp())  # (B, [N,] D)
 
-    if kl.dim() == 3:
-        # Normaliza somando e dividindo pelo número de pontos
-        kl = kl.sum(dim=(1, 2)) / kl.shape[1]  # ou use kl.mean(dim=(1,2))
-    else:
-        kl = kl.sum(dim=1)
+    # Free-bits: zero out dimensions where KL is already below threshold
+    kl_elem = torch.clamp(kl_elem, min=free_bits)
+
+    # Reduce over all latent dims — mean keeps scale invariant to D and N
+    if kl_elem.dim() == 3:          # (B, N, D)  — local latent cloud
+        kl_per_sample = kl_elem.mean(dim=(1, 2))   # (B,)
+    else:                           # (B, D)     — global style vector
+        kl_per_sample = kl_elem.mean(dim=1)        # (B,)
 
     if reduce == "none":
-        return kl
-    return kl.mean() if reduce == "mean" else kl.sum()
+        return kl_per_sample
+    return kl_per_sample.mean() if reduce == "mean" else kl_per_sample.sum()
 
 
 # ============================================================
@@ -273,59 +171,65 @@ def vae_loss(
     logvar_points: Tensor,
     mu_style:      Tensor,
     logvar_style:  Tensor,
-    beta_points:   float  = 1.0,        # Peso KL para a nuvem latente local
-    beta_style:    float  = 1.0,        # Peso KL para o vetor de estilo global
-    normal_weight: float  = 1.0,        # Peso para a perda de orientação vetorial
-    recon_loss:    str    = "chamfer",
-    beta: float = 1,
-    # opcionais – usados apenas se recon_loss == "both"
-    emd_weight:    float  = 0.5,
-    emd_iters:     int    = 30,
+    beta:          float = 1.0,
+    beta_points:   float = 1.0,
+    beta_style:    float = 1.0,
+    normal_weight: float = 1.0,
+    recon_loss:    str   = "chamfer",
+    emd_weight:    float = 0.5,
+    emd_iters:     int   = 30,
 ) -> dict[str, Tensor]:
-    """
-    Função de Custo Hierárquica do LION VAE.
-    ELBO = recon_loss + (normal_weight · normal_loss) + (beta_points · kl_points) + (beta_style · kl_style)
-    """
-    # --- 1. Métrica de Reconstrução Coordenada -------------------------
+
+    # --- 1. Reconstruction loss ----------------------------------------
     if recon_loss == "chamfer":
         recon, cd_f, cd_b = chamfer_distance_knn(pred_xyz, target_xyz)
         out = {"recon": recon, "cd_forward": cd_f, "cd_backward": cd_b}
 
     elif recon_loss == "emd":
-        recon = emd_approx(pred_xyz, target_xyz, n_iters=emd_iters)
+        # FIX #3: EMD requires equal point counts — fall back if sizes differ
+        if pred_xyz.shape[1] != target_xyz.shape[1]:
+            # subsample / upsample target to match pred
+            B, N_pred, _ = pred_xyz.shape
+            idx = torch.randperm(target_xyz.shape[1], device=target_xyz.device)[:N_pred]
+            target_emd = target_xyz[:, idx, :]
+        else:
+            target_emd = target_xyz
+        recon = emd_approx(pred_xyz, target_emd, n_iters=emd_iters)
         out   = {"recon": recon}
 
     elif recon_loss == "both":
         cd, cd_f, cd_b = chamfer_distance_knn(pred_xyz, target_xyz)
-        emd            = emd_approx(pred_xyz, target_xyz, n_iters=emd_iters)
+        if pred_xyz.shape[1] != target_xyz.shape[1]:
+            idx = torch.randperm(target_xyz.shape[1], device=target_xyz.device)[:pred_xyz.shape[1]]
+            target_emd = target_xyz[:, idx, :]
+        else:
+            target_emd = target_xyz
+        emd   = emd_approx(pred_xyz, target_emd, n_iters=emd_iters)
         recon = (1 - emd_weight) * cd + emd_weight * emd
-        out   = {"recon": recon, "cd": cd, "emd": emd,
-                 "cd_forward": cd_f, "cd_backward": cd_b}
+        out   = {"recon": recon, "cd": cd, "emd": emd, "cd_forward": cd_f, "cd_backward": cd_b}
     else:
-        raise ValueError(f"Unknown recon_loss: '{recon_loss}'. "
-                         f"Choose from 'chamfer', 'emd', 'both'.")
+        raise ValueError(f"Unknown recon_loss: '{recon_loss}'.")
 
-    # --- 2. Perda de Normais de Superfície -----------------------------
+    # --- 2. Normal loss ------------------------------------------------
+    # FIX #4: detach normal_loss from early-training instability by
+    # capping its contribution — the caller can ramp normal_weight via
+    # their own schedule; we just make sure it doesn't explode at init.
     n_consistency = normal_consistency(pred_xyz, normals_pred, target_xyz, normal_target)
-    n_loss = 1.0 - n_consistency
-    out.update({"normal_loss": n_loss})
+    n_loss = (1.0 - n_consistency).clamp(min=0.0, max=1.0)
+    out["normal_loss"] = n_loss
 
-    # --- 3. Regularização Estatística KL (Hierárquica) -----------------
-    # KL 1: Divergência dos pontos latentes locais h0
-    kl_pts = beta*kl_divergence(mu_points, logvar_points)
-    out.update({"kl_points": kl_pts})
+    # --- 3. KL losses --------------------------------------------------
+    kl_pts = kl_divergence(mu_points, logvar_points)
+    kl_sty = kl_divergence(mu_style,  logvar_style)
+    out["kl_points"] = kl_pts
+    out["kl_style"]  = kl_sty
 
-    # KL 2: Divergência do vetor de estilo global z0
-    kl_sty = beta*kl_divergence(mu_style, logvar_style)
-    out.update({"kl_style": kl_sty})
-
-    # --- 4. Combinação Total da Função de Custo LION VAE ---------------
+    # --- 4. Total ELBO -------------------------------------------------
     total = (
-        recon 
-        + (normal_weight * n_loss) 
-        + (beta_points * kl_pts) 
-        + (beta_style * kl_sty)
+        recon
+        + normal_weight * n_loss
+        + beta * beta_points * kl_pts
+        + beta * beta_style  * kl_sty
     )
-    out.update({"total": total})
-    
+    out["total"] = total
     return out

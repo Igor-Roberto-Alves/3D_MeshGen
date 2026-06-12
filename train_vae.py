@@ -2,32 +2,28 @@
 train_vae.py
 ------------
 Training loop for the LION-inspired Hierarchical Point-Cloud VAE.
-
-Usage
------
-python train_vae.py [--config config.yaml]   # YAML overrides (optional)
-python train_vae.py --epochs 200 --latent_dim 256 --beta 1.0
 """
-from torch.utils.tensorboard import SummaryWriter
+
 import argparse
-import os
-import time
-import math
 import json
 import logging
-from dataclasses import dataclass, asdict
+import math
+import os
+from dataclasses import asdict, dataclass
 from pathlib import Path
+import time
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, random_split
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
-import numpy as np
+from torch.utils.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter
 
 from src.dataset import Ds_point_sampled_already
-from src.metric import vae_loss, f_score, normal_consistency
+from src.metric import f_score, normal_consistency, vae_loss
 from src.Vae import Vae
 
 
@@ -54,13 +50,14 @@ class TrainConfig:
     weight_decay:  float = 1e-4
     warmup_epochs: int   = 10
     grad_clip:     float = 1.0
+    normal_weight: float = 1.0
 
-    # --- VAE ---
-    beta_start:    float = 0.0    # β annealing: start value
-    beta_end:      float = 1.0    # β annealing: final value
-    beta_epochs:   int   = 100    # epochs to reach beta_end
-    recon_loss:    str   = "chamfer"   # "chamfer" | "emd" | "both"
-    emd_weight:    float = 0.5    # used only when recon_loss="both"
+    # --- VAE BETA SCHEDULING ---
+    beta_start:    float = 0.0    
+    beta_end:      float = 5.0    # Aumentado para equilibrar com o novo cálculo médio da KL
+    beta_epochs:   int   = 60     # Estabiliza o espaço latente mais cedo na metade do treino
+    recon_loss:    str   = "chamfer"   
+    emd_weight:    float = 0.5    
 
     # --- data ---
     val_split:     float = 0.1
@@ -69,11 +66,11 @@ class TrainConfig:
 
     # --- misc ---
     seed:          int   = 42
-    save_every:    int   = 10    # save checkpoint every N epochs
-    log_every:     int   = 50    # log metrics every N batches
+    save_every:    int   = 5     # Salva checkpoints a cada 5 épocas para poupar I/O de disco
+    log_every:     int   = 50    
     device:        str   = "cuda"
-    amp:           bool  = True   # automatic mixed precision
-    resume:        int   = 0     # epoch to resume from
+    amp:           bool  = True   
+    resume:        int   = 0     
 
 
 # ============================================================
@@ -86,7 +83,6 @@ def log_metrics_tensorboard(writer: SummaryWriter, metrics: dict[str, float], pr
 
 
 @torch.no_grad()
-@torch.no_grad()
 def log_reconstructions(
     writer: SummaryWriter,
     model: nn.Module,
@@ -95,64 +91,43 @@ def log_reconstructions(
     epoch: int,
     max_items: int = 4,
 ):
+    """Logs Ground Truth vs Reconstruction, and random samples from the Gaussian prior."""
     model.eval()
 
-    points = next(iter(loader))
+    # Capture a verification batch
+    points, _ = next(iter(loader))
     points = points.to(device)
-    points = normalise_batch(points)
-
     target_xyz = points[..., :3]
 
-    # Reconstrução clássica usando dados reais
-    coords_pred, normals_pred, mu, logvar = model(points)
+    # Inference forward pass
+    coords_pred, normals_pred, mu, logvar, mu_style, logvar_style = model(points)
 
     refined = coords_pred.detach().float().cpu()
     target_xyz = target_xyz.detach().float().cpu()
 
     B = min(max_items, refined.shape[0])
 
+    # Coloring schemes for mesh visualizations
     gt_colors = torch.zeros_like(target_xyz[:B])
-    gt_colors[..., 1] = 255  # Verde para o Ground Truth
+    gt_colors[..., 1] = 255  # Green for Ground Truth
 
     pred_colors = torch.zeros_like(refined[:B])
-    pred_colors[..., 0] = 255  # Vermelho para a Reconstrução
+    pred_colors[..., 0] = 255  # Red for VAE Reconstruction
 
-    writer.add_mesh(
-        tag="reconstruction/ground_truth",
-        vertices=target_xyz[:B],
-        colors=gt_colors,
-        global_step=epoch,
-    )
+    writer.add_mesh("reconstruction/ground_truth", vertices=target_xyz[:B], colors=gt_colors, global_step=epoch)
+    writer.add_mesh("reconstruction/prediction", vertices=refined[:B], colors=pred_colors, global_step=epoch)
 
-    writer.add_mesh(
-        tag="reconstruction/prediction",
-        vertices=refined[:B],
-        colors=pred_colors,
-        global_step=epoch,
-    )
-
-    # ============================================================
-    # GERADOR DE AMOSTRAS ALEATÓRIAS (PRIOR GENERATION)
-    # ============================================================
-    # Determina a quantidade de pontos configurada (padrão 2048)
-    num_pts = model.decoder.num_points if hasattr(model.decoder, "num_points") else 2048
-    
-    # Gera exatamente 5 objetos tridimensionais inéditos a partir do Prior Gaussiano
+    # --- Generative Prior Sampling ---
+    num_pts = getattr(model, "num_latent_points", 512) 
     num_gen = 5
+    
     generated_xyz, _ = model.generate(num_samples=num_gen, num_points=num_pts, device=device)
     generated_xyz = generated_xyz.detach().float().cpu()
 
-    # Define a cor azul pura para as amostras geradas
     gen_colors = torch.zeros_like(generated_xyz)
-    gen_colors[..., 2] = 255  # Azul para amostras inéditas do prior
+    gen_colors[..., 2] = 255  # Blue for purely synthesized shapes
 
-    writer.add_mesh(
-        tag="samples/random_generation",
-        vertices=generated_xyz,
-        colors=gen_colors,
-        global_step=epoch,
-    )
-
+    writer.add_mesh("samples/random_generation", vertices=generated_xyz, colors=gen_colors, global_step=epoch)
     model.train()
 
 
@@ -190,32 +165,6 @@ def count_parameters(model: nn.Module) -> int:
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
-def normalise_batch(points: torch.Tensor) -> torch.Tensor:
-    xyz    = points[..., :3]
-    centre = xyz.mean(dim=1, keepdim=True)
-    xyz    = xyz - centre
-    scale  = xyz.norm(dim=2, keepdim=True).max(dim=1, keepdim=True).values.clamp(min=1e-6)
-    xyz    = xyz / scale
-    return torch.cat([xyz, points[..., 3:]], dim=2)
-
-
-def make_collate(num_points: int):
-    def collate(batch):
-        features_list = []
-        for _, feat in batch:
-            N = feat.shape[0]
-            if N >= num_points:
-                idx  = torch.randperm(N)[:num_points]
-                feat = feat[idx]
-            else:
-                pad  = num_points - N
-                idx  = torch.randint(0, N, (pad,))
-                feat = torch.cat([feat, feat[idx]], dim=0)
-            features_list.append(feat)
-        return torch.stack(features_list, dim=0)
-    return collate
-
-
 # ============================================================
 # Train / Val steps
 # ============================================================
@@ -237,23 +186,28 @@ def train_one_epoch(
     totals: dict[str, float] = {}
     n_batches = 0
 
-    for batch_idx, points in enumerate(loader):
+    for batch_idx, data in enumerate(loader):
+        points, _ = data
         points = points.to(device, non_blocking=True)
-        points = normalise_batch(points)
         target_xyz = points[..., :3]
+        normal_target = points[..., 3:]
 
         with torch.autocast(device_type=device.type, enabled=cfg.amp):
-            # AJUSTE: Removido o 'coarse' que não existe no pipeline hierárquico
-            coords_pred, normals_pred, mu, logvar = model(points)
+            coords_pred, normals_pred, mu, logvar, mu_style, logvar_style = model(points)
 
             losses = vae_loss(
-                pred_xyz   = coords_pred,
-                target_xyz = target_xyz,
-                mu         = mu,
-                logvar     = logvar,
-                beta       = beta,
-                recon_loss = cfg.recon_loss,
-                emd_weight = cfg.emd_weight,
+                pred_xyz=coords_pred,
+                target_xyz=target_xyz,
+                mu_points=mu,
+                logvar_points=logvar,
+                mu_style=mu_style,
+                normal_target=normal_target,
+                logvar_style=logvar_style,
+                beta=beta,
+                recon_loss=cfg.recon_loss,
+                emd_weight=cfg.emd_weight,
+                normals_pred=normals_pred,
+                normal_weight=cfg.normal_weight
             )
 
         optimiser.zero_grad(set_to_none=True)
@@ -271,8 +225,7 @@ def train_one_epoch(
             avg = {k: v / n_batches for k, v in totals.items()}
             logger.info(
                 f"  Epoch {epoch:03d}  Batch {batch_idx+1}/{len(loader)}  "
-                f"β={beta:.3f}  "
-                + "  ".join(f"{k}={v:.5f}" for k, v in avg.items())
+                f"β={beta:.3f}  " + "  ".join(f"{k}={v:.5f}" for k, v in avg.items())
             )
 
     return {k: v / max(n_batches, 1) for k, v in totals.items()}
@@ -293,31 +246,35 @@ def validate(
     totals: dict[str, float] = {}
     n_batches = 0
 
-    for points in loader:
+    for points, _ in loader:
         points = points.to(device, non_blocking=True)
-        points = normalise_batch(points)
         target_xyz = points[..., :3]
         target_nrm = points[..., 3:]
 
         with torch.autocast(device_type=device.type, enabled=cfg.amp):
-            coords_pred, normals_pred, mu, logvar = model(points)
+            coords_pred, normals_pred, mu_points, logvar_points, mu_style, logvar_style = model(points)
 
             losses = vae_loss(
-                pred_xyz   = coords_pred,
-                target_xyz = target_xyz,
-                mu         = mu,
-                logvar     = logvar,
-                beta       = beta,
-                recon_loss = cfg.recon_loss,
-                emd_weight = cfg.emd_weight,
+                pred_xyz=coords_pred,
+                target_xyz=target_xyz,
+                mu_points=mu_points,
+                logvar_points=logvar_points,
+                mu_style=mu_style,
+                normal_target=target_nrm,
+                logvar_style=logvar_style,
+                beta=beta,
+                recon_loss=cfg.recon_loss,
+                emd_weight=cfg.emd_weight,
+                normals_pred=normals_pred,
+                normal_weight=cfg.normal_weight
             )
 
-        fs  = f_score(coords_pred, target_xyz, threshold=0.01)
-        nc  = normal_consistency(coords_pred, normals_pred, target_xyz, target_nrm)
+        fs = f_score(coords_pred, target_xyz, threshold=0.01)
+        nc = normal_consistency(coords_pred, normals_pred, target_xyz, target_nrm)
 
         for k, v in losses.items():
             totals[k] = totals.get(k, 0.0) + v.item()
-        totals["f_score"]  = totals.get("f_score",  0.0) + fs["f_score"].item()
+        totals["f_score"] = totals.get("f_score", 0.0) + fs["f_score"].item()
         totals["normal_c"] = totals.get("normal_c", 0.0) + nc.item()
         n_batches += 1
 
@@ -334,75 +291,51 @@ def main(cfg: TrainConfig) -> None:
     logger = get_logger(cfg.log_dir)
     writer = SummaryWriter(log_dir=cfg.log_dir)
 
-    device = torch.device(
-        cfg.device if (cfg.device == "cuda" and torch.cuda.is_available()) else "cpu"
-    )
+    device = torch.device(cfg.device if (cfg.device == "cuda" and torch.cuda.is_available()) else "cpu")
     logger.info(f"Using device: {device}")
 
-    # ---- dataset -------------------------------------------------------
+    # ---- Datasets & Splits ---------------------------------------------
     base_ds = Ds_point_sampled_already(root=cfg.data_root, augment=False)
-
     indices = torch.randperm(len(base_ds), generator=torch.Generator().manual_seed(cfg.seed)).tolist()
-
     val_n = max(1, int(len(base_ds) * cfg.val_split))
 
     train_idx = indices[val_n:]
     val_idx   = indices[:val_n]
 
-    trn_ds = torch.utils.data.Subset(
-        Ds_point_sampled_already(root=cfg.data_root, augment=True),
-        train_idx
-    )
-
-    val_ds = torch.utils.data.Subset(
-        Ds_point_sampled_already(root=cfg.data_root, augment=False),
-        val_idx
-    )
+    trn_ds = torch.utils.data.Subset(Ds_point_sampled_already(root=cfg.data_root, augment=True), train_idx)
+    val_ds = torch.utils.data.Subset(Ds_point_sampled_already(root=cfg.data_root, augment=False), val_idx)
    
-    collate = make_collate(cfg.num_points)
+    # FIX: shuffle=True ativado no Loader de treinamento para evitar overfitting sequencial
     trn_loader = DataLoader(
-        trn_ds, batch_size=cfg.batch_size, shuffle=True,
-        num_workers=cfg.num_workers, pin_memory=cfg.pin_memory,
-        collate_fn=collate, drop_last=True,
+        trn_ds, batch_size=cfg.batch_size, shuffle=True, 
+        num_workers=cfg.num_workers, pin_memory=cfg.pin_memory
     )
     val_loader = DataLoader(
         val_ds, batch_size=cfg.batch_size, shuffle=False,
-        num_workers=cfg.num_workers, pin_memory=cfg.pin_memory,
-        collate_fn=collate,
+        num_workers=cfg.num_workers, pin_memory=cfg.pin_memory
     )
     logger.info(f"Dataset: {len(train_idx)} train / {len(val_idx)} val samples")
 
-    # ---- MODEL INSTANTIATION (AJUSTADO PARA O NOVO VAE) -----------------
+    # ---- Model Instantiation -------------------------------------------
     model = Vae(
         latent_dim=cfg.latent_dim, 
         style_dim=cfg.style_dim, 
         in_channels=6
     ).to(device)
     
-    logger.info(f"Hierarchical VAE Initialised successfully.")
+    logger.info("Hierarchical VAE Initialised successfully.")
     logger.info(f"Parameters: {count_parameters(model):,}")
 
-    # ---- optimiser / scheduler ----------------------------------------
+    # ---- Optimiser & Schedulers ----------------------------------------
     optimiser = AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
 
-    warmup = LinearLR(
-        optimiser,
-        start_factor=1e-3, end_factor=1.0,
-        total_iters=cfg.warmup_epochs,
-    )
-    cosine = CosineAnnealingLR(
-        optimiser,
-        T_max=cfg.epochs - cfg.warmup_epochs,
-        eta_min=cfg.lr * 1e-2,
-    )
-    scheduler = SequentialLR(
-        optimiser, schedulers=[warmup, cosine],
-        milestones=[cfg.warmup_epochs]
-    )
+    warmup = LinearLR(optimiser, start_factor=1e-3, end_factor=1.0, total_iters=cfg.warmup_epochs)
+    cosine = CosineAnnealingLR(optimiser, T_max=cfg.epochs - cfg.warmup_epochs, eta_min=cfg.lr * 1e-2)
+    scheduler = SequentialLR(optimiser, schedulers=[warmup, cosine], milestones=[cfg.warmup_epochs])
 
     scaler = torch.amp.GradScaler("cuda", enabled=cfg.amp and device.type == "cuda")
 
-    # ---- resume --------------------------------------------------------
+    # ---- Resume Checkpoint State ---------------------------------------
     start_epoch = 0
     best_val_cd = math.inf
     history: list[dict] = []
@@ -419,13 +352,11 @@ def main(cfg: TrainConfig) -> None:
         history     = ckpt.get("history", [])
         logger.info(f"Resumed from epoch {start_epoch}")
 
-    # ---- training loop -------------------------------------------------
+    # ---- Core Training Epoch Loop --------------------------------------
     for epoch in range(start_epoch, cfg.epochs):
         t0 = time.time()
 
-        trn_metrics = train_one_epoch(
-            model, trn_loader, optimiser, scaler, cfg, epoch, logger, device
-        )
+        trn_metrics = train_one_epoch(model, trn_loader, optimiser, scaler, cfg, epoch, logger, device)
         val_metrics = validate(model, val_loader, cfg, epoch, device)
 
         scheduler.step()
@@ -450,14 +381,24 @@ def main(cfg: TrainConfig) -> None:
         log_metrics_tensorboard(writer, val_metrics, "val", epoch)
         writer.add_scalar("latent/best_val_cd", best_val_cd, epoch)
 
-        # Visualização de reconstrução a cada 5 épocas
+        # Render geometric updates inside TensorBoard
         if epoch % 5 == 0:
-            log_reconstructions(writer, model, val_loader, device, epoch, max_items=4)
+            log_reconstructions(writer, model, trn_loader, device, epoch, max_items=4)
 
-        # ---- checkpointing -------------------------------------------
-        record = {"epoch": epoch, **{f"trn_{k}": v for k, v in trn_metrics.items()},
-                  **{f"val_{k}": v for k, v in val_metrics.items()}}
+        # ---- Track Performance & Save Checkpoints ----------------------
+        record = {
+            "epoch": epoch, 
+            **{f"trn_{k}": v for k, v in trn_metrics.items()},
+            **{f"val_{k}": v for k, v in val_metrics.items()}
+        }
         history.append(record)
+
+        # Reads exclusively the "recon" key mapping Chamfer/EMD distance
+        val_cd = val_metrics.get("recon", math.inf)
+        is_best = val_cd < best_val_cd
+        if is_best:
+            best_val_cd = val_cd
+            logger.info(f"  ✓ New best val reconstruction (Chamfer): {best_val_cd:.6f}")
 
         save_state = {
             "epoch":       epoch,
@@ -470,18 +411,14 @@ def main(cfg: TrainConfig) -> None:
             "history":     history,
         }
 
+        # Backup state to prevent tracking losses if training crashes
         torch.save(save_state, os.path.join(cfg.ckpt_dir, "latest.pt"))
 
         if (epoch + 1) % cfg.save_every == 0:
             torch.save(save_state, os.path.join(cfg.ckpt_dir, f"epoch_{epoch:04d}.pt"))
 
-        val_cd_key = "val_cd" if "val_cd" in val_metrics else "val_recon"
-        val_cd = val_metrics.get(val_cd_key, math.inf)
-        if val_cd < best_val_cd:
-            best_val_cd = val_cd
-            save_state["best_val_cd"] = best_val_cd
+        if is_best:
             torch.save(save_state, os.path.join(cfg.ckpt_dir, "best.pt"))
-            logger.info(f"  ✓ New best val CD: {best_val_cd:.6f}")
 
         with open(os.path.join(cfg.log_dir, "history.json"), "w") as f:
             json.dump(history, f, indent=2)
