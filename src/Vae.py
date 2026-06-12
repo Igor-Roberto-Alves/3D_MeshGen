@@ -49,6 +49,7 @@ class Vae(nn.Module):
         std = torch.exp(0.5 * logvar)
         eps = torch.randn_like(std)
         z_points = mu + eps * std  # Nuvem Latente: (B, N, 259)
+        return z_points
 
     def generate(self, num_samples: int, num_points: int = 512, device: torch.device = None) -> tuple[torch.Tensor, torch.Tensor]:
         """

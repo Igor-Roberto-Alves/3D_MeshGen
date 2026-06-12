@@ -17,142 +17,77 @@ from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 import numpy as np
 
 from src.dataset import Ds_point_sampled_already
-from src.metric import vae_loss, f_score, normal_consistency
 from src.Vae import Vae
+from src.Diffus import (
+    DDPMScheduler, StyleScoreNet, PointScoreNet, Model
+)
 
 
 @dataclass
-class TrainConfig:
+class DiffusionConfig:
     # --- paths ---
-    data_root:     str  = "point_clouds"
-    ckpt_dir:      str  = "checkpoints_diff"
-    log_dir:       str  = "logs_diff"
+    data_root:      str   = "point_clouds"
+    vae_ckpt:       str   = "checkpoints/best.pt"   # frozen VAE checkpoint
+    ckpt_dir:       str   = "checkpoints_diffusion"
+    log_dir:        str   = "logs_diffusion"
 
-    # --- architecture ---
-    latent_dim:    int   = 6
-    style_dim:     int   = 512
-    num_points:    int   = 2048  
+    # --- VAE architecture (must match the frozen checkpoint) ---
+    latent_dim:     int   = 6
+    style_dim:      int   = 512
+
+    # --- diffusion architecture ---
+    hidden_dim:     int   = 512
+    style_depth:    int   = 6
+    point_depth:    int   = 8
+    heads:          int   = 4
+    num_classes:    int   = 53
+    T:              int   = 1000
+    schedule:       str   = "cosine"   # "cosine" | "linear"
+
+    # --- loss weights ---
+    w_style:        float = 1.0
+    w_points:       float = 1.0
 
     # --- training ---
-    epochs:        int   = 400
-    batch_size:    int   = 32
-    lr:            float = 1e-3
-    weight_decay:  float = 1e-4
-    warmup_epochs: int   = 10
-    grad_clip:     float = 1.0
-
-    # --- VAE ---
-    beta_start:    float = 0.0    
-    beta_end:      float = 1.0    
-    beta_epochs:   int   = 100    # epochs to reach beta_end
-    recon_loss:    str   = "chamfer"   # "chamfer" | "emd" | "both"
-    emd_weight:    float = 0.5    # used only when recon_loss="both"
-    normal_weght: float = 0.5 # Weight for normal reconstruction
+    epochs:         int   = 400
+    batch_size:     int   = 32
+    lr:             float = 1e-4
+    weight_decay:   float = 1e-4
+    warmup_epochs:  int   = 10
+    grad_clip:      float = 1.0
 
     # --- data ---
-    val_split:     float = 0.1
-    num_workers:   int   = 4
-    pin_memory:    bool  = True
+    val_split:      float = 0.1
+    num_workers:    int   = 4
+    pin_memory:     bool  = True
 
     # --- misc ---
-    seed:          int   = 495241 #IRA
-    save_every:    int   = 2    # save checkpoint every 2 epochs
-    log_every:     int   = 50    # log metrics every 50 batches
-    device:        str   = "cuda"
-    amp:           bool  = True   # automatic mixed precision
-    resume:        int   = 0     # epoch to resume from
+    seed:           int   = 495241
+    save_every:     int   = 2
+    log_every:      int   = 50
+    device:         str   = "cuda"
+    amp:            bool  = True
+    resume:         int   = 0
 
 
-# Tensorboard
+# ------------------------------------------------------------------ #
+# Helpers (same pattern as your VAE train.py)
+# ------------------------------------------------------------------ #
 
-def log_metrics_tensorboard(writer: SummaryWriter, metrics: dict[str, float], prefix: str, epoch: int):
+def log_metrics_tensorboard(writer, metrics, prefix, epoch):
     for k, v in metrics.items():
         writer.add_scalar(f"{prefix}/{k}", v, epoch)
 
 
-@torch.no_grad()
-def log_reconstructions(
-    writer: SummaryWriter,
-    model: nn.Module,
-    loader: DataLoader,
-    device: torch.device,
-    epoch: int,
-    max_items: int = 4,
-):
-    model.eval()
-
-    points = next(iter(loader))
-    points = points.to(device)
-
-    target_xyz = points[..., :3]
-
-    coords_pred, normals_pred, mu, logvar = model(points)
-
-    refined = coords_pred.detach().float().cpu()
-    target_xyz = target_xyz.detach().float().cpu()
-
-    B = min(max_items, refined.shape[0])
-
-    gt_colors = torch.zeros_like(target_xyz[:B])
-    gt_colors[..., 1] = 255  # Verde para o Ground Truth
-
-    pred_colors = torch.zeros_like(refined[:B])
-    pred_colors[..., 0] = 255  # Vermelho para a Reconstrução
-
-    writer.add_mesh(
-        tag="reconstruction/ground_truth",
-        vertices=target_xyz[:B],
-        colors=gt_colors,
-        global_step=epoch,
-    )
-
-    writer.add_mesh(
-        tag="reconstruction/prediction",
-        vertices=refined[:B],
-        colors=pred_colors,
-        global_step=epoch,
-    )
-
-
-    num_pts_lat = 512 
-    num_gen = 5
-    generated_xyz, _ = model.generate(num_samples=num_gen, num_points=num_pts_lat, device=device)
-    generated_xyz = generated_xyz.detach().float().cpu()
-
-    # Define a cor azul pura para as amostras geradas
-    gen_colors = torch.zeros_like(generated_xyz)
-    gen_colors[..., 2] = 255  # Azul para amostras inéditas do prior
-
-    writer.add_mesh(
-        tag="samples/random_generation",
-        vertices=generated_xyz,
-        colors=gen_colors,
-        global_step=epoch,
-    )
-
-    model.train()
-
-
-# ============================================================
-# Utilities
-# ============================================================
-
-def beta_schedule(epoch: int, cfg: TrainConfig) -> float:
-    if epoch >= cfg.beta_epochs:
-        return cfg.beta_end
-    t = epoch / cfg.beta_epochs
-    return cfg.beta_start + t * (cfg.beta_end - cfg.beta_start)
-
-
-def set_seed(seed: int) -> None:
+def set_seed(seed):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     np.random.seed(seed)
 
 
-def get_logger(log_dir: str) -> logging.Logger:
+def get_logger(log_dir):
     Path(log_dir).mkdir(parents=True, exist_ok=True)
-    logger = logging.getLogger("vae_train")
+    logger = logging.getLogger("diffusion_train")
     logger.setLevel(logging.INFO)
     if not logger.handlers:
         fh = logging.FileHandler(os.path.join(log_dir, "train.log"))
@@ -163,56 +98,86 @@ def get_logger(log_dir: str) -> logging.Logger:
     return logger
 
 
-def count_parameters(model: nn.Module) -> int:
+def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
+# ------------------------------------------------------------------ #
+# Dataset — returns (points, cls) tuples
+# ------------------------------------------------------------------ #
+
+def build_loaders(cfg: DiffusionConfig):
+    """
+    Ds_point_sampled_already must return (points, cls) or you wrap it below.
+    If your dataset only returns points, see the wrapper comment.
+    """
+    base_ds = Ds_point_sampled_already(root=cfg.data_root, augment=False)
+    indices = torch.randperm(
+        len(base_ds), generator=torch.Generator().manual_seed(cfg.seed)
+    ).tolist()
+
+    val_n     = max(1, int(len(base_ds) * cfg.val_split))
+    train_idx = indices[val_n:]
+    val_idx   = indices[:val_n]
+
+    trn_ds = torch.utils.data.Subset(
+        Ds_point_sampled_already(root=cfg.data_root, augment=True), train_idx
+    )
+    val_ds = torch.utils.data.Subset(
+        Ds_point_sampled_already(root=cfg.data_root, augment=False), val_idx
+    )
+
+    trn_loader = DataLoader(
+        trn_ds, batch_size=cfg.batch_size, shuffle=True,
+        num_workers=cfg.num_workers, pin_memory=cfg.pin_memory, drop_last=True,
+    )
+    val_loader = DataLoader(
+        val_ds, batch_size=cfg.batch_size, shuffle=False,
+        num_workers=cfg.num_workers, pin_memory=cfg.pin_memory,
+    )
+    return trn_loader, val_loader, len(train_idx), len(val_idx)
 
 
+# ------------------------------------------------------------------ #
 # Train / Val steps
+# ------------------------------------------------------------------ #
 
 def train_one_epoch(
-    model:     nn.Module,
-    loader:    DataLoader,
-    optimiser: torch.optim.Optimizer,
-    scaler:    torch.amp.GradScaler,
-    cfg:       TrainConfig,
-    epoch:     int,
-    logger:    logging.Logger,
-    device:    torch.device,
-) -> dict[str, float]:
-
+    model, loader, optimiser, scaler, cfg, epoch, logger, device
+) -> dict:
     model.train()
-    beta = beta_schedule(epoch, cfg)
+    # VAE must stay frozen/eval even during model.train()
+    model.vae.eval()
 
     totals: dict[str, float] = {}
     n_batches = 0
 
-    for batch_idx, points in enumerate(loader):
+    for batch_idx, batch in enumerate(loader):
+        # --- unpack: adapt if your dataset returns only points ---
+        if isinstance(batch, (list, tuple)):
+            points, cls = batch
+        else:
+            points = batch
+            cls = None   # should not happen if dataset has classes
+
         points = points.to(device, non_blocking=True)
-        target_xyz = points[..., :3]
-        target_normals = points[..., 3:]
+        cls    = cls.to(device, non_blocking=True)
 
         with torch.autocast(device_type=device.type, enabled=cfg.amp):
-            coords_pred, normals_pred, mu, logvar = model(points)
-
-            losses = vae_loss(
-                pred_xyz   = coords_pred,
-                target_xyz = target_xyz,
-                mu         = mu,
-                logvar     = logvar,
-                beta       = beta,
-                normals_pred = normals_pred, # ADD in src.metric
-                target_normals = target_normals,
-                recon_loss = cfg.recon_loss,
-                emd_weight = cfg.emd_weight,
-                normal_weight = cfg.normal_weight # ADD in src.metric, ADD in cfg structure
+            losses = model.training_step(
+                points, cls,
+                w_style=cfg.w_style,
+                w_points=cfg.w_points,
             )
 
         optimiser.zero_grad(set_to_none=True)
-        scaler.scale(losses["total"]).backward()
+        scaler.scale(losses["loss"]).backward()
         scaler.unscale_(optimiser)
-        nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+        nn.utils.clip_grad_norm_(
+            list(model.style_net.parameters()) +
+            list(model.point_net.parameters()),
+            cfg.grad_clip,
+        )
         scaler.step(optimiser)
         scaler.update()
 
@@ -224,7 +189,6 @@ def train_one_epoch(
             avg = {k: v / n_batches for k, v in totals.items()}
             logger.info(
                 f"  Epoch {epoch:03d}  Batch {batch_idx+1}/{len(loader)}  "
-                f"β={beta:.3f}  "
                 + "  ".join(f"{k}={v:.5f}" for k, v in avg.items())
             )
 
@@ -232,57 +196,62 @@ def train_one_epoch(
 
 
 @torch.no_grad()
-def validate(
-    model:  nn.Module,
-    loader: DataLoader,
-    cfg:    TrainConfig,
-    epoch:  int,
-    device: torch.device,
-) -> dict[str, float]:
-
+def validate(model, loader, cfg, epoch, device) -> dict:
     model.eval()
-    beta = beta_schedule(epoch, cfg)
 
     totals: dict[str, float] = {}
     n_batches = 0
 
-    for points in loader:
+    for batch in loader:
+        if isinstance(batch, (list, tuple)):
+            points, cls = batch
+        else:
+            points = batch
+            cls = None
+
         points = points.to(device, non_blocking=True)
-        target_xyz = points[..., :3]
-        target_nrm = points[..., 3:]
+        cls    = cls.to(device, non_blocking=True)
 
         with torch.autocast(device_type=device.type, enabled=cfg.amp):
-            coords_pred, normals_pred, mu, logvar = model(points)
-
-            losses = vae_loss(
-                pred_xyz   = coords_pred,
-                target_xyz = target_xyz,
-                mu         = mu,
-                logvar     = logvar,
-                beta       = beta,
-                recon_loss = cfg.recon_loss,
-                emd_weight = cfg.emd_weight,
+            losses = model.training_step(
+                points, cls,
+                w_style=cfg.w_style,
+                w_points=cfg.w_points,
             )
-
-        fs  = f_score(coords_pred, target_xyz, threshold=0.01)
-        nc  = normal_consistency(coords_pred, normals_pred, target_xyz, target_nrm)
 
         for k, v in losses.items():
             totals[k] = totals.get(k, 0.0) + v.item()
-        totals["f_score"]  = totals.get("f_score",  0.0) + fs["f_score"].item()
-        totals["normal_c"] = totals.get("normal_c", 0.0) + nc.item()
         n_batches += 1
 
     return {k: v / max(n_batches, 1) for k, v in totals.items()}
 
 
-# ============================================================
+@torch.no_grad()
+def log_samples(writer, model, cfg, device, epoch, n=4):
+    """Generate n samples per class and log to TensorBoard."""
+    model.eval()
+
+    cls = torch.arange(n, device=device) % cfg.num_classes
+    gen_xyz = model.sample(
+        n=n, cls=cls, device=device,
+        style_dim=cfg.style_dim,
+        latent_dim=cfg.latent_dim * cfg.latent_dim,  # adapt to your z_points dim
+    )
+    gen_xyz = gen_xyz[..., :3].detach().float().cpu()
+
+    colors = torch.zeros_like(gen_xyz)
+    colors[..., 2] = 255   # blue
+
+    writer.add_mesh("samples/generated", vertices=gen_xyz, colors=colors, global_step=epoch)
+    model.train()
+    model.vae.eval()
 
 
-def main(cfg: TrainConfig) -> None:
+# ------------------------------------------------------------------ #
+# Main
+# ------------------------------------------------------------------ #
 
-    # -- seed and Tensorboard
-
+def main(cfg: DiffusionConfig) -> None:
     set_seed(cfg.seed)
     Path(cfg.ckpt_dir).mkdir(parents=True, exist_ok=True)
     logger = get_logger(cfg.log_dir)
@@ -294,83 +263,72 @@ def main(cfg: TrainConfig) -> None:
     logger.info(f"Using device: {device}")
 
     # ---- dataset -------------------------------------------------------
-    base_ds = Ds_point_sampled_already(root=cfg.data_root, augment=False)
+    trn_loader, val_loader, n_trn, n_val = build_loaders(cfg)
+    logger.info(f"Dataset: {n_trn} train / {n_val} val samples")
 
-    indices = torch.randperm(len(base_ds), generator=torch.Generator().manual_seed(cfg.seed)).tolist()
+    # ---- frozen VAE ----------------------------------------------------
+    vae = Vae(latent_dim=cfg.latent_dim, style_dim=cfg.style_dim, in_channels=6).to(device)
+    ckpt = torch.load(cfg.vae_ckpt, map_location=device)
+    vae.load_state_dict(ckpt["model"])
+    logger.info(f"Loaded VAE from {cfg.vae_ckpt} (epoch {ckpt.get('epoch', '?')})")
 
-    val_n = max(1, int(len(base_ds) * cfg.val_split))
-
-    train_idx = indices[val_n:]
-    val_idx   = indices[:val_n]
-
-    trn_ds = torch.utils.data.Subset(
-        Ds_point_sampled_already(root=cfg.data_root, augment=True),
-        train_idx
-    )
-
-    val_ds = torch.utils.data.Subset(
-        Ds_point_sampled_already(root=cfg.data_root, augment=False),
-        val_idx
-    )
-   
-    trn_loader = DataLoader(
-        trn_ds, batch_size=cfg.batch_size, shuffle=True,
-        num_workers=cfg.num_workers, pin_memory=cfg.pin_memory, drop_last=True,
-    )
-    val_loader = DataLoader(
-        val_ds, batch_size=cfg.batch_size, shuffle=False,
-        num_workers=cfg.num_workers, pin_memory=cfg.pin_memory,
-    )
-    logger.info(f"Dataset: {len(train_idx)} train / {len(val_idx)} val samples")
-
-    # ---- MODEL INSTANTIATION -------------------------------------------
-
-    model = Vae(
-        latent_dim=cfg.latent_dim, 
-        style_dim=cfg.style_dim, 
-        in_channels=6
+    # ---- diffusion models ----------------------------------------------
+    style_net = StyleScoreNet(
+        style_dim=cfg.style_dim,
+        hidden_dim=cfg.hidden_dim,
+        depth=cfg.style_depth,
+        heads=cfg.heads,
+        num_classes=cfg.num_classes,
     ).to(device)
-    
+
+    point_net = PointScoreNet(
+        latent_dim=3 + cfg.latent_dim,
+        style_dim=cfg.style_dim,
+        hidden_dim=cfg.hidden_dim,
+        depth=cfg.point_depth,
+        heads=cfg.heads,
+    ).to(device)
+
+    style_sched = DDPMScheduler(T=cfg.T, schedule=cfg.schedule)
+    point_sched = DDPMScheduler(T=cfg.T, schedule=cfg.schedule)
+
+    model = Model(
+        frozen_vae=vae,
+        style_score_net=style_net,
+        point_score_net=point_net,
+        style_scheduler=style_sched,
+        point_scheduler=point_sched,
+    ).to(device)
+
+    # only style_net + point_net are trainable
+    trainable = list(model.style_net.parameters()) + list(model.point_net.parameters())
     logger.info("*******************************************")
-    logger.info(f"Hierarchical VAE Initialised successfully.")
-    logger.info(f"Parameters: {count_parameters(model):,}")
+    logger.info("Diffusion Model initialised.")
+    logger.info(f"Trainable parameters: {sum(p.numel() for p in trainable):,}")
     logger.info("*******************************************")
 
-    # ---- optimiser / scheduler ----------------------------------------
-    optimiser = AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
-
-    warmup = LinearLR(
-        optimiser,
-        start_factor=1e-3, end_factor=1.0,
-        total_iters=cfg.warmup_epochs,
-    )
-    cosine = CosineAnnealingLR(
-        optimiser,
-        T_max=cfg.epochs - cfg.warmup_epochs,
-        eta_min=cfg.lr * 1e-2,
-    )
-    scheduler = SequentialLR(
-        optimiser, schedulers=[warmup, cosine],
-        milestones=[cfg.warmup_epochs]
-    )
-
-
+    # ---- optimiser / scheduler -----------------------------------------
+    optimiser = AdamW(trainable, lr=cfg.lr, weight_decay=cfg.weight_decay)
+    warmup = LinearLR(optimiser, start_factor=1e-3, end_factor=1.0, total_iters=cfg.warmup_epochs)
+    cosine = CosineAnnealingLR(optimiser, T_max=cfg.epochs - cfg.warmup_epochs, eta_min=cfg.lr * 1e-2)
+    scheduler = SequentialLR(optimiser, schedulers=[warmup, cosine], milestones=[cfg.warmup_epochs])
     scaler = torch.amp.GradScaler("cuda", enabled=cfg.amp and device.type == "cuda")
 
     # ---- resume --------------------------------------------------------
     start_epoch = 0
-    best_val_cd = math.inf
-    history: list[dict] = []
+    best_val    = math.inf
+    history     = []
 
     resume_path = os.path.join(cfg.ckpt_dir, "latest.pt")
     if os.path.exists(resume_path) and cfg.resume:
         ckpt = torch.load(resume_path, map_location=device)
-        model.load_state_dict(ckpt["model"])
+        model.style_net.load_state_dict(ckpt["style_net"])
+        model.point_net.load_state_dict(ckpt["point_net"])
         optimiser.load_state_dict(ckpt["optimiser"])
         scheduler.load_state_dict(ckpt["scheduler"])
         scaler.load_state_dict(ckpt["scaler"])
         start_epoch = ckpt["epoch"] + 1
-        best_val_cd = ckpt.get("best_val_cd", math.inf)
+        best_val    = ckpt.get("best_val", math.inf)
         history     = ckpt.get("history", [])
         logger.info(f"Resumed from epoch {start_epoch}")
 
@@ -378,9 +336,7 @@ def main(cfg: TrainConfig) -> None:
     for epoch in range(start_epoch, cfg.epochs):
         t0 = time.time()
 
-        trn_metrics = train_one_epoch(
-            model, trn_loader, optimiser, scaler, cfg, epoch, logger, device
-        )
+        trn_metrics = train_one_epoch(model, trn_loader, optimiser, scaler, cfg, epoch, logger, device)
         val_metrics = validate(model, val_loader, cfg, epoch, device)
 
         scheduler.step()
@@ -391,52 +347,44 @@ def main(cfg: TrainConfig) -> None:
         logger.info(
             f"Epoch {epoch:03d}/{cfg.epochs}  "
             f"lr={scheduler.get_last_lr()[0]:.2e}  "
-            f"β={beta_schedule(epoch, cfg):.3f}  "
-            f"time={elapsed:.1f}s\n"
-            f"  {trn_str}\n"
-            f"  {val_str}"
+            f"time={elapsed:.1f}s\n  {trn_str}\n  {val_str}"
         )
 
-        # TensorBoard logging
         writer.add_scalar("train/lr", scheduler.get_last_lr()[0], epoch)
-        writer.add_scalar("train/beta", beta_schedule(epoch, cfg), epoch)
-
         log_metrics_tensorboard(writer, trn_metrics, "train", epoch)
         log_metrics_tensorboard(writer, val_metrics, "val", epoch)
-        writer.add_scalar("latent/best_val_cd", best_val_cd, epoch)
 
-        # Visualização de reconstrução a cada 5 épocas
-        if epoch % 1 == 0:
-            log_reconstructions(writer, model, val_loader, device, epoch, max_items=4)
+        if epoch % 5 == 0:
+            log_samples(writer, model, cfg, device, epoch)
 
-        # ---- checkpointing -------------------------------------------
-        record = {"epoch": epoch, **{f"trn_{k}": v for k, v in trn_metrics.items()},
+        # ---- checkpoint ------------------------------------------------
+        record = {"epoch": epoch,
+                  **{f"trn_{k}": v for k, v in trn_metrics.items()},
                   **{f"val_{k}": v for k, v in val_metrics.items()}}
         history.append(record)
 
         save_state = {
-            "epoch":       epoch,
-            "model":       model.state_dict(),
-            "optimiser":   optimiser.state_dict(),
-            "scheduler":   scheduler.state_dict(),
-            "scaler":      scaler.state_dict(),
-            "best_val_cd": best_val_cd,
-            "config":      asdict(cfg),
-            "history":     history,
+            "epoch":      epoch,
+            "style_net":  model.style_net.state_dict(),
+            "point_net":  model.point_net.state_dict(),
+            "optimiser":  optimiser.state_dict(),
+            "scheduler":  scheduler.state_dict(),
+            "scaler":     scaler.state_dict(),
+            "best_val":   best_val,
+            "config":     asdict(cfg),
+            "history":    history,
         }
-
         torch.save(save_state, os.path.join(cfg.ckpt_dir, "latest.pt"))
 
         if (epoch + 1) % cfg.save_every == 0:
             torch.save(save_state, os.path.join(cfg.ckpt_dir, f"epoch_{epoch:04d}.pt"))
 
-        val_cd_key = "val_cd" if "val_cd" in val_metrics else "val_recon"
-        val_cd = val_metrics.get(val_cd_key, math.inf)
-        if val_cd < best_val_cd:
-            best_val_cd = val_cd
-            save_state["best_val_cd"] = best_val_cd
+        val_loss = val_metrics.get("loss", math.inf)
+        if val_loss < best_val:
+            best_val = val_loss
+            save_state["best_val"] = best_val
             torch.save(save_state, os.path.join(cfg.ckpt_dir, "best.pt"))
-            logger.info(f"  ✓ New best val CD: {best_val_cd:.6f}")
+            logger.info(f"  ✓ New best val loss: {best_val:.6f}")
 
         with open(os.path.join(cfg.log_dir, "history.json"), "w") as f:
             json.dump(history, f, indent=2)
@@ -445,20 +393,16 @@ def main(cfg: TrainConfig) -> None:
     logger.info("Training complete.")
 
 
-# -----------------------------------------------------------------------
-
-def parse_args() -> TrainConfig:
-    cfg = TrainConfig()
-    p   = argparse.ArgumentParser(description="Train LION Hierarchical Point-Cloud VAE")
+def parse_args() -> DiffusionConfig:
+    cfg = DiffusionConfig()
+    p   = argparse.ArgumentParser(description="Train Diffusion prior over VAE latents")
     for field_name, field_val in asdict(cfg).items():
         t = type(field_val)
         if t is bool:
             p.add_argument(f"--{field_name}", default=field_val, type=lambda x: x.lower() != "false")
         else:
             p.add_argument(f"--{field_name}", default=field_val, type=t)
-    
-    args = vars(p.parse_args())
-    return TrainConfig(**args)
+    return DiffusionConfig(**vars(p.parse_args()))
 
 
 if __name__ == "__main__":

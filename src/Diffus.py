@@ -56,10 +56,12 @@ class DDPMScheduler:
             noise = torch.randn_like(x0)
 
         shape = (-1,) + (1,) * (x0.ndim - 1)          # broadcast over D / N,D
-        sqrt_ab  = self.sqrt_alpha_bar[t].to(x0).view(shape)
-        sqrt_1ab = self.sqrt_one_minus_alpha_bar[t].to(x0).view(shape)
+        
+        # ADICIONADO .to(x0.device) antes de indexar com [t]
+        sqrt_ab  = self.sqrt_alpha_bar.to(x0.device)[t].view(shape)
+        sqrt_1ab = self.sqrt_one_minus_alpha_bar.to(x0.device)[t].view(shape)
+        
         return sqrt_ab * x0 + sqrt_1ab * noise, noise
-
 
     @torch.no_grad()
     def p_sample(
@@ -156,11 +158,12 @@ class ResBlock(nn.Module):
         self.t_proj = nn.Linear(t_dim, dim)
         self.norm2  = nn.LayerNorm(dim)
 
+    # Se precisar ajustar o ResBlock em src/Diffus.py:
     def forward(self, x: torch.Tensor, t_emb: torch.Tensor) -> torch.Tensor:
+        # Garante que a projeção temporal funcione independente de t_emb ser (B, D) ou (B, 1, D)
         h = self.norm1(x) + self.t_proj(t_emb)
         h = self.norm2(h)
         return x + self.ff(h)
-
 
 class SelfAttention1D(nn.Module):
     """Multi-head self-attention on a (B, D) vector treated as (B, 1, D)."""
@@ -178,21 +181,28 @@ class SelfAttention1D(nn.Module):
 
 class CrossAttention1D(nn.Module):
     """
-    x (query)   : (B, D_x)
-    ctx (key/val): (B, D_ctx)
-    Returns     : (B, D_x)
+    x (query)   : (B, N, D_x) or (B, D_x)
+    ctx (key/val): (B, M, D_ctx) or (B, D_ctx)
+    Returns     : Same shape as x
     """
-
     def __init__(self, query_dim: int, ctx_dim: int, heads: int = 4):
         super().__init__()
         self.attn = nn.MultiheadAttention(query_dim, heads, batch_first=True, kdim=ctx_dim, vdim=ctx_dim, dropout=0.0)
         self.norm = nn.LayerNorm(query_dim)
 
     def forward(self, x: torch.Tensor, ctx: torch.Tensor) -> torch.Tensor:
-        q   = x.unsqueeze(1)    # (B, 1, D_x)
-        kv  = ctx.unsqueeze(1)  # (B, 1, D_ctx)
+        x_is_2d = (x.ndim == 2)
+        
+        # Convert to 3D if inputs are 2D
+        q = x.unsqueeze(1) if x_is_2d else x
+        kv = ctx.unsqueeze(1) if ctx.ndim == 2 else ctx
+        
         out, _ = self.attn(q, kv, kv)
-        return self.norm(x + out.squeeze(1))
+        
+        if x_is_2d:
+            out = out.squeeze(1)
+            
+        return self.norm(x + out)
 
 
 # ======================================================================
@@ -258,7 +268,7 @@ class StyleScoreNet(nn.Module):
 class PointScoreNet(nn.Module):
     def __init__(
         self,
-        latent_dim: int = 256,
+        latent_dim: int = 3,
         style_dim:  int = 512,
         hidden_dim: int = 512,
         depth:      int = 8,
@@ -285,13 +295,19 @@ class PointScoreNet(nn.Module):
         nn.init.zeros_(self.out_proj.weight)
         nn.init.zeros_(self.out_proj.bias)
 
-    def forward(self, z_t, t, z_style):   # cls removido
+    def forward(self, z_t, t, z_style):   
         t_emb = self.t_emb(t)
         ctx   = self.style_proj(z_style)
+        
+        # Unsqueeze along dimension 1 if input is a 3D point cloud/sequence
+        if z_t.ndim == 3:
+            t_emb = t_emb.unsqueeze(1)  # Becomes (B, 1, hidden_dim)
+            ctx = ctx.unsqueeze(1)      # Becomes (B, 1, hidden_dim)
+
         h     = self.in_proj(z_t) + t_emb + ctx
 
         for blk, x_attn in zip(self.blocks, self.x_attns):
-            h = blk(h, t_emb)             # cls_emb removido daqui
+            h = blk(h, t_emb)             
             if isinstance(x_attn, CrossAttention1D):
                 h = x_attn(h, ctx)
 
@@ -299,9 +315,33 @@ class PointScoreNet(nn.Module):
 
 
 class Model(nn.Module):
-    # ... __init__ e encode inalterados ...
+    def __init__(self, frozen_vae, style_score_net, point_score_net,
+                 style_scheduler: DDPMScheduler, point_scheduler: DDPMScheduler):
+        super().__init__()
+        self.vae = frozen_vae
+        for p in self.vae.parameters():
+            p.requires_grad_(False)
+        self.vae.eval()
 
-    def point_loss(self, z_points, z_style):   # cls removido
+        self.style_net  = style_score_net   # StyleScoreNet
+        self.point_net  = point_score_net   # PointScoreNet
+        self.style_sched = style_scheduler
+        self.point_sched = point_scheduler
+
+    def style_loss(self, z_style, cls):
+        B = z_style.shape[0]
+
+        t = torch.randint(0, self.style_sched.T, (B,), device=z_style.device)
+        
+
+        z_t, noise = self.style_sched.q_sample(z_style, t)
+
+        eps_hat = self.style_net(z_t, t, cls=cls)
+        
+
+        return F.mse_loss(eps_hat, noise)
+
+    def point_loss(self, z_points, z_style):
         B = z_points.shape[0]
         t = torch.randint(0, self.point_sched.T, (B,), device=z_points.device)
         z_t, noise = self.point_sched.q_sample(z_points, t)
@@ -309,14 +349,15 @@ class Model(nn.Module):
         return F.mse_loss(eps_hat, noise)
 
     def training_step(self, x, cls, w_style=1.0, w_points=1.0):
-        z_style, z_points = self.encode(x)
+        mu, logvar, z_style = self.vae.Encode(x)
+        z_points = self.vae.z(mu, logvar)
         l_style  = self.style_loss(z_style, cls)
-        l_points = self.point_loss(z_points, z_style)   # cls removido
+        l_points = self.point_loss(z_points, z_style)   
         total    = w_style * l_style + w_points * l_points
         return dict(loss=total, loss_style=l_style, loss_points=l_points)
 
     @torch.no_grad()
-    def sample(self, n, cls: torch.Tensor, device, style_dim=512, latent_dim=256):
+    def sample(self, n, cls: torch.Tensor, device, style_dim=512, num_points=512, point_dim=9):
 
         z_style = self.style_sched.sample(
             model  = self.style_net,
@@ -325,14 +366,14 @@ class Model(nn.Module):
             cls    = cls,
         )
 
-        def point_model(x_t, t, z_style):          # cls removido
+        def point_model(x_t, t, z_style):          
             return self.point_net(x_t, t, z_style=z_style)
 
         z_points = self.point_sched.sample(
             model   = point_model,
-            shape   = (n, latent_dim),
+            shape   = (n, num_points, point_dim),  # Generates full 3D point latent grid
             device  = device,
-            z_style = z_style,                      # cls removido
+            z_style = z_style,                      
         )
 
         return self.vae.Decode(z_style, z_points)

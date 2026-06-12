@@ -233,3 +233,49 @@ if __name__ == "__main__":
 
     ds = Ds_point_sampled(Ds_point_model())
     print(len(ds))
+class Ds_point_sampled_already:
+
+    def __init__(self, root="point_clouds", augment=True): # Changed to bool flag
+        self.root = root
+        self.files = []
+        for rt, dirs, files in os.walk(root):
+            for file in files:
+                if file.endswith(".ply"):
+                    self.files.append(os.path.join(rt, file))
+
+        self.augment = augment
+        self.transform = data_augs
+
+        self.class_to_idx = {cls_id: idx for idx, cls_id in enumerate(Ds_point_model.map().keys())}
+
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, idx):
+
+        filename = os.path.basename(self.files[idx])
+        class_name, _ = filename.replace(".ply", "").split("_")
+        
+
+        class_idx = self.class_to_idx.get(class_name, 0)
+        cls_tensor = torch.tensor(class_idx, dtype=torch.long)
+    
+        file_path = self.files[idx]
+        pcd = o3d.io.read_point_cloud(file_path)
+
+        points = np.asarray(pcd.points, dtype=np.float32)
+        normals = np.asarray(pcd.normals, dtype=np.float32)
+
+        features = np.concatenate([points, normals], axis=1)
+        features = torch.from_numpy(features).float()
+
+        if self.augment and self.transform:
+            xyz = features[:, :3]
+            nrm = features[:, 3:]
+
+            xyz = self.transform(xyz)
+
+            features = torch.cat([xyz, nrm], dim=1)
+
+
+        return features, cls_tensor
