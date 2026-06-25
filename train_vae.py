@@ -82,28 +82,58 @@ def log_metrics_tensorboard(writer, metrics, prefix, epoch):
         writer.add_scalar(f"{prefix}/{k}", v, epoch)
 
 
+def _side_by_side(clouds: list[torch.Tensor], colors: list[torch.Tensor], gap: float = 2.5):
+    """
+    Concatenate N point clouds into one mesh, offset along X so they sit side-by-side.
+    clouds: list of (N_pts, 3) tensors (already CPU float)
+    colors: list of matching (N_pts, 3) uint8 tensors
+    Returns vertices (1, N_total, 3) and colors (1, N_total, 3) ready for add_mesh.
+    """
+    shifted_v, shifted_c = [], []
+    x_cursor = 0.0
+    for v, c in zip(clouds, colors):
+        v = v.clone()
+        # centre each cloud, then shift by cursor
+        v[:, 0] -= v[:, 0].mean()
+        v[:, 0] += x_cursor
+        half_width = (v[:, 0].max() - v[:, 0].min()).item() * 0.5
+        x_cursor  += half_width * 2 + gap
+        shifted_v.append(v)
+        shifted_c.append(c)
+    verts  = torch.cat(shifted_v, dim=0).unsqueeze(0)   # (1, N_total, 3)
+    clrs   = torch.cat(shifted_c, dim=0).unsqueeze(0)   # (1, N_total, 3)
+    return verts, clrs
+
+
 @torch.no_grad()
 def log_reconstructions(writer, model, loader, device, epoch, max_items=4):
+    """
+    For each of max_items samples: log a single mesh showing
+        [GT (green) | Reconstruction (red) | Prior sample (blue)]
+    side-by-side so all three are always synchronised in the same panel.
+    """
     model.eval()
     points, _ = next(iter(loader))
     points = points.to(device)
-    target_xyz = points[..., :3]
+    N = points.shape[1]
 
     xyz_out, *_ = model(points)
-    refined    = xyz_out.detach().float().cpu()
-    target_xyz = target_xyz.detach().float().cpu()
-    B = min(max_items, refined.shape[0])
+    gt    = points[..., :3].detach().float().cpu()
+    recon = xyz_out.detach().float().cpu()
+    B     = min(max_items, gt.shape[0])
 
-    gt_colors   = torch.zeros_like(target_xyz[:B]); gt_colors[..., 1]   = 255
-    pred_colors = torch.zeros_like(refined[:B]);    pred_colors[..., 0] = 255
-    writer.add_mesh("reconstruction/ground_truth", vertices=target_xyz[:B], colors=gt_colors,   global_step=epoch)
-    writer.add_mesh("reconstruction/prediction",   vertices=refined[:B],    colors=pred_colors, global_step=epoch)
+    # One prior sample per displayed shape (same N)
+    prior_samples = model.generate(num_samples=B, num_points=N, device=device)
+    prior_samples = prior_samples.detach().float().cpu()
 
-    # Random generation from prior
-    generated = model.generate(num_samples=5, num_points=points.shape[1], device=device)
-    generated = generated.detach().float().cpu()
-    gen_colors = torch.zeros_like(generated); gen_colors[..., 2] = 255
-    writer.add_mesh("samples/random_generation", vertices=generated, colors=gen_colors, global_step=epoch)
+    for i in range(B):
+        gt_v   = gt[i];    gt_c   = torch.tensor([[0, 220, 0]],   dtype=torch.uint8).expand(N, -1)
+        rec_v  = recon[i]; rec_c  = torch.tensor([[220, 0, 0]],   dtype=torch.uint8).expand(N, -1)
+        pri_v  = prior_samples[i]
+        pri_c  = torch.tensor([[0, 80, 220]], dtype=torch.uint8).expand(N, -1)
+
+        verts, clrs = _side_by_side([gt_v, rec_v, pri_v], [gt_c, rec_c, pri_c])
+        writer.add_mesh(f"sample_{i}/gt_recon_prior", vertices=verts, colors=clrs, global_step=epoch)
 
     model.train()
 
