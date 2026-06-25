@@ -23,7 +23,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from src.dataset import Ds_point_sampled_already
 from src.metric import f_score, vae_loss
-from src.Vae import Vae
+from src.Vae import Vae, normalize_pc
 
 
 # ============================================================
@@ -118,7 +118,7 @@ def log_reconstructions(writer, model, loader, device, epoch, max_items=4):
     N = points.shape[1]
 
     xyz_out, *_ = model(points)
-    gt    = points[..., :3].detach().float().cpu()
+    gt    = normalize_pc(points)[..., :3].detach().float().cpu()
     recon = xyz_out.detach().float().cpu()
     B     = min(max_items, gt.shape[0])
 
@@ -185,7 +185,9 @@ def train_one_epoch(model, loader, optimiser, scaler, cfg, epoch, logger, device
     for batch_idx, data in enumerate(loader):
         points, _ = data
         points     = points.to(device, non_blocking=True)
-        target_xyz = points[..., :3]
+        # Normalize before extracting target so it matches the model's output space.
+        # model(points) calls normalize_pc internally; the loss must compare in the same scale.
+        target_xyz = normalize_pc(points)[..., :3]
 
         with torch.autocast(device_type=device.type, enabled=cfg.amp):
             xyz_out, mu_l, logvar_l, mu_g, logvar_g = model(points)
@@ -231,7 +233,7 @@ def validate(model, loader, cfg, epoch, device):
 
     for points, _ in loader:
         points     = points.to(device, non_blocking=True)
-        target_xyz = points[..., :3]
+        target_xyz = normalize_pc(points)[..., :3]
 
         with torch.autocast(device_type=device.type, enabled=cfg.amp):
             xyz_out, mu_l, logvar_l, mu_g, logvar_g = model(points)
