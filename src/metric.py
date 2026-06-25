@@ -165,20 +165,20 @@ def kl_divergence(mu: Tensor, logvar: Tensor, free_bits: float = 0.5, reduce: st
 
 def vae_loss(
     pred_xyz:      Tensor,
-    normals_pred:  Tensor,
     target_xyz:    Tensor,
-    normal_target: Tensor,
     mu_points:     Tensor,
     logvar_points: Tensor,
     mu_style:      Tensor,
     logvar_style:  Tensor,
-    beta:          float = 1.0,
-    beta_points:   float = 1.0,
-    beta_style:    float = 1.0,
-    normal_weight: float = 1.0,
-    recon_loss:    str   = "chamfer",
-    emd_weight:    float = 0.5,
-    emd_iters:     int   = 30,
+    beta:          float          = 1.0,
+    beta_points:   float          = 1.0,
+    beta_style:    float          = 1.0,
+    recon_loss:    str            = "chamfer",
+    emd_weight:    float          = 0.5,
+    emd_iters:     int            = 30,
+    normals_pred:  Tensor | None  = None,
+    normal_target: Tensor | None  = None,
+    normal_weight: float          = 0.0,
 ) -> dict[str, Tensor]:
 
     # --- 1. Reconstruction loss ----------------------------------------
@@ -211,16 +211,19 @@ def vae_loss(
     else:
         raise ValueError(f"Unknown recon_loss: '{recon_loss}'.")
 
-    # --- 2. Normal loss ------------------------------------------------
-    # FIX #4: detach normal_loss from early-training instability by
-    # capping its contribution — the caller can ramp normal_weight via
-    # their own schedule; we just make sure it doesn't explode at init.
-    n_consistency = normal_consistency(pred_xyz, normals_pred, target_xyz, normal_target)
-    n_loss = (1.0 - n_consistency).clamp(min=0.0, max=1.0)
-    out["normal_loss"] = n_loss
+    # --- 2. Normal loss (optional) -------------------------------------
+    if normal_weight > 0.0 and normals_pred is not None and normal_target is not None:
+        n_consistency = normal_consistency(pred_xyz, normals_pred, target_xyz, normal_target)
+        n_loss = (1.0 - n_consistency).clamp(min=0.0, max=1.0)
+        out["normal_loss"] = n_loss
+    else:
+        n_loss = pred_xyz.new_zeros(1)
+        out["normal_loss"] = n_loss
 
     # --- 3. KL losses --------------------------------------------------
-    kl_pts = kl_divergence(mu_points[..., 3:], logvar_points[..., 3:])
+    # mu_points / logvar_points are (B, N, latent_dim) — full local latent,
+    # no xyz prefix, so we use the full tensor here.
+    kl_pts = kl_divergence(mu_points, logvar_points)
     kl_sty = kl_divergence(mu_style,  logvar_style)
     out["kl_points"] = kl_pts
     out["kl_style"]  = kl_sty
