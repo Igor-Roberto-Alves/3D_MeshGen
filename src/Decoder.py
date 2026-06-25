@@ -169,83 +169,113 @@ class PointUpsampleBlock(nn.Module):
 # Core LION Decoder Structure
 # ===========================================================================
 
+    
 class LIONDecoder(nn.Module):
-    def __init__(
-        self,
-        latent_dim=256,
-        style_dim=512,
-        input_dim=3,
-        up_factor = 0,
-    ):
+    def __init__(self, latent_dim=256, style_dim=512, input_dim=3, up_factor=4):
         super().__init__()
-
-        self.input_dim = input_dim
+        self.up_factor = up_factor
 
         self.feat_proj = SharedMLP([latent_dim, 256])
 
-        self.stage0 = PVConvBlockDecoder(
-            256, 256,
-            style_dim=style_dim,
-            resolution=8
-        )
+        # --- PROCESSAMENTO NA RESOLUÇÃO COARSE (Ex: 512 pontos) ---
+        self.stage0 = PVConvBlockDecoder(256, 256, style_dim=style_dim, resolution=8)
+        self.stage1 = PVConvBlockDecoder(256, 128, style_dim=style_dim, resolution=16)
 
-        self.stage1 = PVConvBlockDecoder(
-            256, 128,
-            style_dim=style_dim,
-            resolution=16
-        )
+        # --- CAMADA DE EXPANSÃO (512 -> 2048 pontos) ---
+        # O upsample gera novas coordenadas XYZ brutas
+        self.upsample = PointUpsampleBlock(feat_channels=128, k=self.up_factor)
 
-        self.stage2 = PVConvBlockDecoder(
-            128, 128,
-            style_dim=style_dim,
+        # --- NOVO: REFINAMENTO NA RESOLUÇÃO DENSE (Ex: 2048 pontos) ---
+        # Forçamos a rede a aprender convoluções 3D de Voxel JÁ na resolução final!
+        self.refine_stage = PVConvBlockDecoder(
+            128,          # Primeiro argumento: in_features / in_channels
+            64,           # Segundo argumento: out_features / out_channels
+            style_dim=style_dim, 
             resolution=32
         )
 
-        self.coord_head = nn.Sequential(
-            nn.Conv1d(128, 128, 1),
-            nn.GELU(),
-            nn.Conv1d(128, 64, 1),
-            nn.GELU(),
-            nn.Conv1d(64, 3, 1)
-        )
+        # A cabeça de saída agora processa features refinadas em 3D
         self.output_head = nn.Sequential(
-        nn.Conv1d(128, 128, 1),
-        nn.GELU(),
-        nn.Conv1d(128, 64, 1),
-        nn.GELU(),
-        nn.Conv1d(64, 6, 1)
-    )
+            nn.Conv1d(64, 64, 1),
+            nn.GELU(),
+            nn.Conv1d(64, 6, 1) # Prevê apenas o ajuste fino final e as normais
+        )
 
     def forward(self, latent_points, style):
-
-        # latent_points: (B, N, 3 + latent_dim)
-
         xyz = latent_points[:, :, :3].contiguous()
         feat = latent_points[:, :, 3:]
 
-        feat = self.feat_proj(
-            feat.permute(0, 2, 1)
-        ).permute(0, 2, 1)
+        # Projeta features latentes
+        feat = self.feat_proj(feat.permute(0, 2, 1)).permute(0, 2, 1)
 
+        # Extrai geometria na resolução base (512 pts)
         feat = self.stage0(xyz, feat, style)
         feat = self.stage1(xyz, feat, style)
-        feat = self.stage2(xyz, feat, style)
 
-        out = self.output_head(
-            feat.permute(0, 2, 1)
-        ).permute(0, 2, 1)  # (B, N, 6)
+        # --- REVOLUÇÃO DO UPSAMPLE ---
+        # 1. Geramos as coordenadas expandidas dos 2048 pontos filhos
+        xyz_upsampled = self.upsample(xyz, feat) 
+        
+        # 2. Alinhamos as features repetindo-as temporariamente
+        B, N, C = feat.shape
+        k = self.up_factor
+        feat_upsampled = feat.unsqueeze(2).expand(B, N, k, C).reshape(B, N * k, C)
+
+        # 3. O PULO DO GATO: Passamos os novos pontos 3D e as features repetidas 
+        # pelo bloco de refinamento PVCNN. Agora os filhos deixam de ser cópias idênticas!
+        feat_refined = self.refine_stage(xyz_upsampled, feat_upsampled, style)
+
+        # Predição final com os canais suavizados em 3D
+        out = self.output_head(feat_refined.permute(0, 2, 1)).permute(0, 2, 1)
 
         delta_xyz = out[:, :, :3]
         normal_raw = out[:, :, 3:]
 
-        xyz_out = xyz + delta_xyz
-        xyz_out = torch.clamp(xyz_out, -1.0, 1.0)
-
-        normals_out = F.normalize(
-            normal_raw,
-            p=2,
-            dim=-1,
-            eps=1e-8
-        )
+        # Ajuste fino final sobre a malha de alta resolução
+        xyz_out = xyz_upsampled + delta_xyz
+        
+        normals_out = F.normalize(normal_raw, p=2, dim=-1, eps=1e-8)
 
         return xyz_out, normals_out
+
+class LIONDecoder(nn.Module):
+    # Mudámos latent_dim para 1 (acompanhando o Encoder)
+    def __init__(self, latent_dim=1, style_dim=512, input_dim = 0, up_factor = 0):
+        super().__init__()
+        
+        # Projeta a única dimensão latente estocástica para um espaço de trabalho rico
+        self.feat_proj = SharedMLP([latent_dim, 256])
+
+        # Como já temos 2048 pontos desde o início, processamos tudo em alta resolução
+        self.stage0 = PVConvBlockDecoder(256, 128, style_dim=style_dim, resolution=16)
+        self.stage1 = PVConvBlockDecoder(128, 64,  style_dim=style_dim, resolution=32)
+        self.stage2 = PVConvBlockDecoder(64,  64,  style_dim=style_dim, resolution=32)
+
+        # A cabeça de saída prevê APENAS o Delta XYZ (3 canais)
+        self.output_head = nn.Sequential(
+            nn.Conv1d(64, 64, 1),
+            nn.GELU(),
+            nn.Conv1d(64, 3, 1) 
+        )
+
+    def forward(self, latent_points, style):
+        # latent_points vem do Encoder: (B, 2048, 4)
+        xyz_latent = latent_points[:, :, :3].contiguous()
+        feat = latent_points[:, :, 3:] # Apenas 1 canal
+
+        # 1. Projeção Inicial
+        feat = self.feat_proj(feat.permute(0, 2, 1)).permute(0, 2, 1)
+
+        # 2. Refinamento Profundo Condicionado ao Estilo (AdaGN acontece lá dentro)
+        feat = self.stage0(xyz_latent, feat, style)
+        feat = self.stage1(xyz_latent, feat, style)
+        feat = self.stage2(xyz_latent, feat, style)
+
+        # 3. Predição do Delta
+        delta_xyz = self.output_head(feat.permute(0, 2, 1)).permute(0, 2, 1)
+
+        # 4. SKIP CONNECTION PONDERADO (A Mágica da Identidade)
+        xyz_out = xyz_latent + (0.01 * delta_xyz)
+        
+        # Retornamos apenas a geometria pura. O VAE não mexe com normais.
+        return xyz_out, xyz_out

@@ -96,11 +96,8 @@ class Vae(nn.Module):
         std_feat   = torch.exp(0.5 * logvar[:, :, 3:])
         eps_feat   = torch.randn_like(std_feat)
 
-        std_xyz    = torch.exp(0.5 * logvar[:, :, :3])
-        eps_xyz    = torch.randn_like(std_xyz)
-
-        z_xyz      = mu[:, :, :3]  + eps_xyz  * std_xyz
-        z_feat     = mu[:, :, 3:]  + eps_feat * std_feat
+        z_xyz      = mu[:, :, :3]  # Deterministic spatial anchors
+        z_feat     = mu[:, :, 3:]  + eps_feat * std_feat  # Stochastic features
 
         z_points   = torch.cat([z_xyz, z_feat], dim=-1)       # (B, M, 3+latent_dim)
 

@@ -54,7 +54,7 @@ class TrainConfig:
 
     # --- VAE BETA SCHEDULING ---
     beta_start:    float = 0.0    
-    beta_end:      float = 5.0    # Aumentado para equilibrar com o novo cálculo médio da KL
+    beta_end:      float = 0.001    # Aumentado para equilibrar com o novo cálculo médio da KL
     beta_epochs:   int   = 60     # Estabiliza o espaço latente mais cedo na metade do treino
     recon_loss:    str   = "chamfer"   
     emd_weight:    float = 0.5    
@@ -118,7 +118,8 @@ def log_reconstructions(
     writer.add_mesh("reconstruction/prediction", vertices=refined[:B], colors=pred_colors, global_step=epoch)
 
     # --- Generative Prior Sampling ---
-    num_pts = getattr(model, "num_latent_points", 512) 
+    num_pts = getattr(model, "num_latent_points", 1024)
+    num_pts = 2048 
     num_gen = 5
     
     generated_xyz, _ = model.generate(num_samples=num_gen, num_points=num_pts, device=device)

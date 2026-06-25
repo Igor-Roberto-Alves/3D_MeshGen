@@ -145,7 +145,8 @@ def kl_divergence(mu: Tensor, logvar: Tensor, free_bits: float = 0.5, reduce: st
     kl_elem = -0.5 * (1.0 + logvar - mu.pow(2) - logvar.exp())  # (B, [N,] D)
 
     # Free-bits: zero out dimensions where KL is already below threshold
-    kl_elem = torch.clamp(kl_elem, min=free_bits)
+    # kl_elem = torch.clamp(kl_elem, min=free_bits)
+    kl_elem = torch.clamp(kl_elem, min=0.01) # WAITING WAITING 
 
     # Reduce over all latent dims — mean keeps scale invariant to D and N
     if kl_elem.dim() == 3:          # (B, N, D)  — local latent cloud
@@ -219,7 +220,7 @@ def vae_loss(
     out["normal_loss"] = n_loss
 
     # --- 3. KL losses --------------------------------------------------
-    kl_pts = kl_divergence(mu_points, logvar_points)
+    kl_pts = kl_divergence(mu_points[..., 3:], logvar_points[..., 3:])
     kl_sty = kl_divergence(mu_style,  logvar_style)
     out["kl_points"] = kl_pts
     out["kl_style"]  = kl_sty

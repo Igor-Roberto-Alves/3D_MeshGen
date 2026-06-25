@@ -7,28 +7,27 @@ from torchvision.transforms import transforms
 
 
 # ----------------------------
-class Jitter(object):
-    def __init__(self, sigma=0.01, clip=0.05):
-        self.sigma = sigma
-        self.clip = clip
-
-    def __call__(self, points):
-        noise = torch.randn_like(points) * self.sigma
-        noise = noise.clamp(-self.clip, self.clip)
-        return points + noise
-
-
+# Joint Augmentation (Jitters XYZ, rotates both XYZ and Normals consistently)
 # ----------------------------
-# ROTATION (eixo Y)
-# ----------------------------
-class RandomRotateY(object):
-    def __call__(self, points):
-        """
-        points: (N, 3)
-        """
-        device = points.device
-        theta = torch.rand(1, device=device) * 2 * torch.pi
+class JointAugment(object):
+    def __init__(self, jitter_sigma=0.01, jitter_clip=0.05):
+        self.jitter_sigma = jitter_sigma
+        self.jitter_clip = jitter_clip
 
+    def __call__(self, features):
+        """
+        features: (N, 6) tensor — [xyz | normals]
+        """
+        xyz = features[:, :3]
+        nrm = features[:, 3:]
+
+        # 1. Jitter coordinates only
+        noise = torch.randn_like(xyz) * self.jitter_sigma
+        noise = noise.clamp(-self.jitter_clip, self.jitter_clip)
+        xyz_jittered = xyz + noise
+
+        # 2. Rotate both XYZ and normals by same random Y-rotation
+        theta = torch.rand(1, device=features.device) * 2 * torch.pi
         c = torch.cos(theta)
         s = torch.sin(theta)
 
@@ -36,18 +35,14 @@ class RandomRotateY(object):
             [ c, 0, s],
             [ 0, 1, 0],
             [-s, 0, c]
-        ], device=device)
+        ], dtype=features.dtype, device=features.device)
 
-        return points @ rot.T
+        xyz_rotated = xyz_jittered @ rot.T
+        nrm_rotated = nrm @ rot.T
 
+        return torch.cat([xyz_rotated, nrm_rotated], dim=1)
 
-# ----------------------------
-# COMPOSE
-# ----------------------------
-data_augs = transforms.Compose([
-    Jitter(sigma=0.01, clip=0.05),
-    RandomRotateY(),
-])
+data_augs = JointAugment()
 
 
 class Ds_point_model:
@@ -190,52 +185,7 @@ class Ds_point_sampled:
 
 
 class Ds_point_sampled_already:
-
-    def __init__(self, root="point_clouds", augment = data_augs):
-        self.root = root
-        self.files = []
-        for rt, dirs, files in os.walk(root):
-            for file in files:
-                if file.endswith(".ply"):
-                    self.files.append(os.path.join(rt, file))
-        self.augment = data_augs
-
-    def __len__(self):
-        return len(self.files)
-
-    def __getitem__(self, idx):
-        content = self.files[idx][13:-4]
-        class_name, _ = content.split("_")
-    
-   
-        file_path = self.files[idx]
-        pcd = o3d.io.read_point_cloud(file_path)
-
-        points = np.asarray(pcd.points, dtype=np.float32)
-        normals = np.asarray(pcd.normals, dtype=np.float32)
-
-        features = np.concatenate([points, normals], axis=1)
-        features = torch.from_numpy(features).float()
-
-    
-        if self.augment:
-    
-            xyz = features[:, :3]
-            nrm = features[:, 3:]
-
-            xyz = data_augs(xyz)
-
-            features = torch.cat([xyz, nrm], dim=1)
-
-        return class_name, features
-
-if __name__ == "__main__":
-
-    ds = Ds_point_sampled(Ds_point_model())
-    print(len(ds))
-class Ds_point_sampled_already:
-
-    def __init__(self, root="point_clouds", augment=True): # Changed to bool flag
+    def __init__(self, root="point_clouds", augment=True):
         self.root = root
         self.files = []
         for rt, dirs, files in os.walk(root):
@@ -252,10 +202,8 @@ class Ds_point_sampled_already:
         return len(self.files)
 
     def __getitem__(self, idx):
-
         filename = os.path.basename(self.files[idx])
         class_name, _ = filename.replace(".ply", "").split("_")
-        
 
         class_idx = self.class_to_idx.get(class_name, 0)
         cls_tensor = torch.tensor(class_idx, dtype=torch.long)
@@ -270,12 +218,11 @@ class Ds_point_sampled_already:
         features = torch.from_numpy(features).float()
 
         if self.augment and self.transform:
-            xyz = features[:, :3]
-            nrm = features[:, 3:]
-
-            xyz = self.transform(xyz)
-
-            features = torch.cat([xyz, nrm], dim=1)
-
+            features = self.transform(features)
 
         return features, cls_tensor
+
+
+if __name__ == "__main__":
+    ds = Ds_point_sampled(Ds_point_model())
+    print(len(ds))

@@ -264,7 +264,7 @@ class Encoder(nn.Module):
     def forward(self, x: torch.Tensor, style: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         
         # x ~ (B, 2048, 6) x,y,z,n_1,n_2,n_3
-
+        xyz_original = x[:, :, :3].clone() # WAITING WAITING
         x = self.stage0(x)               # (B, 2048, 64)
         x = self.stage1(x)               # (B, 2048, 128)
         x = self.stage2(x)               # (B, 2048, 256)
@@ -281,14 +281,9 @@ class Encoder(nn.Module):
 
         # fps downsampling
 
-        xyz_dense = x[:, :, :3]          # (B, 2048, 3)
-        fps_indices = farthest_point_sample(xyz_dense, self.num_latent_points) # (B, 128)
-        
-
-        x_latent = index_points(x, fps_indices) 
-
-    
-        latent_xyz = x_latent[:, :, :3]  
+        fps_indices = farthest_point_sample(xyz_original, self.num_latent_points)
+        x_latent = index_points(x, fps_indices)
+        latent_xyz = index_points(xyz_original, fps_indices)
 
 
         x_latent = self.local_mlp(x_latent.permute(0, 2, 1)).permute(0, 2, 1)  # (B, num_latent_points, 512)
@@ -303,7 +298,72 @@ class Encoder(nn.Module):
       
         mu = torch.cat([latent_xyz, mu_feat], dim=-1) # Shape final: (B, num_latent_points, 3 + latent_dim)
         
-        zeros_padding = torch.ones_like(latent_xyz)
+        zeros_padding = torch.full_like(latent_xyz, -4)
         logvar = torch.cat([zeros_padding, logvar_feat], dim=-1) # Shape final: (B, num_latent_points, 3 + latent_dim)
+
+        return mu, logvar
+    
+
+class Encoder(nn.Module):
+    def __init__(self, latent_dim: int = 1, in_channels: int = 6, style_dim: int = 512, num_latent_points = 2048):
+        super().__init__()
+        # 1. Mudança LION: latent_dim do ponto passa a ser 1 em vez de 512
+        self.latent_dim = latent_dim 
+        
+        self.stage0 = PVConvBlock(in_channels, 64,  resolution=32)
+        self.stage1 = PVConvBlock(64, 128, resolution=16)
+        self.stage2 = PVConvBlock(128, 256, resolution=8)
+        
+        # Camada AdaGN para injetar o estilo global nas features locais
+        self.adagn = AdaGN(num_channels=256, style_dim=style_dim, num_groups=32)
+
+        # Processamento local pós-AdaGN
+        self.local_mlp = SharedMLP([256, 512])
+
+        # Cabeças de predição estatística (LION opera por ponto via Conv1d)
+        # fc_mu agora prevê 3 canais para o Delta XYZ + 1 canal para a Feature Latente = 4
+        self.fc_mu     = nn.Conv1d(512, 3 + self.latent_dim, kernel_size=1)
+        # fc_logvar prevê a variância para as coordenadas e para a feature = 4
+        self.fc_logvar = nn.Conv1d(512, 3 + self.latent_dim, kernel_size=1)
+
+    def forward(self, x: torch.Tensor, style: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        # x shape: (B, 2048, 6) -> [xyz | normals]
+        xyz_original = x[:, :, :3].clone().contiguous() 
+        
+        # Passagem pelo esqueleto PVCNN
+        x = self.stage0(x)               # (B, 2048, 64)
+        x = self.stage1(x)               # (B, 2048, 128)
+        x = self.stage2(x)               # (B, 2048, 256)
+
+        # Condicionamento AdaGN com o Estilo Global
+        x = x.permute(0, 2, 1)           # (B, 256, 2048)
+        x = self.adagn(x, style)         # (B, 256, 2048)
+        
+        # Expansão de canais locais
+        x_latent = self.local_mlp(x)     # (B, 512, 2048)
+
+        # Predição dos parâmetros da distribuição Gaussiana
+        mu_raw = self.fc_mu(x_latent).permute(0, 2, 1)         # (B, 2048, 3 + latent_dim)
+        logvar_raw = self.fc_logvar(x_latent).permute(0, 2, 1) # (B, 2048, 3 + latent_dim)
+
+        # -------------------------------------------------------------------
+        # A MÁGICA DO LION: CONEXÕES RESIDUAIS PONDERADAS (Weighted Skips)
+        # -------------------------------------------------------------------
+        # Separamos o delta previsto para o XYZ e a média da feature
+        mu_xyz_delta = mu_raw[:, :, :3]
+        mu_feat = mu_raw[:, :, 3:]
+
+        # A média das coordenadas latentes NÃO é do zero: é a original + delta amortecido por 0.01
+        mu_xyz = xyz_original + (0.01 * mu_xyz_delta)
+        
+        # Juntamos de volta para formar o MU final do VAE
+        mu = torch.cat([mu_xyz, mu_feat], dim=-1) # (B, 2048, 4)
+
+        # -------------------------------------------------------------------
+        # VARIANCE SCALING: LOG_SIGMA_OFFSET = 6.0
+        # -------------------------------------------------------------------
+        # Subtraímos um offset de 6.0 (ou outro valor alto) para forçar a variância 
+        # inicial a ser extremamente próxima de zero, agindo como uma identidade.
+        logvar = logvar_raw - 6.0 # Aplica-se tanto a XYZ como às features!
 
         return mu, logvar
