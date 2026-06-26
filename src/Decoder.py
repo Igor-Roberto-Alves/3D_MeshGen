@@ -95,42 +95,48 @@ class LIONDecoder(nn.Module):
     """
     Point-cloud decoder conditioned on global shape latent z_g.
 
-    Input:  z_local  (B, N, 3 + latent_dim)  — xyz anchors | per-point features
-            z_global (B, style_dim)           — global shape context
-    Output: xyz_out  (B, N, 3)               — refined point positions
+    Input:  z_l      (B, N, latent_dim)  — purely stochastic per-point latent
+            z_global (B, style_dim)      — global shape context
+    Output: xyz_out  (B, N, 3)          — decoded point positions
 
-    The decoder does NOT upsample. N_out == N_in; the VAE keeps the same
-    point count throughout, matching the LION paper (Sec. 3).
+    No anchor bypass: positions are decoded entirely from the stochastic
+    latent so the VAE latent space is a proper generative prior.
     """
     def __init__(self, latent_dim=3, style_dim=256):
         super().__init__()
-        # Project the small per-point latent to a richer working space
+        # Lightweight head: derives initial xyz from z_l for PVCNN spatial indexing.
+        # This is used only for voxelisation — it is NOT a skip connection.
+        self.pos_head = nn.Sequential(
+            nn.Conv1d(latent_dim, 64, 1),
+            nn.GELU(),
+            nn.Conv1d(64, 3, 1),
+        )
+
         self.feat_proj = SharedMLP([latent_dim, 128, 256])
 
-        # Three PVCNN stages, all conditioned on z_g via AdaGN
         self.stage0 = PVConvBlockDecoder(256, 256, style_dim, resolution=16)
         self.stage1 = PVConvBlockDecoder(256, 128, style_dim, resolution=32)
         self.stage2 = PVConvBlockDecoder(128, 64,  style_dim, resolution=32)
 
-        # Predict a small delta_xyz on top of the anchor positions
+        # Predict absolute positions — no anchor to lean on
         self.output_head = nn.Sequential(
             nn.Conv1d(64, 64, 1),
             nn.GELU(),
             nn.Conv1d(64, 3, 1),
         )
 
-    def forward(self, z_local, z_global):
-        # z_local:  (B, N, 3 + latent_dim)
+    def forward(self, z_l, z_global):
+        # z_l:      (B, N, latent_dim)  — stochastic latent only, no anchors
         # z_global: (B, style_dim)
-        xyz  = z_local[..., :3]                               # anchor positions
-        feat = z_local[..., 3:]                               # (B, N, latent_dim)
+        z = z_l.permute(0, 2, 1)                                  # (B, latent_dim, N)
 
-        feat = self.feat_proj(feat.permute(0, 2, 1)).permute(0, 2, 1)  # (B, N, 256)
-        feat = self.stage0(xyz, feat, z_global)
-        feat = self.stage1(xyz, feat, z_global)
-        feat = self.stage2(xyz, feat, z_global)
+        # Coarse position for voxelisation spatial indexing (not a skip)
+        xyz_init = torch.tanh(self.pos_head(z)).permute(0, 2, 1)  # (B, N, 3)
 
-        delta = self.output_head(feat.permute(0, 2, 1)).permute(0, 2, 1)  # (B, N, 3)
+        feat = self.feat_proj(z).permute(0, 2, 1)                 # (B, N, 256)
+        feat = self.stage0(xyz_init, feat, z_global)
+        feat = self.stage1(xyz_init, feat, z_global)
+        feat = self.stage2(xyz_init, feat, z_global)
 
-        # Weighted skip: anchors carry the coarse structure; delta refines it
-        return xyz + 0.1 * delta
+        xyz_out = self.output_head(feat.permute(0, 2, 1)).permute(0, 2, 1)  # (B, N, 3)
+        return torch.tanh(xyz_out)

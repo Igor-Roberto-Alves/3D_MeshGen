@@ -32,10 +32,8 @@ class Vae(nn.Module):
     z_g  (B, style_dim)         – global shape prior, N(0,I)
     z_l  (B, N, latent_dim)     – local per-point prior, N(0,I)
 
-    Latent points passed to the decoder:
-        z_local = cat(xyz_anchors, z_l)   (B, N, 3 + latent_dim)
-
-    The decoder refines anchor positions under global context z_g.
+    The decoder reconstructs positions purely from (z_l, z_g) — no anchor
+    bypass — so the latent space is a proper generative prior for diffusion.
     """
 
     def __init__(
@@ -77,11 +75,9 @@ class Vae(nn.Module):
         logvar_l = logvar_l.clamp(-10.0, 10.0)
         z_l = mu_l + torch.randn_like(mu_l) * (0.5 * logvar_l).exp()
 
-        # Anchor positions are the normalised input xyz (no noise added)
-        xyz_anchor = x[..., :3]
-        z_local = torch.cat([xyz_anchor, z_l], dim=-1)
-
-        xyz_out = self.decoder(z_local, z_g)
+        # No anchor bypass: z_l is the sole input to the decoder.
+        # Positions are reconstructed entirely from the stochastic latent.
+        xyz_out = self.decoder(z_l, z_g)
         return xyz_out, mu_l, logvar_l, mu_g, logvar_g
 
     # ------------------------------------------------------------------
@@ -97,9 +93,6 @@ class Vae(nn.Module):
             device = next(self.parameters()).device
         self.eval()
 
-        z_g         = torch.randn(num_samples, self.style_dim,              device=device)
-        xyz_anchors = torch.randn(num_samples, num_points, 3,               device=device).clamp(-1.0, 1.0)
-        z_l         = torch.randn(num_samples, num_points, self.latent_dim, device=device)
-
-        z_local = torch.cat([xyz_anchors, z_l], dim=-1)
-        return self.decoder(z_local, z_g)
+        z_g = torch.randn(num_samples, self.style_dim,              device=device)
+        z_l = torch.randn(num_samples, num_points, self.latent_dim, device=device)
+        return self.decoder(z_l, z_g)

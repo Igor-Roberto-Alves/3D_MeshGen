@@ -38,7 +38,7 @@ class TrainConfig:
     log_dir:       str   = "logs"
 
     # --- architecture ---
-    latent_dim:    int   = 3      # per-point latent features (LION paper: ~3)
+    latent_dim:    int   = 8      # per-point latent features; 3 is too small without anchor bypass
     style_dim:     int   = 256    # global shape latent dim
     in_channels:   int   = 6
 

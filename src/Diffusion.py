@@ -228,8 +228,8 @@ class StyleDenoiser(nn.Module):
 
 class LatentPointDenoiser(nn.Module):
     """
-    ε-predictor for the local latent cloud z_local ∈ ℝ^{N × point_dim}.
-    point_dim = 3 (xyz anchor) + latent_dim (features) = 6.
+    ε-predictor for the local latent cloud z_l ∈ ℝ^{N × point_dim}.
+    point_dim must equal Vae.latent_dim — no anchor prefix since the anchor bypass was removed.
 
     Processing is shared across N (Conv1d = per-point MLP), conditioned on
     z_g + timestep via adaptive group normalisation.
@@ -242,7 +242,7 @@ class LatentPointDenoiser(nn.Module):
 
     def __init__(
         self,
-        point_dim:  int = 6,
+        point_dim:  int = 8,   # must match Vae latent_dim — no anchors in z_l anymore
         style_dim:  int = 256,
         hidden:     int = 256,
         n_layers:   int = 8,

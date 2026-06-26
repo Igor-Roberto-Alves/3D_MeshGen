@@ -54,7 +54,7 @@ class DiffusionConfig:
     data_root:   str   = "point_clouds"
 
     # --- VAE architecture (must match the loaded checkpoint) ---
-    vae_latent_dim:  int = 3
+    vae_latent_dim:  int = 8   # must match the latent_dim used in train_vae.py
     vae_style_dim:   int = 256
     vae_in_channels: int = 6
 
@@ -113,15 +113,13 @@ def extract_latents(vae: Vae, points: torch.Tensor):
 
     Returns
     -------
-    z_g     (B, style_dim)            global style mean
-    z_local (B, N, 3 + latent_dim)   cat(xyz_anchor, local_mean)
+    z_g  (B, style_dim)       global style mean
+    z_l  (B, N, latent_dim)   local posterior mean — no anchor prefix
     """
-    x_norm   = normalize_pc(points)
-    mu_g, _  = vae.global_encoder(x_norm)           # (B, style_dim)
-    mu_l, _  = vae.local_encoder(x_norm, mu_g)      # (B, N, latent_dim)
-    xyz_anch = x_norm[..., :3]                       # (B, N, 3)
-    z_local  = torch.cat([xyz_anch, mu_l], dim=-1)  # (B, N, 3+latent_dim)
-    return mu_g, z_local
+    x_norm  = normalize_pc(points)
+    mu_g, _ = vae.global_encoder(x_norm)   # (B, style_dim)
+    mu_l, _ = vae.local_encoder(x_norm, mu_g)  # (B, N, latent_dim)
+    return mu_g, mu_l
 
 
 # ============================================================
@@ -186,7 +184,7 @@ def log_generations(
     # Pick a few representative classes
     show_classes = list(range(min(4, cfg.num_classes)))
     N  = 2048
-    pd = 3 + cfg.vae_latent_dim  # point_dim
+    pd = cfg.vae_latent_dim
 
     for cls_idx in show_classes:
         B   = cfg.vis_per_class
@@ -207,7 +205,7 @@ def log_generations(
         )   # (B, N, 6)
 
         # --- Decode ---
-        xyz_out = vae.decoder(z_local, z_g).float().cpu()  # (B, N, 3)
+        xyz_out = vae.decoder(z_local, z_g).float().cpu()  # (B, N, 3)  z_local is z_l here
 
         for i in range(B):
             gen_v = xyz_out[i]
@@ -391,7 +389,7 @@ def main(cfg: DiffusionConfig) -> None:
     ).to(device)
 
     point_dn  = LatentPointDenoiser(
-        point_dim=3 + cfg.vae_latent_dim,
+        point_dim=cfg.vae_latent_dim,   # no anchor prefix — must match Vae.latent_dim
         style_dim=cfg.vae_style_dim,
         hidden=cfg.point_hidden,
         n_layers=cfg.point_layers,
