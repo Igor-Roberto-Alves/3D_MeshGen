@@ -52,7 +52,7 @@ class TrainConfig:
 
     # --- VAE beta scheduling (KL annealing) ---
     beta_start:    float = 0.0
-    beta_end:      float = 1e-3
+    beta_end:      float = 2.0
     beta_epochs:   int   = 80
 
     # --- reconstruction loss ---
@@ -341,7 +341,7 @@ def main(cfg: TrainConfig) -> None:
         log_metrics_tensorboard(writer, val_metrics, "val",   epoch)
 
         if epoch % 5 == 0:
-            log_reconstructions(writer, model, trn_loader, device, epoch, max_items=4)
+            log_reconstructions(writer, model, val_loader, device, epoch, max_items=4)
 
         val_cd = val_metrics.get("recon", math.inf)
         is_best = val_cd < best_val_cd
