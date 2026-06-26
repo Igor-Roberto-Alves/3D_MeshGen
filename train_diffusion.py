@@ -54,7 +54,7 @@ class DiffusionConfig:
     data_root:   str   = "point_clouds"
 
     # --- VAE architecture (must match the loaded checkpoint) ---
-    vae_latent_dim:  int = 8   # must match the latent_dim used in train_vae.py
+    vae_latent_dim:  int = 3   # LION paper: latent_dim=3 (z_l lives in position space)
     vae_style_dim:   int = 256
     vae_in_channels: int = 6
 
@@ -113,13 +113,14 @@ def extract_latents(vae: Vae, points: torch.Tensor):
 
     Returns
     -------
-    z_g  (B, style_dim)       global style mean
-    z_l  (B, N, latent_dim)   local posterior mean — no anchor prefix
+    z_g  (B, style_dim)   global style posterior mean
+    z_l  (B, N, 3)        LION skip: xyz_anchor + 0.01 * mu_l  (position space)
     """
     x_norm  = normalize_pc(points)
-    mu_g, _ = vae.global_encoder(x_norm)   # (B, style_dim)
-    mu_l, _ = vae.local_encoder(x_norm, mu_g)  # (B, N, latent_dim)
-    return mu_g, mu_l
+    mu_g, _ = vae.global_encoder(x_norm)         # (B, style_dim)
+    mu_l, _ = vae.local_encoder(x_norm, mu_g)    # (B, N, 3)
+    z_l     = x_norm[..., :3] + 0.01 * mu_l      # same skip as Vae.forward
+    return mu_g, z_l
 
 
 # ============================================================
@@ -389,7 +390,7 @@ def main(cfg: DiffusionConfig) -> None:
     ).to(device)
 
     point_dn  = LatentPointDenoiser(
-        point_dim=cfg.vae_latent_dim,   # no anchor prefix — must match Vae.latent_dim
+        point_dim=3,   # z_l is always 3D (position space, LION paper D.1)
         style_dim=cfg.vae_style_dim,
         hidden=cfg.point_hidden,
         n_layers=cfg.point_layers,

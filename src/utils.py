@@ -62,8 +62,10 @@ class AdaGN(nn.Module):
         # MLP que transforma o estilo global nos parâmetros lineares (gamma e beta)
         # Inicializamos o peso da escala em zero para começar como uma identidade
         self.fc = nn.Linear(style_dim, num_channels * 2)
-        nn.init.zeros_(self.fc.weight)
-        nn.init.zeros_(self.fc.bias)
+        # Paper D.1: weight scale 0.1, output factor bias=1.0, output shift bias=0.0
+        nn.init.normal_(self.fc.weight, std=0.1)
+        nn.init.ones_(self.fc.bias[:num_channels])   # factor starts at 1 (identity scale)
+        nn.init.zeros_(self.fc.bias[num_channels:])  # shift starts at 0
 
     def forward(self, x: torch.Tensor, style: torch.Tensor) -> torch.Tensor:
         # x: (B, num_channels, N) - Formato padrão de Conv1d / GroupNorm
@@ -73,9 +75,7 @@ class AdaGN(nn.Module):
         x_norm = self.gn(x)
         
         # 2. Gera os coeficientes a partir do estilo
-        style_effects = self.fc(style).unsqueeze(-1) # (B, num_channels * 2, 1)
-        gamma, beta = torch.chunk(style_effects, 2, dim=1) # Divide ao meio
-        
-        # Como inicializamos os pesos em zero, somamos 1 ao gamma 
-        # para que o comportamento inicial seja multiplicar por 1 (identidade)
-        return x_norm * (1 + gamma) + beta
+        style_effects = self.fc(style).unsqueeze(-1)          # (B, num_channels*2, 1)
+        gamma, beta   = torch.chunk(style_effects, 2, dim=1)  # factor, shift
+        # gamma bias initialised to 1 → identity scale at init; beta bias 0 → no shift
+        return x_norm * gamma + beta

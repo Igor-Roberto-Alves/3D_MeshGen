@@ -73,10 +73,15 @@ class Vae(nn.Module):
         # --- Local level (conditioned on z_g) ---
         mu_l, logvar_l = self.local_encoder(x, z_g)
         logvar_l = logvar_l.clamp(-10.0, 10.0)
-        z_l = mu_l + torch.randn_like(mu_l) * (0.5 * logvar_l).exp()
+        eps_l = torch.randn_like(mu_l) * (0.5 * logvar_l).exp()
 
-        # No anchor bypass: z_l is the sole input to the decoder.
-        # Positions are reconstructed entirely from the stochastic latent.
+        # LION paper D.1 — weighted skip connection:
+        # z_l = xyz_anchor + 0.01 * perturbation
+        # At init: mu_l ≈ 0 (bias zeroed) and std ≈ 0 (logvar bias = -6),
+        # so z_l ≈ xyz → encoder acts as identity at the start of training.
+        xyz_anchor = x[..., :3]
+        z_l = xyz_anchor + 0.01 * (mu_l + eps_l)
+
         xyz_out = self.decoder(z_l, z_g)
         return xyz_out, mu_l, logvar_l, mu_g, logvar_g
 
@@ -93,6 +98,7 @@ class Vae(nn.Module):
             device = next(self.parameters()).device
         self.eval()
 
-        z_g = torch.randn(num_samples, self.style_dim,              device=device)
-        z_l = torch.randn(num_samples, num_points, self.latent_dim, device=device)
+        z_g = torch.randn(num_samples, self.style_dim, device=device)
+        # z_l lives in position space: sample from N(0,I) in [-1,1] as anchor substitute
+        z_l = torch.randn(num_samples, num_points, self.latent_dim, device=device).clamp(-1, 1)
         return self.decoder(z_l, z_g)

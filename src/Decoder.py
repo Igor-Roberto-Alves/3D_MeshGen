@@ -70,21 +70,22 @@ class PointBranch(nn.Module):
 
 class PVConvBlockDecoder(nn.Module):
     """PVCNN block with AdaGN conditioning — used inside the decoder."""
-    def __init__(self, feat_in, feat_out, style_dim, resolution=16):
+    def __init__(self, feat_in, feat_out, style_dim, resolution=16, dropout=0.1):
         super().__init__()
         half = feat_out // 2
-        self.voxel = VoxelBranch(feat_in, half, resolution)
-        self.point = PointBranch(feat_in, half)
-        self.adagn = AdaGN(num_channels=feat_out, style_dim=style_dim, num_groups=8)
-        self.act   = nn.GELU()
-        self.conv  = nn.Conv1d(feat_out, feat_out, 1)
+        self.voxel   = VoxelBranch(feat_in, half, resolution)
+        self.point   = PointBranch(feat_in, half)
+        self.adagn   = AdaGN(num_channels=feat_out, style_dim=style_dim, num_groups=8)
+        self.act     = nn.GELU()
+        self.conv    = nn.Conv1d(feat_out, feat_out, 1)
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, xyz, feat, style):
         v = self.voxel(xyz, feat)
         p = self.point(xyz, feat)
         x = torch.cat([v, p], dim=2).permute(0, 2, 1)  # (B, feat_out, N)
         x = self.adagn(x, style)
-        return self.conv(self.act(x)).permute(0, 2, 1)  # (B, N, feat_out)
+        return self.dropout(self.conv(self.act(x))).permute(0, 2, 1)  # (B, N, feat_out)
 
 
 # ---------------------------------------------------------------------------
@@ -95,48 +96,41 @@ class LIONDecoder(nn.Module):
     """
     Point-cloud decoder conditioned on global shape latent z_g.
 
-    Input:  z_l      (B, N, latent_dim)  — purely stochastic per-point latent
-            z_global (B, style_dim)      — global shape context
-    Output: xyz_out  (B, N, 3)          — decoded point positions
+    Input:  z_l      (B, N, 3)       — latent points in position space
+                                        (= xyz_anchor + 0.01 * encoder_perturbation)
+            z_global (B, style_dim)  — global shape context
+    Output: xyz_out  (B, N, 3)      — refined point positions
 
-    No anchor bypass: positions are decoded entirely from the stochastic
-    latent so the VAE latent space is a proper generative prior.
+    LION paper D.1 weighted skip:
+        xyz_out = z_l + 0.01 * delta
+    At init, output_head bias=0 → delta≈0 → xyz_out ≈ z_l ≈ xyz_anchor (identity).
     """
     def __init__(self, latent_dim=3, style_dim=256):
         super().__init__()
-        # Lightweight head: derives initial xyz from z_l for PVCNN spatial indexing.
-        # This is used only for voxelisation — it is NOT a skip connection.
-        self.pos_head = nn.Sequential(
-            nn.Conv1d(latent_dim, 64, 1),
-            nn.GELU(),
-            nn.Conv1d(64, 3, 1),
-        )
-
         self.feat_proj = SharedMLP([latent_dim, 128, 256])
 
         self.stage0 = PVConvBlockDecoder(256, 256, style_dim, resolution=16)
         self.stage1 = PVConvBlockDecoder(256, 128, style_dim, resolution=32)
         self.stage2 = PVConvBlockDecoder(128, 64,  style_dim, resolution=32)
 
-        # Predict absolute positions — no anchor to lean on
         self.output_head = nn.Sequential(
             nn.Conv1d(64, 64, 1),
             nn.GELU(),
             nn.Conv1d(64, 3, 1),
         )
+        # Zero-init output so delta≈0 at start → identity mapping through decoder
+        nn.init.zeros_(self.output_head[-1].weight)
+        nn.init.zeros_(self.output_head[-1].bias)
 
     def forward(self, z_l, z_global):
-        # z_l:      (B, N, latent_dim)  — stochastic latent only, no anchors
+        # z_l:      (B, N, 3)       — latent points (already in position space)
         # z_global: (B, style_dim)
-        z = z_l.permute(0, 2, 1)                                  # (B, latent_dim, N)
+        xyz  = z_l                                                           # spatial ref for voxelisation
+        feat = self.feat_proj(z_l.permute(0, 2, 1)).permute(0, 2, 1)       # (B, N, 256)
+        feat = self.stage0(xyz, feat, z_global)
+        feat = self.stage1(xyz, feat, z_global)
+        feat = self.stage2(xyz, feat, z_global)
 
-        # Coarse position for voxelisation spatial indexing (not a skip)
-        xyz_init = torch.tanh(self.pos_head(z)).permute(0, 2, 1)  # (B, N, 3)
-
-        feat = self.feat_proj(z).permute(0, 2, 1)                 # (B, N, 256)
-        feat = self.stage0(xyz_init, feat, z_global)
-        feat = self.stage1(xyz_init, feat, z_global)
-        feat = self.stage2(xyz_init, feat, z_global)
-
-        xyz_out = self.output_head(feat.permute(0, 2, 1)).permute(0, 2, 1)  # (B, N, 3)
-        return torch.tanh(xyz_out)
+        delta = self.output_head(feat.permute(0, 2, 1)).permute(0, 2, 1)   # (B, N, 3)
+        # Paper D.1: predicted delta multiplied by 0.01 before adding to z_l
+        return z_l + 0.01 * delta

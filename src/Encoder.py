@@ -71,7 +71,7 @@ class PointBranch(nn.Module):
 
 class PVConvBlock(nn.Module):
     """Plain PVCNN block — no style conditioning. Used in GlobalEncoder."""
-    def __init__(self, feat_in, feat_out, resolution=16):
+    def __init__(self, feat_in, feat_out, resolution=16, dropout=0.1):
         super().__init__()
         half = feat_out // 2
         self.voxel = VoxelBranch(feat_in, half, resolution)
@@ -80,6 +80,7 @@ class PVConvBlock(nn.Module):
             nn.Conv1d(feat_out, feat_out, 1, bias=False),
             nn.BatchNorm1d(feat_out),
             nn.GELU(),
+            nn.Dropout(dropout),
         )
 
     def forward(self, xyz, feat):
@@ -91,21 +92,22 @@ class PVConvBlock(nn.Module):
 
 class PVConvBlockConditioned(nn.Module):
     """PVCNN block with AdaGN style conditioning. Used in LocalEncoder."""
-    def __init__(self, feat_in, feat_out, style_dim, resolution=16):
+    def __init__(self, feat_in, feat_out, style_dim, resolution=16, dropout=0.1):
         super().__init__()
         half = feat_out // 2
-        self.voxel = VoxelBranch(feat_in, half, resolution)
-        self.point = PointBranch(feat_in, half)
-        self.adagn = AdaGN(num_channels=feat_out, style_dim=style_dim, num_groups=8)
-        self.act   = nn.GELU()
-        self.conv  = nn.Conv1d(feat_out, feat_out, 1)
+        self.voxel   = VoxelBranch(feat_in, half, resolution)
+        self.point   = PointBranch(feat_in, half)
+        self.adagn   = AdaGN(num_channels=feat_out, style_dim=style_dim, num_groups=8)
+        self.act     = nn.GELU()
+        self.conv    = nn.Conv1d(feat_out, feat_out, 1)
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, xyz, feat, style):
         v = self.voxel(xyz, feat)
         p = self.point(xyz, feat)
         x = torch.cat([v, p], dim=2).permute(0, 2, 1)  # (B, feat_out, N)
         x = self.adagn(x, style)
-        return self.conv(self.act(x)).permute(0, 2, 1)  # (B, N, feat_out)
+        return self.dropout(self.conv(self.act(x))).permute(0, 2, 1)  # (B, N, feat_out)
 
 
 # ---------------------------------------------------------------------------
@@ -147,12 +149,9 @@ class LocalEncoder(nn.Module):
     """
     Encodes per-point latent features conditioned on the global shape z_g.
 
-    Architecture (LION Sec. 3):
-        PVCNN backbone + AdaGN conditioning  →  fc_mu / fc_logvar per point
-    Returns mu_l, logvar_l  each of shape (B, N, latent_dim).
-
-    The xyz anchors are NOT part of the stochastic latent — they are passed
-    separately from the input and concatenated in Vae.forward before decoding.
+    latent_dim is fixed at 3 (LION paper D.1): mu_l represents a 3-channel
+    position perturbation. The skip z_l = xyz + 0.01 * mu_l is applied in
+    Vae.forward, so z_l lives in the same 3D position space as the input.
     """
     def __init__(self, in_channels=6, latent_dim=3, style_dim=256):
         super().__init__()
@@ -162,9 +161,11 @@ class LocalEncoder(nn.Module):
         self.stage2 = PVConvBlockConditioned(128,         256, style_dim, resolution=8)
         self.fc_mu     = nn.Conv1d(256, latent_dim, 1)
         self.fc_logvar = nn.Conv1d(256, latent_dim, 1)
-        # Bias the logvar head low so the encoder starts near-deterministic.
-        # The KL term will gradually open up the variance during training.
+        # Paper D.1 — variance scaling: bias -6 pushes posterior std ≈ 0 at init
+        # so z_l ≈ xyz_anchor (identity mapping through encoder).
         nn.init.constant_(self.fc_logvar.bias, -6.0)
+        nn.init.zeros_(self.fc_mu.weight)
+        nn.init.zeros_(self.fc_mu.bias)
 
     def forward(self, x, style):
         # x: (B, N, in_channels);  style: (B, style_dim)
