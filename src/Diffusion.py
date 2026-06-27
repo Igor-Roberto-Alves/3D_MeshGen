@@ -242,7 +242,7 @@ class LatentPointDenoiser(nn.Module):
 
     def __init__(
         self,
-        point_dim:  int = 8,   # must match Vae latent_dim — no anchors in z_l anymore
+        point_dim:  int = 3,   # z_l lives in position space (LION D.1); must match Vae.latent_dim
         style_dim:  int = 256,
         hidden:     int = 256,
         n_layers:   int = 8,

@@ -39,6 +39,7 @@ from torch.utils.tensorboard import SummaryWriter
 from src.dataset import Ds_point_sampled_already
 from src.Vae import Vae, normalize_pc
 from src.Diffusion import CosineSchedule, StyleDenoiser, LatentPointDenoiser
+from src.metric import generation_metrics
 
 
 # ============================================================
@@ -96,6 +97,12 @@ class DiffusionConfig:
     # --- generation visualization ---
     vis_every:      int   = 10    # log generated meshes every N epochs
     vis_per_class:  int   = 2     # samples per class to visualize
+
+    # --- generation metrics (MMD / COV / 1-NNA) ---
+    # Computed every gen_metrics_every epochs. Expensive (runs full DDPM chains).
+    # Set to 0 to disable.
+    gen_metrics_every: int = 25
+    gen_metrics_n:     int = 512  # number of shapes to generate for evaluation
 
 
 # ============================================================
@@ -295,10 +302,12 @@ def validate(
     loader:    DataLoader,
     cfg:       DiffusionConfig,
     device:    torch.device,
+    compute_gen_metrics: bool = False,
 ) -> dict:
     style_dn.eval(); point_dn.eval()
     totals    = {}
     n_batches = 0
+    ref_clouds: list[torch.Tensor] = []
 
     for points, class_idx in loader:
         points    = points.to(device, non_blocking=True)
@@ -314,7 +323,68 @@ def validate(
         totals["loss_point"] = totals.get("loss_point", 0.0) + loss_p.item()
         n_batches += 1
 
-    return {k: v / max(n_batches, 1) for k, v in totals.items()}
+        if compute_gen_metrics:
+            ref_clouds.append(normalize_pc(points)[..., :3].float().cpu())
+
+    out = {k: v / max(n_batches, 1) for k, v in totals.items()}
+
+    if compute_gen_metrics:
+        out.update(_eval_generation(
+            schedule, style_dn, point_dn, vae, ref_clouds, cfg, device
+        ))
+
+    return out
+
+
+@torch.no_grad()
+def _eval_generation(
+    schedule:  CosineSchedule,
+    style_dn:  StyleDenoiser,
+    point_dn:  LatentPointDenoiser,
+    vae:       Vae,
+    ref_clouds: list[torch.Tensor],
+    cfg:       DiffusionConfig,
+    device:    torch.device,
+    n_gen:     int = 512,
+) -> dict:
+    """
+    Generate n_gen shapes from the prior and compute MMD / COV / 1-NNA
+    against the reference (val) set.
+
+    MMD  — Minimum Matching Distance: mean CD from each real to its closest generated.
+           Lower = better quality.
+    COV  — Coverage: fraction of real clouds matched by at least one generated cloud.
+           Higher = better diversity.
+    1-NNA — 1-NN accuracy in gen∪ref space.
+           Closer to 0.5 = better (generated and real are indistinguishable).
+    """
+    N  = ref_clouds[0].shape[0]           # points per cloud
+    pd = cfg.vae_latent_dim               # 3
+
+    gen_clouds = []
+    for start in range(0, n_gen, cfg.batch_size):
+        B   = min(cfg.batch_size, n_gen - start)
+        cls = torch.randint(0, cfg.num_classes, (B,), device=device)
+
+        uncond = style_dn.uncond(B, device)
+        z_g    = schedule.sample(style_dn, (cfg.vae_style_dim,),
+                                 condition=cls, uncond=uncond,
+                                 guidance=cfg.guidance, device=device)
+        z_l    = schedule.sample(point_dn, (N, pd),
+                                 condition=z_g, device=device)
+        xyz    = vae.decoder(z_l, z_g).float().cpu()
+        gen_clouds.append(xyz)
+
+    gen = torch.cat(gen_clouds, dim=0)             # (n_gen, N, 3)
+    ref = torch.cat(ref_clouds, dim=0)             # (R, N, 3)
+
+    # Subsample ref to same size as gen to keep 1-NNA balanced
+    if len(ref) > n_gen:
+        idx = torch.randperm(len(ref))[:n_gen]
+        ref = ref[idx]
+
+    metrics = generation_metrics(gen.to(device), ref.to(device))
+    return {f"gen_{k}": v for k, v in metrics.items()}
 
 
 # ============================================================
@@ -461,7 +531,9 @@ def main(cfg: DiffusionConfig) -> None:
             vae, schedule, style_dn, point_dn,
             trn_loader, opt_s, opt_p, scaler, cfg, epoch, logger, device,
         )
-        val = validate(vae, schedule, style_dn, point_dn, val_loader, cfg, device)
+        compute_gen = (cfg.gen_metrics_every > 0 and epoch % cfg.gen_metrics_every == 0)
+        val = validate(vae, schedule, style_dn, point_dn, val_loader, cfg, device,
+                       compute_gen_metrics=compute_gen)
 
         sched_s.step(); sched_p.step()
         elapsed = time.time() - t0

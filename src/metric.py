@@ -205,9 +205,16 @@ def vae_loss(
             target_emd = target_xyz[:, idx, :]
         else:
             target_emd = target_xyz
-        emd   = emd_approx(pred_xyz, target_emd, n_iters=emd_iters)
+        emd_raw = emd_approx(pred_xyz, target_emd, n_iters=emd_iters)
+        # Normalise EMD to per-point scale so it's comparable to Chamfer.
+        # Chamfer returns mean of per-point squared distances (~1e-3 scale).
+        # Raw Sinkhorn EMD is a sum over N*N transport plan (~1e0-1e1 scale).
+        # Dividing by N brings both to the same order of magnitude.
+        N = pred_xyz.shape[1]
+        emd = emd_raw / N
         recon = (1 - emd_weight) * cd + emd_weight * emd
-        out   = {"recon": recon, "cd": cd, "emd": emd, "cd_forward": cd_f, "cd_backward": cd_b}
+        out   = {"recon": recon, "cd": cd, "emd": emd, "emd_raw": emd_raw,
+                 "cd_forward": cd_f, "cd_backward": cd_b}
     else:
         raise ValueError(f"Unknown recon_loss: '{recon_loss}'.")
 
@@ -237,3 +244,97 @@ def vae_loss(
     )
     out["total"] = total
     return out
+
+
+# ============================================================
+# Generation quality metrics  (MMD, COV, 1-NNA)
+# ============================================================
+# These follow the standard evaluation protocol from:
+#   "Learning Representations and Generative Models for 3D Point Clouds"
+#   (Achlioptas et al., ICML 2018)
+#
+# All three use pairwise Chamfer distances between two sets of clouds:
+#   gen   — generated clouds  (M, N, 3)
+#   ref   — reference/real   (R, N, 3)
+#
+# They measure the triangle of desiderata: quality, diversity, fidelity.
+
+def _pairwise_cd_matrix(a: Tensor, b: Tensor, batch_size: int = 64) -> Tensor:
+    """
+    Compute pairwise Chamfer distances between every cloud in a and every cloud in b.
+    Returns (len(a), len(b)) matrix.  Batched to avoid OOM on large sets.
+    """
+    M, R = len(a), len(b)
+    dist = torch.zeros(M, R, device=a.device)
+    for i in range(0, M, batch_size):
+        ai = a[i:i + batch_size]               # (bs, N, 3)
+        for j in range(0, R, batch_size):
+            bj = b[j:j + batch_size]           # (bs2, N, 3)
+            # broadcast: compare each cloud in ai against each in bj
+            cd_vals = []
+            for k in range(len(ai)):
+                ak = ai[k].unsqueeze(0).expand(len(bj), -1, -1)   # (bs2, N, 3)
+                cd, _, _ = chamfer_distance_knn(ak, bj, reduce="none")
+                cd_vals.append(cd)             # (bs2,)
+            dist[i:i + batch_size, j:j + batch_size] = torch.stack(cd_vals)
+    return dist
+
+
+@torch.no_grad()
+def generation_metrics(
+    gen: Tensor,
+    ref: Tensor,
+    batch_size: int = 32,
+) -> dict[str, float]:
+    """
+    Compute MMD, COV, and 1-NNA between generated and reference point clouds.
+
+    Parameters
+    ----------
+    gen : (M, N, 3)  generated clouds
+    ref : (R, N, 3)  reference (real) clouds — ideally a held-out test split
+    batch_size : chunk size for pairwise CD computation
+
+    Returns
+    -------
+    dict with keys:
+        mmd   — Minimum Matching Distance (lower = better quality)
+        cov   — Coverage (higher = better diversity, range [0,1])
+        nna   — 1-Nearest-Neighbour Accuracy (closer to 0.5 = better)
+    """
+    gen = gen.float();  ref = ref.float()
+
+    # Pairwise CD matrices
+    cd_gen_ref = _pairwise_cd_matrix(gen, ref, batch_size)   # (M, R)
+    cd_ref_gen = cd_gen_ref.T                                  # (R, M)
+
+    # ---- MMD: for each ref cloud, find closest generated cloud ----------
+    mmd = cd_ref_gen.min(dim=1).values.mean().item()
+
+    # ---- COV: fraction of ref clouds matched by at least one gen cloud --
+    matched = cd_ref_gen.min(dim=1).indices                   # (R,) — closest gen per ref
+    cov = matched.unique().numel() / len(ref)
+
+    # ---- 1-NNA ----------------------------------------------------------
+    # Build the full (M+R) x (M+R) pairwise CD matrix in blocks.
+    # Label: gen=0, ref=1.  For each cloud, its 1-NN (excluding itself)
+    # should have the same label if gen and ref are indistinguishable.
+    cd_gen_gen = _pairwise_cd_matrix(gen, gen, batch_size)    # (M, M)
+    cd_ref_ref = _pairwise_cd_matrix(ref, ref, batch_size)    # (R, R)
+
+    # For gen samples: find NN in gen∪ref (excluding self)
+    cd_gen_gen.fill_diagonal_(float("inf"))
+    nn_gen_in_gen = cd_gen_gen.min(dim=1).values              # (M,)
+    nn_gen_in_ref = cd_gen_ref.min(dim=1).values              # (M,)
+    # NN of each gen cloud is in gen if nn_gen < nn_ref
+    gen_correct = (nn_gen_in_gen < nn_gen_in_ref).float()
+
+    # For ref samples: find NN in gen∪ref (excluding self)
+    cd_ref_ref.fill_diagonal_(float("inf"))
+    nn_ref_in_ref = cd_ref_ref.min(dim=1).values              # (R,)
+    nn_ref_in_gen = cd_ref_gen.min(dim=1).values              # (R,)
+    ref_correct = (nn_ref_in_ref < nn_ref_in_gen).float()
+
+    nna = torch.cat([gen_correct, ref_correct]).mean().item()
+
+    return {"mmd": mmd, "cov": cov, "nna": nna}
