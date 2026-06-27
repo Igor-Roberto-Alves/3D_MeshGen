@@ -35,12 +35,14 @@ class VoxelBranch(nn.Module):
         device = features.device
         idx = coords.long().clamp(0, R - 1)
         flat_idx = idx[:, 0] * R * R + idx[:, 1] * R + idx[:, 2]
-        voxels = torch.zeros(B, C, R * R * R, device=device, dtype=features.dtype)
-        count  = torch.zeros(B, 1, R * R * R, device=device, dtype=features.dtype)
-        voxels.scatter_add_(2, flat_idx.unsqueeze(1).expand_as(features), features)
+        # float32 accumulation prevents float16 overflow under AMP
+        feat32  = features.float()
+        voxels  = torch.zeros(B, C, R * R * R, device=device, dtype=torch.float32)
+        count   = torch.zeros(B, 1, R * R * R, device=device, dtype=torch.float32)
+        voxels.scatter_add_(2, flat_idx.unsqueeze(1).expand_as(feat32), feat32)
         count.scatter_add_(2, flat_idx.unsqueeze(1),
-                           torch.ones(B, 1, N, device=device, dtype=features.dtype))
-        return (voxels / count.clamp(min=1.0)).view(B, C, R, R, R)
+                           torch.ones(B, 1, N, device=device, dtype=torch.float32))
+        return (voxels / count.clamp(min=1.0)).view(B, C, R, R, R).to(features.dtype)
 
     def forward(self, xyz, feat):
         B, N, _ = xyz.shape
@@ -89,48 +91,95 @@ class PVConvBlockDecoder(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# LION Decoder
+# LION Decoder (correct architecture)
 # ---------------------------------------------------------------------------
 
 class LIONDecoder(nn.Module):
     """
-    Point-cloud decoder conditioned on global shape latent z_g.
+    Point-cloud decoder following the real LION architecture (LatentPointDecPVC).
 
-    Input:  z_l      (B, N, 3)       — latent points in position space
-                                        (= xyz_anchor + 0.01 * encoder_perturbation)
-            z_global (B, style_dim)  — global shape context
-    Output: xyz_out  (B, N, 3)      — refined point positions
+    z_l has shape (B, N, 3 + latent_dim) matching the encoder output:
+      - z_l[:, :, :3]        — position latents (used directly as xyz_init)
+      - z_l[:, :, 3:]        — feature latents  (processed through PVCNN)
 
-    LION paper D.1 weighted skip:
-        xyz_out = z_l + 0.01 * delta
-    At init, output_head bias=0 → delta≈0 → xyz_out ≈ z_l ≈ xyz_anchor (identity).
+    The decoder extracts xyz_init = tanh(z_l[:,:,:3]).  tanh bounds coordinates
+    to [-1,1] for voxelisation stability (our VoxelBranch assumes this range).
+    In LION's PointNet++ SA blocks this is not needed; here it is a pragmatic fix.
+
+    Skip connection (from LION latent_points_ada.py):
+        xyz_out = output_head(PVCNN_features) + xyz_init
+    i.e. the PVCNN predicts a residual correction over the latent positions.
+
+    At epoch 0 the output_head is near-zero (small init), so:
+        xyz_out ≈ xyz_init ≈ tanh(mu_l[:,:,:3]) ≈ mu_l[:,:,:3] ≈ input_xyz
+    giving identity-like reconstruction from the very first forward pass.
     """
-    def __init__(self, latent_dim=3, style_dim=256):
+
+    def __init__(self, latent_dim: int = 3, style_dim: int = 256):
         super().__init__()
+        self.latent_dim = latent_dim
+
+        # feat_proj maps the FEATURE part of z_l (latent_dim channels) to 256-dim.
+        # The POSITION part (first 3 channels) is used directly as xyz_init.
         self.feat_proj = SharedMLP([latent_dim, 128, 256])
 
         self.stage0 = PVConvBlockDecoder(256, 256, style_dim, resolution=16)
         self.stage1 = PVConvBlockDecoder(256, 128, style_dim, resolution=32)
         self.stage2 = PVConvBlockDecoder(128, 64,  style_dim, resolution=32)
 
+        # Position residual head: near-zero init so delta≈0 at epoch 0
+        # → xyz_out ≈ xyz_init (identity through latent positions).
         self.output_head = nn.Sequential(
             nn.Conv1d(64, 64, 1),
             nn.GELU(),
             nn.Conv1d(64, 3, 1),
         )
-        # Zero-init output so delta≈0 at start → identity mapping through decoder
-        nn.init.zeros_(self.output_head[-1].weight)
+        nn.init.normal_(self.output_head[-1].weight, std=0.01)
         nn.init.zeros_(self.output_head[-1].bias)
 
-    def forward(self, z_l, z_global):
-        # z_l:      (B, N, 3)       — latent points (already in position space)
-        # z_global: (B, style_dim)
-        xyz  = z_l                                                           # spatial ref for voxelisation
-        feat = self.feat_proj(z_l.permute(0, 2, 1)).permute(0, 2, 1)       # (B, N, 256)
-        feat = self.stage0(xyz, feat, z_global)
-        feat = self.stage1(xyz, feat, z_global)
-        feat = self.stage2(xyz, feat, z_global)
+        # Normal prediction head — separate branch, same small-init strategy.
+        self.output_head_normals = nn.Sequential(
+            nn.Conv1d(64, 64, 1),
+            nn.GELU(),
+            nn.Conv1d(64, 3, 1),
+        )
+        nn.init.normal_(self.output_head_normals[-1].weight, std=0.01)
+        nn.init.zeros_(self.output_head_normals[-1].bias)
 
-        delta = self.output_head(feat.permute(0, 2, 1)).permute(0, 2, 1)   # (B, N, 3)
-        # Paper D.1: predicted delta multiplied by 0.01 before adding to z_l
-        return z_l + 0.01 * delta
+    def forward(self, z_l: torch.Tensor, z_global: torch.Tensor):
+        """
+        z_l      : (B, N, 3 + latent_dim)  — stochastic per-point latent
+        z_global : (B, style_dim)           — global shape context
+
+        Returns
+        -------
+        xyz_out  (B, N, 3)   reconstructed positions (normalised scale)
+        nrm_out  (B, N, 3)   predicted unit normals
+        """
+        # Split z_l into position and feature parts (LION LatentPointDecPVC logic).
+        xyz_latent = z_l[:, :, :3]                         # (B, N, 3) position latents
+        feat_raw   = z_l[:, :, 3:]                         # (B, N, latent_dim)
+
+        # Use position latents directly — tanh was removed because normalize_pc
+        # maps the farthest point to exactly ±1.0, which would require mu→±∞
+        # to represent through tanh, causing the encoder to diverge (kl_pos→∞).
+        # The VoxelBranch already clamps out-of-range coords safely.
+        xyz_init = xyz_latent                              # (B, N, 3)
+
+        # Project feature latents to PVCNN feature dimension.
+        z_f  = feat_raw.permute(0, 2, 1)                   # (B, latent_dim, N)
+        feat = self.feat_proj(z_f).permute(0, 2, 1)        # (B, N, 256)
+
+        # PVCNN: uses xyz_init for spatial structure (voxelisation reference)
+        feat = self.stage0(xyz_init, feat, z_global)
+        feat = self.stage1(xyz_init, feat, z_global)
+        feat = self.stage2(xyz_init, feat, z_global)
+
+        feat_t  = feat.permute(0, 2, 1)                    # (B, 64, N)
+        delta   = self.output_head(feat_t).permute(0, 2, 1)         # (B, N, 3)
+        nrm_raw = self.output_head_normals(feat_t).permute(0, 2, 1) # (B, N, 3)
+
+        # LION skip: final positions = residual correction + latent positions
+        xyz_out = delta + xyz_init
+        nrm_out = F.normalize(nrm_raw, dim=-1)
+        return xyz_out, nrm_out

@@ -16,6 +16,7 @@ import time
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.utils.data import DataLoader
@@ -52,8 +53,25 @@ class TrainConfig:
 
     # --- VAE beta scheduling (KL annealing) ---
     beta_start:    float = 0.0
-    beta_end:      float = 2.0
-    beta_epochs:   int   = 80
+    beta_end:      float = 1.0
+    beta_epochs:   int   = 150
+    # Per-latent KL weights — mirrors LION's weight_kl_pt / weight_kl_feat / weight_kl_glb.
+    # beta_style:    z_g KL weight  — 1.0: z_g is a standard VAE latent; DDPM level 1
+    #                                  generates it from N(0,I).
+    # beta_pos_pts:  z_l position channel KL (first 3 dims).  Keep near 0; the
+    #                position anchor provides the reconstruction signal — KL here
+    #                fights the anchor and hurts CD.
+    # beta_feat_pts: z_l feature channel KL (remaining latent_dim dims).  Mild
+    #                regularisation (0.001) helps the diffusion model without
+    #                hurting reconstruction; matches LION's weight_kl_feat.
+    beta_style:     float = 1.0
+    beta_pos_pts:   float = 1e-4
+    beta_feat_pts:  float = 0.001
+
+    # Position noise injected into z_l[:,:,:3] before decoding.
+    # Breaks the position shortcut so the decoder must use z_g for correction.
+    # 0.0 = disabled; 0.05 is a good starting value (≈5% of normalised range).
+    pos_noise_std:  float = 0.05
 
     # --- reconstruction loss ---
     recon_loss:    str   = "chamfer"
@@ -63,6 +81,9 @@ class TrainConfig:
     val_split:     float = 0.1
     num_workers:   int   = 4
     pin_memory:    bool  = True
+
+    # --- normal loss ---
+    normal_weight: float = 0.1   # weight for predicted-vs-GT normal consistency loss
 
     # --- misc ---
     seed:          int   = 42
@@ -82,60 +103,227 @@ def log_metrics_tensorboard(writer, metrics, prefix, epoch):
         writer.add_scalar(f"{prefix}/{k}", v, epoch)
 
 
-def _side_by_side(clouds: list[torch.Tensor], colors: list[torch.Tensor], gap: float = 2.5):
-    """
-    Concatenate N point clouds into one mesh, offset along X so they sit side-by-side.
-    clouds: list of (N_pts, 3) tensors (already CPU float)
-    colors: list of matching (N_pts, 3) uint8 tensors
-    Returns vertices (1, N_total, 3) and colors (1, N_total, 3) ready for add_mesh.
-    """
-    shifted_v, shifted_c = [], []
-    x_cursor = 0.0
-    for v, c in zip(clouds, colors):
-        v = v.clone()
-        # centre each cloud, then shift by cursor
-        v[:, 0] -= v[:, 0].mean()
-        v[:, 0] += x_cursor
-        half_width = (v[:, 0].max() - v[:, 0].min()).item() * 0.5
-        x_cursor  += half_width * 2 + gap
-        shifted_v.append(v)
-        shifted_c.append(c)
-    verts  = torch.cat(shifted_v, dim=0).unsqueeze(0)   # (1, N_total, 3)
-    clrs   = torch.cat(shifted_c, dim=0).unsqueeze(0)   # (1, N_total, 3)
-    return verts, clrs
+def _normals_to_rgb(normals: torch.Tensor) -> torch.Tensor:
+    """(B, N, 3) unit normals → (B, N, 3) uint8 RGB using abs values."""
+    return (normals.abs() * 255).clamp(0, 255).to(torch.uint8)
 
+
+# ---- GT / Reconstruction visualisation (separate pages for train & val) ----
 
 @torch.no_grad()
-def log_reconstructions(writer, model, loader, device, epoch, max_items=4):
+def log_gt_recon(writer, model, loader, device, epoch, tag_prefix: str, max_items: int = 4):
     """
-    For each of max_items samples: log a single mesh showing
-        [GT (green) | Reconstruction (red) | Prior sample (blue)]
-    side-by-side so all three are always synchronised in the same panel.
+    Log GT and reconstruction as separate meshes (no side-by-side crowding).
+    Tags:
+        recon/{tag_prefix}/gt/sample_{i}    — green  — ground truth
+        recon/{tag_prefix}/recon/sample_{i} — red    — reconstruction
     """
     model.eval()
     points, _ = next(iter(loader))
     points = points.to(device)
     N = points.shape[1]
 
-    xyz_out, *_ = model(points)
+    # Use posterior means (no reparameterization noise) for a clean visual.
+    # Training forward() always samples z=mu+eps for the ELBO; at visualization
+    # time that noise (sigma~0.7-0.8) corrupts xyz_init and ruins the picture
+    # even when mu_l is a good encoding of the shape.
+    xyz_out, _ = model.reconstruct(points)
     gt    = normalize_pc(points)[..., :3].detach().float().cpu()
     recon = xyz_out.detach().float().cpu()
     B     = min(max_items, gt.shape[0])
 
-    # One prior sample per displayed shape (same N)
-    prior_samples = model.generate(num_samples=B, num_points=N, device=device)
-    prior_samples = prior_samples.detach().float().cpu()
+
+    green = torch.tensor([[0, 220, 0]],   dtype=torch.uint8).expand(N, -1)
+    red   = torch.tensor([[220, 0, 0]],   dtype=torch.uint8).expand(N, -1)
 
     for i in range(B):
-        gt_v   = gt[i];    gt_c   = torch.tensor([[0, 220, 0]],   dtype=torch.uint8).expand(N, -1)
-        rec_v  = recon[i]; rec_c  = torch.tensor([[220, 0, 0]],   dtype=torch.uint8).expand(N, -1)
-        pri_v  = prior_samples[i]
-        pri_c  = torch.tensor([[0, 80, 220]], dtype=torch.uint8).expand(N, -1)
+        writer.add_mesh(
+            f"recon/{tag_prefix}/gt/sample_{i}",
+            vertices=gt[i].unsqueeze(0),
+            colors=green.unsqueeze(0),
+            global_step=epoch,
+        )
+        writer.add_mesh(
+            f"recon/{tag_prefix}/recon/sample_{i}",
+            vertices=recon[i].unsqueeze(0),
+            colors=red.unsqueeze(0),
+            global_step=epoch,
+        )
+    model.train()
 
-        verts, clrs = _side_by_side([gt_v, rec_v, pri_v], [gt_c, rec_c, pri_c])
-        writer.add_mesh(f"sample_{i}/gt_recon_prior", vertices=verts, colors=clrs, global_step=epoch)
+
+# ---- Style samples (fixed z_l, varying z_g) --------------------------------
+
+@torch.no_grad()
+def log_style_samples(
+    writer, model, device, epoch, num_points: int,
+    n_fixed_latents: int = 3, n_styles: int = 5, latent_seed: int = 0,
+):
+    """
+    Fix n_fixed_latents z_l vectors (deterministic across epochs via latent_seed),
+    then decode each with n_styles fresh z_g samples drawn from the prior.
+
+    This shows how the global style vector controls shape while the local
+    per-point structure is held constant.
+
+    Tags: samples/latent_{i}/style_{j}
+    """
+    model.eval()
+
+    # Fixed z_l — constant across all epochs (shape: B, N, 3+latent_dim)
+    gen = torch.Generator()
+    gen.manual_seed(latent_seed)
+    fixed_zl = torch.randn(
+        n_fixed_latents, num_points, model.total_z_dim, generator=gen,
+    ).clamp(-1, 1).to(device)
+
+    blue = torch.tensor([[60, 120, 220]], dtype=torch.uint8)
+
+    for i in range(n_fixed_latents):
+        zl = fixed_zl[i].unsqueeze(0)                                        # (1, N, latent_dim)
+        for j in range(n_styles):
+            zg       = torch.randn(1, model.style_dim, device=device)
+            pts, _   = model.decoder(zl, zg)
+            pts      = pts.detach().float().cpu().squeeze(0)                  # (N, 3)
+            clr = blue.expand(pts.shape[0], -1).unsqueeze(0)                 # (1, N, 3)
+            writer.add_mesh(
+                f"samples/latent_{i}/style_{j}",
+                vertices=pts.unsqueeze(0),
+                colors=clr,
+                global_step=epoch,
+            )
+    model.train()
+
+
+# ---- Normal map comparison -------------------------------------------------
+
+@torch.no_grad()
+def log_normal_maps(writer, model, loader, device, epoch, tag_prefix: str, max_items: int = 4):
+    """
+    Visualise surface normals of GT and reconstructed clouds side-by-side.
+
+    GT normals   : taken directly from the input data (channels 3-5), unit-normalised.
+    Recon normals: estimated from the reconstructed xyz via PCA on k-NN (see
+                   estimate_normals_pca).  The decoder does not output normals; PCA is
+                   the correct way to derive them from the predicted point positions.
+
+    Points are coloured by abs(normal) → RGB so that sign-inconsistency in PCA
+    normals does not distort the comparison.
+
+    Tags:
+        normals/{tag_prefix}/gt/sample_{i}    — ground truth normal colours
+        normals/{tag_prefix}/recon/sample_{i} — reconstructed normal colours
+    """
+    model.eval()
+    points, _ = next(iter(loader))
+    points = points.to(device)
+
+    # Use posterior means — same reason as log_gt_recon.
+    xyz_out, normals_out = model.reconstruct(points)
+    pts_norm  = normalize_pc(points).detach().float().cpu()
+
+    gt_xyz    = pts_norm[..., :3]
+    gt_nrm    = F.normalize(pts_norm[..., 3:6], dim=-1)
+    recon_xyz = xyz_out.detach().float().cpu()
+    recon_nrm = normals_out.detach().float().cpu()    # decoder predicts normals directly
+
+    B = min(max_items, gt_xyz.shape[0])
+    for i in range(B):
+        gt_rgb    = _normals_to_rgb(gt_nrm[i].unsqueeze(0))     # (1, N, 3)
+        recon_rgb = _normals_to_rgb(recon_nrm[i].unsqueeze(0))
+
+        writer.add_mesh(
+            f"normals/{tag_prefix}/gt/sample_{i}",
+            vertices=gt_xyz[i].unsqueeze(0),
+            colors=gt_rgb,
+            global_step=epoch,
+        )
+        writer.add_mesh(
+            f"normals/{tag_prefix}/recon/sample_{i}",
+            vertices=recon_xyz[i].unsqueeze(0),
+            colors=recon_rgb,
+            global_step=epoch,
+        )
+    model.train()
+
+
+# ---- Latent space analysis (active units) ----------------------------------
+
+@torch.no_grad()
+def log_latent_analysis(writer, model, loader, device, epoch):
+    """
+    Run one batch through the encoder and log per-dimension KL for z_l and z_g.
+
+    Active units: dimensions where mean KL > 0.1 — these are the ones the
+    encoder is actually using to encode information.
+
+    If active_units_local == latent_dim  → all dims are used, size is fine.
+    If active_units_local << latent_dim  → latent_dim is too large (waste).
+    If active_units_local == latent_dim AND recon is still high → too small.
+    """
+    model.eval()
+    points, _ = next(iter(loader))
+    points = points.to(device)
+
+    _, _, mu_l, logvar_l, mu_g, logvar_g = model(points)
+
+    # Per-dimension KL  (mean over batch and, for z_l, over N points)
+    # kl_elem shape: same as mu
+    def kl_per_dim(mu, logvar):
+        kl = -0.5 * (1.0 + logvar - mu.pow(2) - logvar.exp())   # (..., D)
+        # reduce everything except the last dim
+        while kl.dim() > 1:
+            kl = kl.mean(dim=0)
+        return kl   # (D,)
+
+    kl_local  = kl_per_dim(mu_l,  logvar_l)   # (latent_dim,)
+    kl_global = kl_per_dim(mu_g,  logvar_g)   # (style_dim,)
+
+    threshold = 0.1
+    active_local  = (kl_local  > threshold).sum().item()
+    active_global = (kl_global > threshold).sum().item()
+
+    writer.add_scalar("latent/active_units_local",  active_local,  epoch)
+    writer.add_scalar("latent/active_units_global", active_global, epoch)
+    writer.add_scalar("latent/latent_dim",  mu_l.shape[-1],  epoch)
+    writer.add_scalar("latent/style_dim",   mu_g.shape[-1],  epoch)
+
+    # Per-dimension KL as individual scalars (readable in TensorBoard)
+    for d, v in enumerate(kl_local.tolist()):
+        writer.add_scalar(f"latent/kl_local_dim{d}", v, epoch)
+    # For style_dim only log first 32 dims to keep TensorBoard tidy
+    for d, v in enumerate(kl_global[:32].tolist()):
+        writer.add_scalar(f"latent/kl_global_dim{d}", v, epoch)
+
+    # Histogram of per-dim KL (most compact summary)
+    writer.add_histogram("latent/kl_local_hist",  kl_local,  epoch)
+    writer.add_histogram("latent/kl_global_hist", kl_global, epoch)
 
     model.train()
+
+
+# ---- Gradient norm logging -------------------------------------------------
+
+def log_gradient_norms(writer, model, global_step: int):
+    """
+    Log per-module gradient L2 norms and the overall pre-clip norm.
+    Call after scaler.unscale_() so gradients are in their true fp32 scale.
+    """
+    modules = {
+        "global_encoder": model.global_encoder,
+        "local_encoder":  model.local_encoder,
+        "decoder":        model.decoder,
+    }
+    total_sq = 0.0
+    for name, mod in modules.items():
+        sq = sum(
+            p.grad.detach().norm(2).item() ** 2
+            for p in mod.parameters()
+            if p.grad is not None
+        )
+        writer.add_scalar(f"gradients/{name}", sq ** 0.5, global_step)
+        total_sq += sq
+    writer.add_scalar("gradients/total_before_clip", total_sq ** 0.5, global_step)
 
 
 # ============================================================
@@ -176,21 +364,21 @@ def count_parameters(model):
 # Train / Val steps
 # ============================================================
 
-def train_one_epoch(model, loader, optimiser, scaler, cfg, epoch, logger, device):
+def train_one_epoch(model, loader, optimiser, scaler, cfg, epoch, logger, device, writer=None):
     model.train()
-    beta    = beta_schedule(epoch, cfg)
-    totals  = {}
+    beta      = beta_schedule(epoch, cfg)
+    totals    = {}
     n_batches = 0
 
     for batch_idx, data in enumerate(loader):
         points, _ = data
         points     = points.to(device, non_blocking=True)
-        # Normalize before extracting target so it matches the model's output space.
-        # model(points) calls normalize_pc internally; the loss must compare in the same scale.
         target_xyz = normalize_pc(points)[..., :3]
 
         with torch.autocast(device_type=device.type, enabled=cfg.amp):
-            xyz_out, mu_l, logvar_l, mu_g, logvar_g = model(points)
+            xyz_out, normals_out, mu_l, logvar_l, mu_g, logvar_g = model(
+                points, pos_noise_std=cfg.pos_noise_std)
+            target_nrm = F.normalize(normalize_pc(points)[..., 3:6], dim=-1)
             losses = vae_loss(
                 pred_xyz=xyz_out,
                 target_xyz=target_xyz,
@@ -199,13 +387,24 @@ def train_one_epoch(model, loader, optimiser, scaler, cfg, epoch, logger, device
                 mu_style=mu_g,
                 logvar_style=logvar_g,
                 beta=beta,
+                beta_pos_pts=cfg.beta_pos_pts,
+                beta_feat_pts=cfg.beta_feat_pts,
+                beta_style=cfg.beta_style,
                 recon_loss=cfg.recon_loss,
                 emd_weight=cfg.emd_weight,
+                normals_pred=normals_out,
+                normal_target=target_nrm,
+                normal_weight=cfg.normal_weight,
             )
 
         optimiser.zero_grad(set_to_none=True)
         scaler.scale(losses["total"]).backward()
         scaler.unscale_(optimiser)
+
+        # Gradient norms logged after unscaling, before clipping
+        if writer is not None and (batch_idx + 1) % cfg.log_every == 0:
+            log_gradient_norms(writer, model, epoch * len(loader) + batch_idx)
+
         nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
         scaler.step(optimiser)
         scaler.update()
@@ -227,8 +426,8 @@ def train_one_epoch(model, loader, optimiser, scaler, cfg, epoch, logger, device
 @torch.no_grad()
 def validate(model, loader, cfg, epoch, device):
     model.eval()
-    beta    = beta_schedule(epoch, cfg)
-    totals  = {}
+    beta      = beta_schedule(epoch, cfg)
+    totals    = {}
     n_batches = 0
 
     for points, _ in loader:
@@ -236,7 +435,9 @@ def validate(model, loader, cfg, epoch, device):
         target_xyz = normalize_pc(points)[..., :3]
 
         with torch.autocast(device_type=device.type, enabled=cfg.amp):
-            xyz_out, mu_l, logvar_l, mu_g, logvar_g = model(points)
+            xyz_out, normals_out, mu_l, logvar_l, mu_g, logvar_g = model(
+                points, pos_noise_std=cfg.pos_noise_std)
+            target_nrm = F.normalize(normalize_pc(points)[..., 3:6], dim=-1)
             losses = vae_loss(
                 pred_xyz=xyz_out,
                 target_xyz=target_xyz,
@@ -245,8 +446,14 @@ def validate(model, loader, cfg, epoch, device):
                 mu_style=mu_g,
                 logvar_style=logvar_g,
                 beta=beta,
+                beta_pos_pts=cfg.beta_pos_pts,
+                beta_feat_pts=cfg.beta_feat_pts,
+                beta_style=cfg.beta_style,
                 recon_loss=cfg.recon_loss,
                 emd_weight=cfg.emd_weight,
+                normals_pred=normals_out,
+                normal_target=target_nrm,
+                normal_weight=cfg.normal_weight,
             )
 
         fs = f_score(xyz_out, target_xyz, threshold=0.01)
@@ -286,6 +493,10 @@ def main(cfg: TrainConfig) -> None:
                             num_workers=cfg.num_workers, pin_memory=cfg.pin_memory)
     logger.info(f"Dataset: {len(train_idx)} train / {len(val_idx)} val samples")
 
+    # num_points from the dataset (needed for style-sample generation)
+    sample_pts, _ = trn_ds[0]
+    num_points = sample_pts.shape[0]
+
     # ---- Model ----------------------------------------------------------
     model = Vae(
         latent_dim=cfg.latent_dim,
@@ -309,7 +520,7 @@ def main(cfg: TrainConfig) -> None:
 
     resume_path = os.path.join(cfg.ckpt_dir, "latest.pt")
     if os.path.exists(resume_path) and cfg.resume:
-        ckpt = torch.load(resume_path, map_location=device)
+        ckpt = torch.load(resume_path, map_location=device, weights_only=False)
         model.load_state_dict(ckpt["model"])
         optimiser.load_state_dict(ckpt["optimiser"])
         scheduler.load_state_dict(ckpt["scheduler"])
@@ -322,7 +533,9 @@ def main(cfg: TrainConfig) -> None:
     # ---- Training loop --------------------------------------------------
     for epoch in range(start_epoch, cfg.epochs):
         t0          = time.time()
-        trn_metrics = train_one_epoch(model, trn_loader, optimiser, scaler, cfg, epoch, logger, device)
+        trn_metrics = train_one_epoch(
+            model, trn_loader, optimiser, scaler, cfg, epoch, logger, device, writer=writer,
+        )
         val_metrics = validate(model, val_loader, cfg, epoch, device)
         scheduler.step()
 
@@ -341,7 +554,21 @@ def main(cfg: TrainConfig) -> None:
         log_metrics_tensorboard(writer, val_metrics, "val",   epoch)
 
         if epoch % 5 == 0:
-            log_reconstructions(writer, model, trn_loader, device, epoch, max_items=4)
+            log_latent_analysis(writer, model, val_loader, device, epoch)
+
+            # Ground truth vs reconstruction — train and val separately
+            log_gt_recon(writer, model, trn_loader, device, epoch, "train", max_items=4)
+            log_gt_recon(writer, model, val_loader,  device, epoch, "val",  max_items=4)
+
+            # Normal map comparison — train and val separately
+            log_normal_maps(writer, model, trn_loader, device, epoch, "train", max_items=4)
+            log_normal_maps(writer, model, val_loader,  device, epoch, "val",  max_items=4)
+
+            # Style samples: fixed z_l, varying z_g
+            log_style_samples(
+                writer, model, device, epoch,
+                num_points=num_points, n_fixed_latents=3, n_styles=5, latent_seed=0,
+            )
 
         val_cd = val_metrics.get("recon", math.inf)
         is_best = val_cd < best_val_cd

@@ -120,14 +120,14 @@ def extract_latents(vae: Vae, points: torch.Tensor):
 
     Returns
     -------
-    z_g  (B, style_dim)   global style posterior mean
-    z_l  (B, N, 3)        LION skip: xyz_anchor + 0.01 * mu_l  (position space)
+    z_g  (B, style_dim)            global style posterior mean
+    z_l  (B, N, 3 + latent_dim)   local posterior mean; position anchor already
+                                   embedded in first 3 channels by LocalEncoder
     """
     x_norm  = normalize_pc(points)
     mu_g, _ = vae.global_encoder(x_norm)         # (B, style_dim)
-    mu_l, _ = vae.local_encoder(x_norm, mu_g)    # (B, N, 3)
-    z_l     = x_norm[..., :3] + 0.01 * mu_l      # same skip as Vae.forward
-    return mu_g, z_l
+    mu_l, _ = vae.local_encoder(x_norm, mu_g)    # (B, N, 3+latent_dim); anchor already inside
+    return mu_g, mu_l
 
 
 # ============================================================
@@ -191,8 +191,8 @@ def log_generations(
 
     # Pick a few representative classes
     show_classes = list(range(min(4, cfg.num_classes)))
-    N  = 2048
-    pd = cfg.vae_latent_dim
+    N        = 2048
+    total_zl = vae.total_z_dim   # 3 + latent_dim
 
     for cls_idx in show_classes:
         B   = cfg.vis_per_class
@@ -201,19 +201,20 @@ def log_generations(
         # --- Stage 1: sample z_g ---
         uncond = style_dn.uncond(B, device)
         z_g    = schedule.sample(
-            style_dn, (cfg.vae_style_dim,),
+            style_dn, (vae.style_dim,),
             condition=cls, uncond=uncond,
             guidance=cfg.guidance, device=device,
         )   # (B, style_dim)
 
         # --- Stage 2: sample z_local conditioned on z_g ---
         z_local = schedule.sample(
-            point_dn, (N, pd),
+            point_dn, (N, total_zl),
             condition=z_g, device=device,
-        )   # (B, N, 6)
+        )   # (B, N, 3+latent_dim)
 
         # --- Decode ---
-        xyz_out = vae.decoder(z_local, z_g).float().cpu()  # (B, N, 3)  z_local is z_l here
+        xyz_out, _ = vae.decoder(z_local, z_g)
+        xyz_out    = xyz_out.float().cpu()   # (B, N, 3)
 
         for i in range(B):
             gen_v = xyz_out[i]
@@ -358,8 +359,8 @@ def _eval_generation(
     1-NNA — 1-NN accuracy in gen∪ref space.
            Closer to 0.5 = better (generated and real are indistinguishable).
     """
-    N  = ref_clouds[0].shape[0]           # points per cloud
-    pd = cfg.vae_latent_dim               # 3
+    N        = ref_clouds[0].shape[1]   # points per cloud  (shape: batch, N, 3)
+    total_zl = vae.total_z_dim          # 3 + latent_dim
 
     gen_clouds = []
     for start in range(0, n_gen, cfg.batch_size):
@@ -370,10 +371,10 @@ def _eval_generation(
         z_g    = schedule.sample(style_dn, (cfg.vae_style_dim,),
                                  condition=cls, uncond=uncond,
                                  guidance=cfg.guidance, device=device)
-        z_l    = schedule.sample(point_dn, (N, pd),
+        z_l    = schedule.sample(point_dn, (N, total_zl),
                                  condition=z_g, device=device)
-        xyz    = vae.decoder(z_l, z_g).float().cpu()
-        gen_clouds.append(xyz)
+        xyz, _ = vae.decoder(z_l, z_g)
+        gen_clouds.append(xyz.float().cpu())
 
     gen = torch.cat(gen_clouds, dim=0)             # (n_gen, N, 3)
     ref = torch.cat(ref_clouds, dim=0)             # (R, N, 3)
@@ -424,18 +425,30 @@ def main(cfg: DiffusionConfig) -> None:
     logger.info(f"Device: {device}")
 
     # ---- Load & freeze VAE -----------------------------------------
-    vae = Vae(
-        latent_dim=cfg.vae_latent_dim,
-        style_dim=cfg.vae_style_dim,
-        in_channels=cfg.vae_in_channels,
-    ).to(device)
-
     if not os.path.exists(cfg.vae_ckpt):
         raise FileNotFoundError(
             f"VAE checkpoint not found: {cfg.vae_ckpt}\n"
             "Run train_vae.py first and pass --vae_ckpt to this script."
         )
-    ckpt = torch.load(cfg.vae_ckpt, map_location=device)
+    ckpt = torch.load(cfg.vae_ckpt, map_location=device, weights_only=False)
+
+    # Read architecture hyperparams saved inside the checkpoint so that
+    # vae_latent_dim / vae_style_dim / vae_in_channels never need to be
+    # specified manually — they always match the trained weights.
+    saved_cfg = ckpt.get("config", {})
+    vae_latent_dim  = saved_cfg.get("latent_dim",  cfg.vae_latent_dim)
+    vae_style_dim   = saved_cfg.get("style_dim",   cfg.vae_style_dim)
+    vae_in_channels = saved_cfg.get("in_channels", cfg.vae_in_channels)
+    logger.info(
+        f"VAE arch from checkpoint: latent_dim={vae_latent_dim} "
+        f"style_dim={vae_style_dim} in_channels={vae_in_channels}"
+    )
+
+    vae = Vae(
+        latent_dim=vae_latent_dim,
+        style_dim=vae_style_dim,
+        in_channels=vae_in_channels,
+    ).to(device)
     vae.load_state_dict(ckpt["model"])
     vae.eval()
     for p in vae.parameters():
@@ -451,7 +464,7 @@ def main(cfg: DiffusionConfig) -> None:
     schedule  = CosineSchedule(T=cfg.T).to(device)
 
     style_dn  = StyleDenoiser(
-        style_dim=cfg.vae_style_dim,
+        style_dim=vae_style_dim,
         num_classes=cfg.num_classes,
         hidden=cfg.style_hidden,
         n_layers=cfg.style_layers,
@@ -460,8 +473,8 @@ def main(cfg: DiffusionConfig) -> None:
     ).to(device)
 
     point_dn  = LatentPointDenoiser(
-        point_dim=3,   # z_l is always 3D (position space, LION paper D.1)
-        style_dim=cfg.vae_style_dim,
+        point_dim=vae.total_z_dim,   # 3 + latent_dim; read from loaded VAE
+        style_dim=vae_style_dim,
         hidden=cfg.point_hidden,
         n_layers=cfg.point_layers,
         T=cfg.T,
@@ -510,7 +523,7 @@ def main(cfg: DiffusionConfig) -> None:
 
     resume_path = os.path.join(cfg.ckpt_dir, "latest.pt")
     if os.path.exists(resume_path) and cfg.resume:
-        ckpt_d = torch.load(resume_path, map_location=device)
+        ckpt_d = torch.load(resume_path, map_location=device, weights_only=False)
         style_dn.load_state_dict(ckpt_d["style_dn"])
         point_dn.load_state_dict(ckpt_d["point_dn"])
         opt_s.load_state_dict(ckpt_d["opt_s"])

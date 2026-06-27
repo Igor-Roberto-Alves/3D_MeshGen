@@ -229,7 +229,7 @@ class StyleDenoiser(nn.Module):
 class LatentPointDenoiser(nn.Module):
     """
     ε-predictor for the local latent cloud z_l ∈ ℝ^{N × point_dim}.
-    point_dim must equal Vae.latent_dim — no anchor prefix since the anchor bypass was removed.
+    point_dim = Vae.total_z_dim = 3 + latent_dim (position channels + feature channels).
 
     Processing is shared across N (Conv1d = per-point MLP), conditioned on
     z_g + timestep via adaptive group normalisation.
@@ -242,7 +242,7 @@ class LatentPointDenoiser(nn.Module):
 
     def __init__(
         self,
-        point_dim:  int = 3,   # z_l lives in position space (LION D.1); must match Vae.latent_dim
+        point_dim:  int = 3,   # must equal Vae.total_z_dim = 3 + latent_dim
         style_dim:  int = 256,
         hidden:     int = 256,
         n_layers:   int = 8,

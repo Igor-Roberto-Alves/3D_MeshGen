@@ -35,12 +35,14 @@ class VoxelBranch(nn.Module):
         device = features.device
         idx = coords.long().clamp(0, R - 1)
         flat_idx = idx[:, 0] * R * R + idx[:, 1] * R + idx[:, 2]
-        voxels = torch.zeros(B, C, R * R * R, device=device, dtype=features.dtype)
-        count  = torch.zeros(B, 1, R * R * R, device=device, dtype=features.dtype)
-        voxels.scatter_add_(2, flat_idx.unsqueeze(1).expand_as(features), features)
+        # float32 accumulation prevents float16 overflow under AMP
+        feat32  = features.float()
+        voxels  = torch.zeros(B, C, R * R * R, device=device, dtype=torch.float32)
+        count   = torch.zeros(B, 1, R * R * R, device=device, dtype=torch.float32)
+        voxels.scatter_add_(2, flat_idx.unsqueeze(1).expand_as(feat32), feat32)
         count.scatter_add_(2, flat_idx.unsqueeze(1),
-                           torch.ones(B, 1, N, device=device, dtype=features.dtype))
-        return (voxels / count.clamp(min=1.0)).view(B, C, R, R, R)
+                           torch.ones(B, 1, N, device=device, dtype=torch.float32))
+        return (voxels / count.clamp(min=1.0)).view(B, C, R, R, R).to(features.dtype)
 
     def forward(self, xyz, feat):
         # xyz: (B, N, 3) in [-1, 1];  feat: (B, N, C)
@@ -111,17 +113,11 @@ class PVConvBlockConditioned(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Global Encoder  (LION paper: "shape-level VAE encoder")
+# Global Encoder
 # ---------------------------------------------------------------------------
 
 class GlobalEncoder(nn.Module):
-    """
-    Encodes the full point cloud into a single global shape latent z_g.
-
-    Architecture (LION Sec. 3):
-        PVCNN backbone  →  global max-pool  →  fc_mu / fc_logvar
-    Returns mu_g, logvar_g  each of shape (B, style_dim).
-    """
+    """Encodes the full point cloud into a single global shape latent z_g."""
     def __init__(self, in_channels=6, style_dim=256):
         super().__init__()
         self.stage0 = PVConvBlock(in_channels, 64,  resolution=32)
@@ -131,50 +127,82 @@ class GlobalEncoder(nn.Module):
         self.fc_logvar = nn.Linear(256, style_dim)
 
     def forward(self, x):
-        # x: (B, N, in_channels) with xyz already in [-1, 1]
         xyz  = x[..., :3]
         feat = x
         feat = self.stage0(xyz, feat)
         feat = self.stage1(xyz, feat)
         feat = self.stage2(xyz, feat)
-        g = feat.max(dim=1).values          # global max-pool → (B, 256)
+        g = feat.max(dim=1).values
         return self.fc_mu(g), self.fc_logvar(g)
 
 
 # ---------------------------------------------------------------------------
-# Local Encoder  (LION paper: "point-level VAE encoder")
+# Local Encoder  (LION architecture)
 # ---------------------------------------------------------------------------
 
 class LocalEncoder(nn.Module):
     """
-    Encodes per-point latent features conditioned on the global shape z_g.
+    Per-point encoder that produces z_l of shape (B, N, 3 + latent_dim).
 
-    latent_dim is fixed at 3 (LION paper D.1): mu_l represents a 3-channel
-    position perturbation. The skip z_l = xyz + 0.01 * mu_l is applied in
-    Vae.forward, so z_l lives in the same 3D position space as the input.
+    Follows the real LION architecture (latent_points_ada.py / PointTransPVC):
+      - The first 3 channels of z_l are *position latents* initialized with a
+        skip connection to the input xyz:
+            mu_pos = PVCNN_output[:,:,:3] + input_xyz
+        This means mu_pos ≈ input_xyz at init, giving the decoder a meaningful
+        starting point and providing a direct gradient path from reconstruction
+        loss to the encoder.
+      - The remaining latent_dim channels are *feature latents* with no skip.
+      - Both position and feature logvars are output by the same head; the bias
+        init of -2.0 gives σ ≈ 0.37 at init (small noise, stable early training).
+
+    Total z_l dim = 3 + latent_dim.  The decoder separates these two parts.
     """
-    def __init__(self, in_channels=6, latent_dim=3, style_dim=256):
+    def __init__(self, in_channels: int = 6, latent_dim: int = 3, style_dim: int = 256):
         super().__init__()
-        self.latent_dim = latent_dim
+        self.latent_dim  = latent_dim
+        self.total_dim   = 3 + latent_dim   # position channels + feature channels
+
         self.stage0 = PVConvBlockConditioned(in_channels, 64,  style_dim, resolution=32)
         self.stage1 = PVConvBlockConditioned(64,          128, style_dim, resolution=16)
         self.stage2 = PVConvBlockConditioned(128,         256, style_dim, resolution=8)
-        self.fc_mu     = nn.Conv1d(256, latent_dim, 1)
-        self.fc_logvar = nn.Conv1d(256, latent_dim, 1)
-        # Paper D.1 — variance scaling: bias -6 pushes posterior std ≈ 0 at init
-        # so z_l ≈ xyz_anchor (identity mapping through encoder).
-        nn.init.constant_(self.fc_logvar.bias, -6.0)
-        nn.init.zeros_(self.fc_mu.weight)
+
+        # Output 3+latent_dim mu values and 3+latent_dim logvar values.
+        # fc_mu outputs position delta (first 3) + feature mu (remaining latent_dim).
+        # The position delta is added to input_xyz (skip), so the network only
+        # needs to learn residuals — it starts at identity (≈ input xyz).
+        self.fc_mu     = nn.Conv1d(256, self.total_dim, 1)
+        self.fc_logvar = nn.Conv1d(256, self.total_dim, 1)
+
+        # Small logvar init → σ ≈ 0.37 at start → stable reparameterization.
+        nn.init.constant_(self.fc_logvar.bias, -2.0)
+        # fc_mu near zero → position delta ≈ 0 → mu_pos ≈ input_xyz at epoch 0.
+        nn.init.normal_(self.fc_mu.weight, std=0.01)
         nn.init.zeros_(self.fc_mu.bias)
 
-    def forward(self, x, style):
-        # x: (B, N, in_channels);  style: (B, style_dim)
-        xyz  = x[..., :3]
+    def forward(self, x: torch.Tensor, style: torch.Tensor):
+        """
+        x     : (B, N, in_channels) — normalized input [xyz | normals]
+        style : (B, style_dim)      — global shape latent z_g
+
+        Returns
+        -------
+        mu_l     (B, N, 3 + latent_dim)
+        logvar_l (B, N, 3 + latent_dim)
+        """
+        xyz  = x[..., :3]   # (B, N, 3) — normalized positions
         feat = x
         feat = self.stage0(xyz, feat, style)
         feat = self.stage1(xyz, feat, style)
         feat = self.stage2(xyz, feat, style)
-        f = feat.permute(0, 2, 1)                    # (B, 256, N)
-        mu     = self.fc_mu(f).permute(0, 2, 1)      # (B, N, latent_dim)
-        logvar = self.fc_logvar(f).permute(0, 2, 1)  # (B, N, latent_dim)
-        return mu, logvar
+
+        f      = feat.permute(0, 2, 1)                     # (B, 256, N)
+        mu_raw = self.fc_mu(f).permute(0, 2, 1)            # (B, N, 3+latent_dim)
+        logvar = self.fc_logvar(f).permute(0, 2, 1)        # (B, N, 3+latent_dim)
+
+        # LION skip: position part of mu = network_delta + input_xyz.
+        # This initialises z_l[:,:,:3] ≈ input_xyz, giving the decoder a
+        # meaningful spatial reference from epoch 0 without any bypass hack.
+        mu_l = mu_raw.clone()
+        mu_l[:, :, :3] = mu_raw[:, :, :3] + xyz
+
+        return mu_l, logvar

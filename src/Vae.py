@@ -13,13 +13,12 @@ def normalize_pc(x: torch.Tensor) -> torch.Tensor:
     """
     xyz  = x[..., :3]
     rest = x[..., 3:]
-    centre = xyz.mean(dim=1, keepdim=True)                                 # (B, 1, 3)
+    centre = xyz.mean(dim=1, keepdim=True)
     xyz_c  = xyz - centre
-    # Largest absolute coordinate value → scale so max coord ≈ 1
     scale  = (xyz_c.abs()
-               .max(dim=-1, keepdim=True).values   # per-point max over xyz
-               .max(dim=1,  keepdim=True).values    # global max over points
-               .clamp(min=1e-6))                    # (B, 1, 1)
+               .max(dim=-1, keepdim=True).values
+               .max(dim=1,  keepdim=True).values
+               .clamp(min=1e-6))
     return torch.cat([xyz_c / scale, rest], dim=-1)
 
 
@@ -29,11 +28,21 @@ class Vae(nn.Module):
 
     Two-level latent space
     ----------------------
-    z_g  (B, style_dim)         – global shape prior, N(0,I)
-    z_l  (B, N, latent_dim)     – local per-point prior, N(0,I)
+    z_g  (B, style_dim)              – global shape prior
+    z_l  (B, N, 3 + latent_dim)     – local per-point latent
+                                       first 3 channels : position latents
+                                       next latent_dim  : abstract feature latents
 
-    The decoder reconstructs positions purely from (z_l, z_g) — no anchor
-    bypass — so the latent space is a proper generative prior for diffusion.
+    Position anchor (LION PointTransPVC design)
+    -------------------------------------------
+    The LocalEncoder builds a skip connection inside its forward():
+        mu_l[:, :, :3] = PVCNN_delta + input_xyz
+
+    At initialisation, PVCNN_delta ≈ 0 (near-zero fc_mu init), so
+    mu_l[:, :, :3] ≈ input_xyz. The decoder uses z_l[:, :, :3] directly
+    as the spatial reference (xyz_init), giving near-perfect reconstruction
+    from epoch 0. Over training, the encoder refines the delta while KL
+    regularises both position and feature channels toward N(0, I).
     """
 
     def __init__(
@@ -45,23 +54,31 @@ class Vae(nn.Module):
         super().__init__()
         self.style_dim   = style_dim
         self.latent_dim  = latent_dim
+        self.total_z_dim = 3 + latent_dim   # full channels of z_l
 
         self.global_encoder = GlobalEncoder(in_channels, style_dim)
+        # LocalEncoder outputs (3 + latent_dim) channels with position anchor.
         self.local_encoder  = LocalEncoder(in_channels, latent_dim, style_dim)
+        # Decoder expects z_l with (3 + latent_dim) channels.
         self.decoder        = LIONDecoder(latent_dim, style_dim)
 
     # ------------------------------------------------------------------
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor, pos_noise_std: float = 0.0):
         """
         x: (B, N, 6)  — raw point cloud [xyz | normals]
+        pos_noise_std: std of Gaussian noise added to z_l position channels
+                       before decoding.  Breaks the position shortcut and forces
+                       the decoder to rely on z_g for spatial correction.
+                       Set to 0 (default) to disable; typical values: 0.02–0.10.
 
         Returns
         -------
-        xyz_out   (B, N, 3)           reconstructed positions (normalised scale)
-        mu_l      (B, N, latent_dim)  local encoder mean
-        logvar_l  (B, N, latent_dim)  local encoder log-variance
-        mu_g      (B, style_dim)      global encoder mean
-        logvar_g  (B, style_dim)      global encoder log-variance
+        xyz_out   (B, N, 3)            reconstructed positions
+        nrm_out   (B, N, 3)            predicted normals
+        mu_l      (B, N, 3+latent_dim) local encoder mean (includes position anchor)
+        logvar_l  (B, N, 3+latent_dim) local encoder log-variance
+        mu_g      (B, style_dim)       global encoder mean
+        logvar_g  (B, style_dim)       global encoder log-variance
         """
         x = normalize_pc(x)
 
@@ -70,20 +87,40 @@ class Vae(nn.Module):
         logvar_g = logvar_g.clamp(-10.0, 10.0)
         z_g = mu_g + torch.randn_like(mu_g) * (0.5 * logvar_g).exp()
 
-        # --- Local level (conditioned on z_g) ---
+        # --- Local level ---
+        # LocalEncoder internally sets mu_l[:,:,:3] = PVCNN_delta + input_xyz.
+        # Sampling z_l = mu_l + eps gives a stochastic version of this anchor.
         mu_l, logvar_l = self.local_encoder(x, z_g)
         logvar_l = logvar_l.clamp(-10.0, 10.0)
-        eps_l = torch.randn_like(mu_l) * (0.5 * logvar_l).exp()
+        z_l = mu_l + torch.randn_like(mu_l) * (0.5 * logvar_l).exp()
 
-        # LION paper D.1 — weighted skip connection:
-        # z_l = xyz_anchor + 0.01 * perturbation
-        # At init: mu_l ≈ 0 (bias zeroed) and std ≈ 0 (logvar bias = -6),
-        # so z_l ≈ xyz → encoder acts as identity at the start of training.
-        xyz_anchor = x[..., :3]
-        z_l = xyz_anchor + 0.01 * (mu_l + eps_l)
+        # Optional position noise: corrupt z_l[:,:,:3] before decoding so the
+        # decoder cannot rely solely on the position shortcut and must use z_g.
+        if pos_noise_std > 0.0 and self.training:
+            z_l = z_l.clone()
+            z_l[:, :, :3] = z_l[:, :, :3] + torch.randn_like(z_l[:, :, :3]) * pos_noise_std
 
-        xyz_out = self.decoder(z_l, z_g)
-        return xyz_out, mu_l, logvar_l, mu_g, logvar_g
+        xyz_out, nrm_out = self.decoder(z_l, z_g)
+        return xyz_out, nrm_out, mu_l, logvar_l, mu_g, logvar_g
+
+    # ------------------------------------------------------------------
+    @torch.no_grad()
+    def reconstruct(self, x: torch.Tensor):
+        """
+        Deterministic reconstruction using posterior means — no reparameterization noise.
+        Use this for visualisation; training uses the sampled forward().
+        """
+        self.eval()
+        x = normalize_pc(x)
+
+        mu_g, _  = self.global_encoder(x)
+        mu_l, _  = self.local_encoder(x, mu_g)
+
+        # mu_l[:,:,:3] ≈ input_xyz (anchor), so the decoder sees the real
+        # point positions. With delta≈0 init, the first epoch already gives
+        # near-perfect reconstruction.
+        xyz_out, nrm_out = self.decoder(mu_l, mu_g)
+        return xyz_out, nrm_out
 
     # ------------------------------------------------------------------
     @torch.no_grad()
@@ -99,6 +136,6 @@ class Vae(nn.Module):
         self.eval()
 
         z_g = torch.randn(num_samples, self.style_dim, device=device)
-        # z_l lives in position space: sample from N(0,I) in [-1,1] as anchor substitute
-        z_l = torch.randn(num_samples, num_points, self.latent_dim, device=device).clamp(-1, 1)
-        return self.decoder(z_l, z_g)
+        z_l = torch.randn(num_samples, num_points, self.total_z_dim, device=device)
+        xyz_out, nrm_out = self.decoder(z_l, z_g)
+        return xyz_out, nrm_out
