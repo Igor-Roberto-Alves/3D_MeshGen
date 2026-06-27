@@ -38,7 +38,7 @@ class TrainConfig:
     log_dir:       str   = "logs"
 
     # --- architecture ---
-    latent_dim:    int   = 3      # LION paper: z_l is in 3D position space (xyz + 0.01 * mu_l)
+    latent_dim:    int   = 3      # per-point latent features (LION paper: ~3)
     style_dim:     int   = 256    # global shape latent dim
     in_channels:   int   = 6
 
@@ -52,7 +52,7 @@ class TrainConfig:
 
     # --- VAE beta scheduling (KL annealing) ---
     beta_start:    float = 0.0
-    beta_end:      float = 1e-3
+    beta_end:      float = 2.0
     beta_epochs:   int   = 80
 
     # --- reconstruction loss ---
