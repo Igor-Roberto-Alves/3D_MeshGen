@@ -436,3 +436,63 @@ class LocalEncoder(nn.Module):
         # Return raw delta — the position skip (xyz + 0.01 * delta) is applied
         # in Vae.forward so that KL is computed on the delta, not on xyz itself.
         return mu_raw, logvar
+
+
+# ---------------------------------------------------------------------------
+# Shape Encoder  (Real_latent — flat global bottleneck, no coordinate shortcut)
+# ---------------------------------------------------------------------------
+
+class ShapeEncoder(nn.Module):
+    """
+    Encodes a point cloud to a FLAT global shape latent z_l ∈ ℝ^{latent_size}.
+
+    Uses the same 4-SA-block downsampling as LocalEncoder, but stops at SA4 and
+    globally max-pools the 16 representative points into a single vector.
+    No Feature Propagation, no per-point output, no coordinate shortcuts.
+
+    NOT conditioned on z_g — encodes shape independently. The decoder receives
+    both vectors and learns to use them complementarily.
+    """
+
+    def __init__(self, in_channels: int = 6, latent_size: int = 1024):
+        super().__init__()
+        self.sa1 = SetAbstraction(
+            in_ch=in_channels, out_ch=32, n_centers=1024,
+            radius=0.1, K=32,
+            n_pvc=2, pvc_hidden=32, pvc_res=32,
+            mlp_dims=[32, 32], use_attention=False, style_dim=None,
+        )
+        self.sa2 = SetAbstraction(
+            in_ch=32, out_ch=128, n_centers=256,
+            radius=0.2, K=32,
+            n_pvc=1, pvc_hidden=64, pvc_res=16,
+            mlp_dims=[64, 128], use_attention=True, attn_dim=128, style_dim=None,
+        )
+        self.sa3 = SetAbstraction(
+            in_ch=128, out_ch=256, n_centers=64,
+            radius=0.4, K=32,
+            n_pvc=1, pvc_hidden=128, pvc_res=8,
+            mlp_dims=[128, 256], use_attention=False, style_dim=None,
+        )
+        self.sa4 = SetAbstraction(
+            in_ch=256, out_ch=128, n_centers=16,
+            radius=0.8, K=32,
+            n_pvc=0, pvc_hidden=128, pvc_res=8,
+            mlp_dims=[128, 128, 128], use_attention=False, style_dim=None,
+        )
+        self.global_attn = PointSelfAttention(128, num_heads=4)
+
+        self.fc_mu     = nn.Linear(128, latent_size)
+        self.fc_logvar = nn.Linear(128, latent_size)
+        nn.init.constant_(self.fc_logvar.bias, -6.0)
+
+    def forward(self, x: torch.Tensor):
+        """x: (B, N, in_channels)"""
+        xyz = x[..., :3]
+        xyz1, f1 = self.sa1(xyz,  x)
+        xyz2, f2 = self.sa2(xyz1, f1)
+        xyz3, f3 = self.sa3(xyz2, f2)
+        _,    f4 = self.sa4(xyz3, f3)
+        f4 = self.global_attn(f4)      # (B, 16, 128)
+        g  = f4.max(dim=1).values      # (B, 128)
+        return self.fc_mu(g), self.fc_logvar(g)

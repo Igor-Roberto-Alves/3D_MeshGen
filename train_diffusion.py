@@ -1,21 +1,21 @@
 """
 train_diffusion.py
 ------------------
-Train the two LION diffusion stages on top of a frozen pretrained VAE.
+Train the two-stage diffusion on top of the flat two-vector VAE (Real_latent).
 
-  Stage 1  StyleDenoiser       :  class label → z_g          (global style DDPM)
-  Stage 2  LatentPointDenoiser :  z_g         → z_local      (latent point DDPM)
+  Stage 1  StyleDenoiser  :  class label → z_g           (global style DDPM)
+  Stage 2  FlatDenoiser   :  z_g         → z_l ∈ ℝ^L    (flat shape DDPM)
 
-Both are trained simultaneously.  Each batch:
-  1. Run the frozen VAE encoder → get CLEAN latents (posterior mean, no noise).
-  2. Sample random timesteps → add noise via the cosine schedule.
-  3. Ask each denoiser to predict the noise → MSE loss.
-  4. Backprop only through the denoisers (VAE is frozen).
+Both stages are trained simultaneously per batch:
+  1. Run frozen VAE encoders → clean latents (posterior mean, no noise).
+  2. Sample random timesteps → add noise.
+  3. Each denoiser predicts the noise → MSE loss.
+  4. Backprop only through denoisers (VAE is frozen).
 
-Generation (end of training / TensorBoard):
-  1. Sample z_g  from StyleDenoiser prior (class-conditioned, DDPM chain).
-  2. Sample z_local from LatentPointDenoiser prior (z_g-conditioned, DDPM chain).
-  3. Decode z_local via the frozen VAE decoder.
+Generation (at inference / TensorBoard):
+  1. Sample z_g from StyleDenoiser (class-conditioned, DDPM chain).
+  2. Sample z_l from FlatDenoiser  (z_g-conditioned, DDPM chain).
+  3. Decode via frozen VAE decoder → point cloud.
 """
 
 import argparse
@@ -38,7 +38,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from src.dataset import Ds_point_sampled_already
 from src.Vae import Vae, normalize_pc
-from src.Diffusion import LinearSchedule, CosineSchedule, StyleDenoiser, LatentPointDenoiser
+from src.Diffusion import LinearSchedule, StyleDenoiser, FlatDenoiser
 from src.metric import generation_metrics
 
 
@@ -54,33 +54,34 @@ class DiffusionConfig:
     log_dir:     str   = "logs_diff"
     data_root:   str   = "point_clouds"
 
-    # --- VAE architecture (must match the loaded checkpoint) ---
-    vae_latent_dim:  int = 3   # LION paper: latent_dim=3 (z_l lives in position space)
-    vae_style_dim:   int = 128   # must match train_vae.py style_dim
+    # --- VAE architecture (auto-read from checkpoint; these are fallback defaults) ---
+    vae_latent_size: int = 1024
+    vae_style_dim:   int = 128
     vae_in_channels: int = 6
+    vae_num_points:  int = 2048
 
     # --- diffusion schedule ---
     T:           int   = 1000
 
-    # --- Style denoiser (Stage 1) ---
+    # --- Style denoiser (Stage 1: class → z_g) ---
     num_classes:    int   = 55
     style_hidden:   int   = 512
     style_layers:   int   = 6
     cfg_dropout:    float = 0.1
-    guidance:       float = 3.0    # CFG scale at inference
+    guidance:       float = 3.0
 
-    # --- Latent point denoiser (Stage 2) ---
-    point_hidden:   int   = 256
-    point_layers:   int   = 8
+    # --- Flat shape denoiser (Stage 2: z_g → z_l) ---
+    shape_hidden:   int   = 512
+    shape_layers:   int   = 8
 
     # --- training ---
     epochs:         int   = 300
     batch_size:     int   = 16
-    lr:             float = 1e-4
+    lr:             float = 2e-4
     weight_decay:   float = 1e-4
     warmup_epochs:  int   = 10
     grad_clip:      float = 1.0
-    ema_decay:      float = 0.9999  # base EMA decay; effective decay warms up from low
+    ema_decay:      float = 0.9999
 
     # --- data ---
     val_split:   float = 0.1
@@ -92,18 +93,16 @@ class DiffusionConfig:
     save_every:  int   = 10
     log_every:   int   = 50
     device:      str   = "cuda"
-    amp:         bool  = True
+    amp:         bool  = False
     resume:      int   = 0
 
     # --- generation visualization ---
-    vis_every:      int   = 10    # log generated meshes every N epochs
-    vis_per_class:  int   = 2     # samples per class to visualize
+    vis_every:      int   = 10
+    vis_per_class:  int   = 2
 
     # --- generation metrics (MMD / COV / 1-NNA) ---
-    # Computed every gen_metrics_every epochs. Expensive (runs full DDPM chains).
-    # Set to 0 to disable.
     gen_metrics_every: int = 25
-    gen_metrics_n:     int = 512  # number of shapes to generate for evaluation
+    gen_metrics_n:     int = 512
 
 
 # ============================================================
@@ -113,57 +112,37 @@ class DiffusionConfig:
 @torch.no_grad()
 def extract_latents(vae: Vae, points: torch.Tensor, stats: dict | None = None):
     """
-    Run the frozen VAE encoder and return CLEAN latents (posterior mean, no sampling).
-
-    Using the mean rather than a sample is the standard approach when training
-    a latent diffusion model (Stable Diffusion does the same).  It gives the
-    diffusion a deterministic, noise-free target and makes training more stable.
-
-    If ``stats`` is given the latents are standardised to zero-mean / unit-std
-    (per channel). This is ESSENTIAL: the DDPM cosine schedule assumes the data
-    has unit variance. z_g in particular is dominated by a large per-dim mean
-    (||mean|| ~ 11.5) with tiny variance (~0.18); without standardisation the
-    style DDPM cannot reproduce its scale and generation collapses.
+    Run the frozen VAE encoders and return clean latents (posterior mean).
 
     Returns
     -------
-    z_g  (B, style_dim)            global style posterior mean (standardised if stats)
-    z_l  (B, N, 3 + latent_dim)   local posterior mean (standardised if stats)
+    z_g  (B, style_dim)    global style posterior mean
+    z_l  (B, latent_size)  flat shape posterior mean
     """
     x_norm  = normalize_pc(points)
-    mu_g, _ = vae.global_encoder(x_norm)         # (B, style_dim)
-    mu_l, _ = vae.local_encoder(x_norm, mu_g)    # (B, N, total_z_dim) — raw deltas
-    # Apply the LION position skip (mirrors Vae.forward exactly).
-    # Use vae.skip_weight so this ALWAYS matches the value the VAE trained with.
-    xyz_anchor = x_norm[..., :3]
-    z_l = mu_l.clone()
-    z_l[..., :3] = xyz_anchor + vae.skip_weight * mu_l[..., :3]
+    mu_g, _ = vae.style_encoder(x_norm)   # (B, style_dim)
+    mu_l, _ = vae.shape_encoder(x_norm)   # (B, latent_size)
 
     if stats is not None:
         mu_g = (mu_g - stats["zg_mean"]) / stats["zg_std"]
-        z_l  = (z_l  - stats["zl_mean"]) / stats["zl_std"]
-    return mu_g, z_l
+        mu_l = (mu_l - stats["zl_mean"]) / stats["zl_std"]
+    return mu_g, mu_l
 
 
 @torch.no_grad()
 def compute_latent_stats(vae: Vae, loader: DataLoader, device: torch.device) -> dict:
-    """
-    Compute per-channel mean/std of the (raw) latents over the training set.
-    z_g stats: (style_dim,);  z_l stats: (3 + latent_dim,) shared across points.
-    std is floored at 1e-2 so near-constant channels don't blow up on division.
-    """
+    """Per-channel mean/std of latents over the training set."""
     zg_sum = zg_sq = None; zg_n = 0
     zl_sum = zl_sq = None; zl_n = 0
     for points, _ in loader:
         points = points.to(device)
-        zg, zl = extract_latents(vae, points)            # raw
-        zlf = zl.reshape(-1, zl.shape[-1])               # (B*N, C)
-        zg_sum = zg.sum(0)  if zg_sum is None else zg_sum + zg.sum(0)
-        zg_sq  = (zg*zg).sum(0) if zg_sq is None else zg_sq + (zg*zg).sum(0)
+        zg, zl = extract_latents(vae, points)    # raw (B, style_dim), (B, latent_size)
+        zg_sum = zg.sum(0)       if zg_sum is None else zg_sum + zg.sum(0)
+        zg_sq  = (zg*zg).sum(0) if zg_sq  is None else zg_sq  + (zg*zg).sum(0)
         zg_n  += zg.shape[0]
-        zl_sum = zlf.sum(0) if zl_sum is None else zl_sum + zlf.sum(0)
-        zl_sq  = (zlf*zlf).sum(0) if zl_sq is None else zl_sq + (zlf*zlf).sum(0)
-        zl_n  += zlf.shape[0]
+        zl_sum = zl.sum(0)       if zl_sum is None else zl_sum + zl.sum(0)
+        zl_sq  = (zl*zl).sum(0) if zl_sq  is None else zl_sq  + (zl*zl).sum(0)
+        zl_n  += zl.shape[0]
     zg_mean = zg_sum / zg_n
     zg_std  = (zg_sq / zg_n - zg_mean**2).clamp(min=1e-4).sqrt().clamp(min=1e-2)
     zl_mean = zl_sum / zl_n
@@ -184,12 +163,11 @@ def denorm_zl(z_l: torch.Tensor, stats: dict | None) -> torch.Tensor:
 # ============================================================
 
 def diffusion_loss(
-    schedule:   LinearSchedule,
-    denoiser:   nn.Module,
-    x0:         torch.Tensor,
-    condition:  torch.Tensor,
+    schedule:  LinearSchedule,
+    denoiser:  nn.Module,
+    x0:        torch.Tensor,
+    condition: torch.Tensor,
 ) -> torch.Tensor:
-    """Simple DDPM ε-prediction MSE loss."""
     B  = x0.shape[0]
     t  = torch.randint(0, schedule.T, (B,), device=x0.device)
     xt, noise = schedule.q_sample(x0, t)
@@ -222,50 +200,40 @@ def _side_by_side(clouds, colors, gap=2.5):
 
 @torch.no_grad()
 def log_generations(
-    writer:         SummaryWriter,
-    schedule:       LinearSchedule,
-    style_dn:       StyleDenoiser,
-    point_dn:       LatentPointDenoiser,
-    vae:            Vae,
-    cfg:            DiffusionConfig,
-    epoch:          int,
-    device:         torch.device,
-    class_names:    dict,          # idx → name string
+    writer:      SummaryWriter,
+    schedule:    LinearSchedule,
+    style_dn:    StyleDenoiser,
+    shape_dn:    FlatDenoiser,
+    vae:         Vae,
+    cfg:         DiffusionConfig,
+    epoch:       int,
+    device:      torch.device,
+    class_names: dict,
     stats=None,
 ):
-    """
-    For a handful of classes, generate shapes via the full two-stage chain
-    and log them to TensorBoard alongside a real sample from that class.
-    """
-    style_dn.eval(); point_dn.eval(); vae.eval()
-
-    # Pick a few representative classes
+    style_dn.eval(); shape_dn.eval(); vae.eval()
     show_classes = list(range(min(4, cfg.num_classes)))
-    N        = 2048
-    total_zl = vae.total_z_dim   # 3 + latent_dim
+    latent_size  = vae.latent_size
 
     for cls_idx in show_classes:
         B   = cfg.vis_per_class
         cls = torch.full((B,), cls_idx, device=device, dtype=torch.long)
 
-        # --- Stage 1: sample z_g ---
         uncond = style_dn.uncond(B, device)
         z_g    = schedule.sample(
             style_dn, (vae.style_dim,),
             condition=cls, uncond=uncond,
             guidance=cfg.guidance, device=device,
-        )   # (B, style_dim)
-
-        # --- Stage 2: sample z_local conditioned on z_g ---
-        z_local = schedule.sample(
-            point_dn, (N, total_zl),
+        )
+        z_l    = schedule.sample(
+            shape_dn, (latent_size,),
             condition=z_g, device=device,
-        )   # (B, N, 3+latent_dim)
+        )
 
-        # --- Decode (denormalise latents first) ---
-        xyz_out, _ = vae.decoder(denorm_zl(z_local, stats), denorm_zg(z_g, stats))
-        xyz_out    = xyz_out.float().cpu()   # (B, N, 3)
+        xyz_out = vae.decoder(denorm_zl(z_l, stats), denorm_zg(z_g, stats))
+        xyz_out = xyz_out.float().cpu()
 
+        N = xyz_out.shape[1]
         for i in range(B):
             gen_v = xyz_out[i]
             gen_c = torch.tensor([[0, 80, 220]], dtype=torch.uint8).expand(N, -1)
@@ -276,7 +244,7 @@ def log_generations(
                 vertices=verts, colors=clrs, global_step=epoch,
             )
 
-    style_dn.train(); point_dn.train()
+    style_dn.train(); shape_dn.train()
 
 
 # ============================================================
@@ -287,7 +255,7 @@ def train_one_epoch(
     vae:       Vae,
     schedule:  LinearSchedule,
     style_dn:  StyleDenoiser,
-    point_dn:  LatentPointDenoiser,
+    shape_dn:  FlatDenoiser,
     loader:    DataLoader,
     opt_s:     torch.optim.Optimizer,
     opt_p:     torch.optim.Optimizer,
@@ -297,10 +265,10 @@ def train_one_epoch(
     logger:    logging.Logger,
     device:    torch.device,
     ema_style=None,
-    ema_point=None,
+    ema_shape=None,
     stats=None,
 ) -> dict:
-    style_dn.train(); point_dn.train()
+    style_dn.train(); shape_dn.train()
     totals    = {}
     n_batches = 0
 
@@ -308,10 +276,8 @@ def train_one_epoch(
         points    = points.to(device, non_blocking=True)
         class_idx = class_idx.to(device, non_blocking=True)
 
-        # --- Extract clean (standardised) latents from frozen VAE ---
-        z_g, z_local = extract_latents(vae, points, stats)
+        z_g, z_l = extract_latents(vae, points, stats)
 
-        # --- Stage 1: style DDPM loss ---
         with torch.autocast(device_type=device.type, enabled=cfg.amp):
             loss_s = diffusion_loss(schedule, style_dn, z_g, class_idx)
 
@@ -321,25 +287,24 @@ def train_one_epoch(
         nn.utils.clip_grad_norm_(style_dn.parameters(), cfg.grad_clip)
         scaler.step(opt_s)
 
-        # --- Stage 2: latent point DDPM loss (condition on z_g mean) ---
         with torch.autocast(device_type=device.type, enabled=cfg.amp):
-            loss_p = diffusion_loss(schedule, point_dn, z_local, z_g)
+            loss_p = diffusion_loss(schedule, shape_dn, z_l, z_g)
 
         opt_p.zero_grad(set_to_none=True)
         scaler.scale(loss_p).backward()
         scaler.unscale_(opt_p)
-        nn.utils.clip_grad_norm_(point_dn.parameters(), cfg.grad_clip)
+        nn.utils.clip_grad_norm_(shape_dn.parameters(), cfg.grad_clip)
         scaler.step(opt_p)
 
         scaler.update()
 
         if ema_style is not None:
             ema_style.update_parameters(style_dn)
-        if ema_point is not None:
-            ema_point.update_parameters(point_dn)
+        if ema_shape is not None:
+            ema_shape.update_parameters(shape_dn)
 
         totals["loss_style"] = totals.get("loss_style", 0.0) + loss_s.item()
-        totals["loss_point"] = totals.get("loss_point", 0.0) + loss_p.item()
+        totals["loss_shape"] = totals.get("loss_shape", 0.0) + loss_p.item()
         n_batches += 1
 
         if (batch_idx + 1) % cfg.log_every == 0:
@@ -357,16 +322,16 @@ def validate(
     vae:       Vae,
     schedule:  LinearSchedule,
     style_dn:  StyleDenoiser,
-    point_dn:  LatentPointDenoiser,
+    shape_dn:  FlatDenoiser,
     loader:    DataLoader,
     cfg:       DiffusionConfig,
     device:    torch.device,
     compute_gen_metrics: bool = False,
     ema_style=None,
-    ema_point=None,
+    ema_shape=None,
     stats=None,
 ) -> dict:
-    style_dn.eval(); point_dn.eval()
+    style_dn.eval(); shape_dn.eval()
     totals    = {}
     n_batches = 0
     ref_clouds: list[torch.Tensor] = []
@@ -375,14 +340,14 @@ def validate(
         points    = points.to(device, non_blocking=True)
         class_idx = class_idx.to(device, non_blocking=True)
 
-        z_g, z_local = extract_latents(vae, points, stats)
+        z_g, z_l = extract_latents(vae, points, stats)
 
         with torch.autocast(device_type=device.type, enabled=cfg.amp):
             loss_s = diffusion_loss(schedule, style_dn, z_g, class_idx)
-            loss_p = diffusion_loss(schedule, point_dn, z_local, z_g)
+            loss_p = diffusion_loss(schedule, shape_dn, z_l, z_g)
 
         totals["loss_style"] = totals.get("loss_style", 0.0) + loss_s.item()
-        totals["loss_point"] = totals.get("loss_point", 0.0) + loss_p.item()
+        totals["loss_shape"] = totals.get("loss_shape", 0.0) + loss_p.item()
         n_batches += 1
 
         if compute_gen_metrics:
@@ -392,9 +357,9 @@ def validate(
 
     if compute_gen_metrics:
         gen_style = ema_style.module if ema_style is not None else style_dn
-        gen_point = ema_point.module if ema_point is not None else point_dn
+        gen_shape = ema_shape.module if ema_shape is not None else shape_dn
         out.update(_eval_generation(
-            schedule, gen_style, gen_point, vae, ref_clouds, cfg, device, stats=stats
+            schedule, gen_style, gen_shape, vae, ref_clouds, cfg, device, stats=stats
         ))
 
     return out
@@ -402,50 +367,35 @@ def validate(
 
 @torch.no_grad()
 def _eval_generation(
-    schedule:  LinearSchedule,
-    style_dn:  StyleDenoiser,
-    point_dn:  LatentPointDenoiser,
-    vae:       Vae,
+    schedule:   LinearSchedule,
+    style_dn:   StyleDenoiser,
+    shape_dn:   FlatDenoiser,
+    vae:        Vae,
     ref_clouds: list[torch.Tensor],
-    cfg:       DiffusionConfig,
-    device:    torch.device,
-    n_gen:     int = 512,
+    cfg:        DiffusionConfig,
+    device:     torch.device,
+    n_gen:      int = 512,
     stats=None,
 ) -> dict:
-    """
-    Generate n_gen shapes from the prior and compute MMD / COV / 1-NNA
-    against the reference (val) set.
+    latent_size = vae.latent_size
+    gen_clouds  = []
 
-    MMD  — Minimum Matching Distance: mean CD from each real to its closest generated.
-           Lower = better quality.
-    COV  — Coverage: fraction of real clouds matched by at least one generated cloud.
-           Higher = better diversity.
-    1-NNA — 1-NN accuracy in gen∪ref space.
-           Closer to 0.5 = better (generated and real are indistinguishable).
-    """
-    N        = ref_clouds[0].shape[1]   # points per cloud  (shape: batch, N, 3)
-    total_zl = vae.total_z_dim          # 3 + latent_dim
-
-    gen_clouds = []
     for start in range(0, n_gen, cfg.batch_size):
         B   = min(cfg.batch_size, n_gen - start)
         cls = torch.randint(0, cfg.num_classes, (B,), device=device)
 
         uncond = style_dn.uncond(B, device)
-        z_g    = schedule.sample(style_dn, (cfg.vae_style_dim,),
+        z_g    = schedule.sample(style_dn, (vae.style_dim,),
                                  condition=cls, uncond=uncond,
                                  guidance=cfg.guidance, device=device)
-        # z_g is standardised; condition the point denoiser on the standardised
-        # value (matches training), then denormalise both before decoding.
-        z_l    = schedule.sample(point_dn, (N, total_zl),
+        z_l    = schedule.sample(shape_dn, (latent_size,),
                                  condition=z_g, device=device)
-        xyz, _ = vae.decoder(denorm_zl(z_l, stats), denorm_zg(z_g, stats))
+        xyz    = vae.decoder(denorm_zl(z_l, stats), denorm_zg(z_g, stats))
         gen_clouds.append(xyz.float().cpu())
 
-    gen = torch.cat(gen_clouds, dim=0)             # (n_gen, N, 3)
-    ref = torch.cat(ref_clouds, dim=0)             # (R, N, 3)
+    gen = torch.cat(gen_clouds, dim=0)
+    ref = torch.cat(ref_clouds, dim=0)
 
-    # Subsample ref to same size as gen to keep 1-NNA balanced
     if len(ref) > n_gen:
         idx = torch.randperm(len(ref))[:n_gen]
         ref = ref[idx]
@@ -494,26 +444,26 @@ def main(cfg: DiffusionConfig) -> None:
     if not os.path.exists(cfg.vae_ckpt):
         raise FileNotFoundError(
             f"VAE checkpoint not found: {cfg.vae_ckpt}\n"
-            "Run train_vae.py first and pass --vae_ckpt to this script."
+            "Run train_vae.py first."
         )
     ckpt = torch.load(cfg.vae_ckpt, map_location=device, weights_only=False)
 
-    # Read architecture hyperparams saved inside the checkpoint so that
-    # vae_latent_dim / vae_style_dim / vae_in_channels never need to be
-    # specified manually — they always match the trained weights.
     saved_cfg = ckpt.get("config", {})
-    vae_latent_dim  = saved_cfg.get("latent_dim",  cfg.vae_latent_dim)
-    vae_style_dim   = saved_cfg.get("style_dim",   cfg.vae_style_dim)
-    vae_in_channels = saved_cfg.get("in_channels", cfg.vae_in_channels)
+    vae_latent_size  = saved_cfg.get("latent_size",  cfg.vae_latent_size)
+    vae_style_dim    = saved_cfg.get("style_dim",    cfg.vae_style_dim)
+    vae_in_channels  = saved_cfg.get("in_channels",  cfg.vae_in_channels)
+    vae_num_points   = saved_cfg.get("num_points",   cfg.vae_num_points)
     logger.info(
-        f"VAE arch from checkpoint: latent_dim={vae_latent_dim} "
-        f"style_dim={vae_style_dim} in_channels={vae_in_channels}"
+        f"VAE arch from checkpoint: latent_size={vae_latent_size} "
+        f"style_dim={vae_style_dim} in_channels={vae_in_channels} "
+        f"num_points={vae_num_points}"
     )
 
     vae = Vae(
-        latent_dim=vae_latent_dim,
+        latent_size=vae_latent_size,
         style_dim=vae_style_dim,
         in_channels=vae_in_channels,
+        num_points=vae_num_points,
     ).to(device)
     vae.load_state_dict(ckpt["model"])
     vae.eval()
@@ -521,13 +471,12 @@ def main(cfg: DiffusionConfig) -> None:
         p.requires_grad_(False)
     logger.info(f"VAE loaded from {cfg.vae_ckpt}  (frozen)")
 
-    # ---- Class name map for logging --------------------------------
     from src.dataset import Ds_point_model
     idx_to_name = {idx: name for idx, (_, name) in
                    enumerate(Ds_point_model.map().items())}
 
     # ---- Diffusion models -----------------------------------------
-    schedule  = LinearSchedule(T=cfg.T).to(device)   # LION uses linear, not cosine
+    schedule  = LinearSchedule(T=cfg.T).to(device)
 
     style_dn  = StyleDenoiser(
         style_dim=vae_style_dim,
@@ -538,25 +487,19 @@ def main(cfg: DiffusionConfig) -> None:
         cfg_dropout=cfg.cfg_dropout,
     ).to(device)
 
-    point_dn  = LatentPointDenoiser(
-        point_dim=vae.total_z_dim,   # 3 + latent_dim; read from loaded VAE
+    shape_dn  = FlatDenoiser(
+        latent_size=vae_latent_size,
         style_dim=vae_style_dim,
-        hidden=cfg.point_hidden,
-        n_layers=cfg.point_layers,
+        hidden=cfg.shape_hidden,
+        n_layers=cfg.shape_layers,
         T=cfg.T,
     ).to(device)
 
-    logger.info(f"StyleDenoiser      params: {count_parameters(style_dn):,}")
-    logger.info(f"LatentPointDenoiser params: {count_parameters(point_dn):,}")
+    logger.info(f"StyleDenoiser  params: {count_parameters(style_dn):,}")
+    logger.info(f"FlatDenoiser   params: {count_parameters(shape_dn):,}")
 
     from torch.optim.swa_utils import AveragedModel
 
-    # Warmup-aware EMA: the effective decay starts low and grows toward
-    # `base_decay` as training proceeds. A fixed decay of 0.9999 needs ~10k
-    # update steps to mean anything — on short runs the EMA stays ~equal to the
-    # random initialisation and produces degenerate (cube-shaped) samples.
-    # decay_t = min(base_decay, (1 + n) / (10 + n)) tracks the model early and
-    # smooths late, so generation works for both short and long runs.
     def make_ema_avg(base_decay: float):
         def ema_avg(avg_p, p, num_averaged):
             n = float(num_averaged.item() if hasattr(num_averaged, "item") else num_averaged)
@@ -565,7 +508,7 @@ def main(cfg: DiffusionConfig) -> None:
         return ema_avg
 
     ema_style = AveragedModel(style_dn, avg_fn=make_ema_avg(cfg.ema_decay))
-    ema_point = AveragedModel(point_dn, avg_fn=make_ema_avg(cfg.ema_decay))
+    ema_shape = AveragedModel(shape_dn, avg_fn=make_ema_avg(cfg.ema_decay))
 
     # ---- Data ---------------------------------------------------------
     base_ds = Ds_point_sampled_already(root=cfg.data_root, augment=False)
@@ -585,16 +528,15 @@ def main(cfg: DiffusionConfig) -> None:
                             num_workers=cfg.num_workers, pin_memory=cfg.pin_memory)
     logger.info(f"Dataset: {len(train_idx)} train / {len(val_idx)} val")
 
-    # ---- Latent standardisation stats (ESSENTIAL for the DDPM) ----
-    # Computed once on the training latents and reused at sampling time.
+    # ---- Latent standardisation -----------------------------------
     stats = compute_latent_stats(vae, trn_loader, device)
     logger.info(
         f"Latent stats | z_g: ||mean||={stats['zg_mean'].norm():.2f} "
         f"std∈[{stats['zg_std'].min():.3f},{stats['zg_std'].max():.3f}] | "
-        f"z_l: std={[round(s,3) for s in stats['zl_std'].tolist()]}"
+        f"z_l: std_mean={stats['zl_std'].mean():.3f}"
     )
 
-    # ---- Optimisers (separate per model) ---------------------------
+    # ---- Optimisers -------------------------------------------------
     def make_opt_sched(model):
         opt    = AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
         warmup = LinearLR(opt, start_factor=1e-3, end_factor=1.0,
@@ -606,7 +548,7 @@ def main(cfg: DiffusionConfig) -> None:
         return opt, sched
 
     opt_s, sched_s = make_opt_sched(style_dn)
-    opt_p, sched_p = make_opt_sched(point_dn)
+    opt_p, sched_p = make_opt_sched(shape_dn)
     scaler = torch.amp.GradScaler("cuda", enabled=cfg.amp and device.type == "cuda")
 
     # ---- Resume ---------------------------------------------------
@@ -618,11 +560,11 @@ def main(cfg: DiffusionConfig) -> None:
     if os.path.exists(resume_path) and cfg.resume:
         ckpt_d = torch.load(resume_path, map_location=device, weights_only=False)
         style_dn.load_state_dict(ckpt_d["style_dn"])
-        point_dn.load_state_dict(ckpt_d["point_dn"])
+        shape_dn.load_state_dict(ckpt_d["shape_dn"])
         if "ema_style" in ckpt_d:
             ema_style.load_state_dict(ckpt_d["ema_style"])
-        if "ema_point" in ckpt_d:
-            ema_point.load_state_dict(ckpt_d["ema_point"])
+        if "ema_shape" in ckpt_d:
+            ema_shape.load_state_dict(ckpt_d["ema_shape"])
         opt_s.load_state_dict(ckpt_d["opt_s"])
         opt_p.load_state_dict(ckpt_d["opt_p"])
         sched_s.load_state_dict(ckpt_d["sched_s"])
@@ -638,14 +580,14 @@ def main(cfg: DiffusionConfig) -> None:
         t0 = time.time()
 
         trn = train_one_epoch(
-            vae, schedule, style_dn, point_dn,
+            vae, schedule, style_dn, shape_dn,
             trn_loader, opt_s, opt_p, scaler, cfg, epoch, logger, device,
-            ema_style=ema_style, ema_point=ema_point, stats=stats,
+            ema_style=ema_style, ema_shape=ema_shape, stats=stats,
         )
         compute_gen = (cfg.gen_metrics_every > 0 and epoch % cfg.gen_metrics_every == 0)
-        val = validate(vae, schedule, style_dn, point_dn, val_loader, cfg, device,
+        val = validate(vae, schedule, style_dn, shape_dn, val_loader, cfg, device,
                        compute_gen_metrics=compute_gen,
-                       ema_style=ema_style, ema_point=ema_point, stats=stats)
+                       ema_style=ema_style, ema_shape=ema_shape, stats=stats)
 
         sched_s.step(); sched_p.step()
         elapsed = time.time() - t0
@@ -657,17 +599,17 @@ def main(cfg: DiffusionConfig) -> None:
         )
 
         writer.add_scalar("train/lr_style", sched_s.get_last_lr()[0], epoch)
-        writer.add_scalar("train/lr_point", sched_p.get_last_lr()[0], epoch)
+        writer.add_scalar("train/lr_shape", sched_p.get_last_lr()[0], epoch)
         log_metrics(writer, trn, "train", epoch)
         log_metrics(writer, val, "val",   epoch)
 
         if epoch % cfg.vis_every == 0:
             log_generations(
-                writer, schedule, ema_style.module, ema_point.module, vae, cfg, epoch,
+                writer, schedule, ema_style.module, ema_shape.module, vae, cfg, epoch,
                 device, idx_to_name, stats=stats,
             )
 
-        val_loss = val.get("loss_style", math.inf) + val.get("loss_point", math.inf)
+        val_loss = val.get("loss_style", math.inf) + val.get("loss_shape", math.inf)
         is_best  = val_loss < best_val_loss
         if is_best:
             best_val_loss = val_loss
@@ -676,9 +618,9 @@ def main(cfg: DiffusionConfig) -> None:
         save_state = {
             "epoch":         epoch,
             "style_dn":      style_dn.state_dict(),
-            "point_dn":      point_dn.state_dict(),
+            "shape_dn":      shape_dn.state_dict(),
             "ema_style":     ema_style.state_dict(),
-            "ema_point":     ema_point.state_dict(),
+            "ema_shape":     ema_shape.state_dict(),
             "opt_s":         opt_s.state_dict(),
             "opt_p":         opt_p.state_dict(),
             "sched_s":       sched_s.state_dict(),
@@ -710,7 +652,7 @@ def main(cfg: DiffusionConfig) -> None:
 
 def parse_args() -> DiffusionConfig:
     cfg = DiffusionConfig()
-    p   = argparse.ArgumentParser(description="Train LION two-stage diffusion")
+    p   = argparse.ArgumentParser(description="Train two-stage flat diffusion")
     for name, val in asdict(cfg).items():
         t = type(val)
         if t is bool:

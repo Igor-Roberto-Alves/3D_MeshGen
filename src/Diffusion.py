@@ -357,3 +357,56 @@ class LatentPointDenoiser(nn.Module):
         for block in self.blocks:
             h = block(h, cond)
         return self.output_proj(h).permute(0, 2, 1)  # (B, N, point_dim)
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Stage 2 (flat)  –  Flat Shape Denoiser   (z_g → z_l)
+# ────────────────────────────────────────────────────────────────────────────
+
+class FlatDenoiser(nn.Module):
+    """
+    ε-predictor for the flat shape latent z_l ∈ ℝ^{latent_size}.
+    Conditioned on z_g (global style) + timestep via MLPResBlocks.
+
+    Mirrors StyleDenoiser but uses z_g as conditioning instead of a class label,
+    and operates on latent_size instead of style_dim.
+    """
+
+    def __init__(
+        self,
+        latent_size: int,
+        style_dim:   int   = 128,
+        hidden:      int   = 512,
+        n_layers:    int   = 8,
+        T:           int   = 1000,
+    ):
+        super().__init__()
+        time_dim = hidden
+
+        self.time_mlp = nn.Sequential(
+            nn.Linear(time_dim, time_dim * 2), nn.SiLU(),
+            nn.Linear(time_dim * 2, time_dim),
+        )
+        self.cond_proj   = nn.Linear(time_dim + style_dim, time_dim)
+
+        self.input_proj  = nn.Linear(latent_size, hidden)
+        self.blocks      = nn.ModuleList([MLPResBlock(hidden, time_dim) for _ in range(n_layers)])
+        self.output_proj = nn.Linear(hidden, latent_size)
+        nn.init.zeros_(self.output_proj.weight)
+        nn.init.zeros_(self.output_proj.bias)
+
+    def forward(self, zt: torch.Tensor, t: torch.Tensor,
+                z_g: torch.Tensor) -> torch.Tensor:
+        """
+        zt:  (B, latent_size)
+        t:   (B,) long
+        z_g: (B, style_dim)
+        """
+        t_emb = sinusoidal_emb(t, self.time_mlp[0].in_features)
+        t_emb = self.time_mlp(t_emb)
+        cond  = self.cond_proj(torch.cat([t_emb, z_g], dim=-1))
+
+        h = self.input_proj(zt)
+        for block in self.blocks:
+            h = block(h, cond)
+        return self.output_proj(h)

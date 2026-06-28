@@ -208,3 +208,75 @@ class LIONDecoder(nn.Module):
         xyz_out = delta + xyz_init
         nrm_out = F.normalize(nrm_raw, dim=-1)
         return xyz_out, nrm_out
+
+
+# ---------------------------------------------------------------------------
+# Flat Decoder  (Real_latent — generates N points from flat (z_l, z_g))
+# ---------------------------------------------------------------------------
+
+class FlatDecoder(nn.Module):
+    """
+    Generates a point cloud from (z_l ∈ ℝ^{latent_size}, z_g ∈ ℝ^{style_dim}).
+
+    No coordinate shortcut — z_l and z_g are the sole information source.
+
+    Architecture
+    ------------
+    1. Broadcast z_l to N points via 1×1 Conv1d (every point sees the full latent).
+    2. Learnable seed_xyz provides the spatial reference for PVCNN voxelisation.
+       Initialised on the unit sphere so voxelisation is non-degenerate at epoch 0.
+    3. Three PVCNN stages conditioned on z_g (AdaGN).
+    4. Output head predicts a delta over seed_xyz → final positions.
+    """
+
+    def __init__(
+        self,
+        latent_size: int,
+        style_dim:   int,
+        num_points:  int = 2048,
+        hidden:      int = 256,
+    ):
+        super().__init__()
+        self.num_points = num_points
+
+        self.latent_expand = nn.Sequential(
+            nn.Conv1d(latent_size, hidden, 1, bias=False),
+            nn.GroupNorm(min(8, hidden), hidden),
+            nn.GELU(),
+        )
+
+        seed = torch.randn(1, num_points, 3)
+        seed = seed / seed.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+        self.seed_xyz = nn.Parameter(seed)
+
+        self.stage0 = PVConvBlockDecoder(hidden,      hidden,      style_dim, resolution=8)
+        self.stage1 = PVConvBlockDecoder(hidden,      hidden // 2, style_dim, resolution=16)
+        self.stage2 = PVConvBlockDecoder(hidden // 2, 64,          style_dim, resolution=32)
+
+        self.output_head = nn.Sequential(
+            nn.Conv1d(64, 64, 1), nn.GELU(),
+            nn.Conv1d(64,  3, 1),
+        )
+        nn.init.normal_(self.output_head[-1].weight, std=0.01)
+        nn.init.zeros_(self.output_head[-1].bias)
+
+    def forward(self, z_l: torch.Tensor, z_g: torch.Tensor) -> torch.Tensor:
+        """
+        z_l : (B, latent_size)
+        z_g : (B, style_dim)
+        Returns xyz_out (B, N, 3)
+        """
+        B = z_l.shape[0]
+        N = self.num_points
+
+        z_l_exp = z_l.unsqueeze(-1).expand(-1, -1, N)          # (B, latent_size, N)
+        feat    = self.latent_expand(z_l_exp).permute(0, 2, 1)  # (B, N, hidden)
+
+        xyz = self.seed_xyz.expand(B, -1, -1)                   # (B, N, 3)
+
+        feat = self.stage0(xyz, feat, z_g)
+        feat = self.stage1(xyz, feat, z_g)
+        feat = self.stage2(xyz, feat, z_g)
+
+        delta = self.output_head(feat.permute(0, 2, 1)).permute(0, 2, 1)  # (B, N, 3)
+        return xyz + delta
