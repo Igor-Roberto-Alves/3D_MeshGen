@@ -114,16 +114,45 @@ class SqueezeExcitation(nn.Module):
         return x * w
 
 
-class PointSelfAttention(nn.Module):
+class LinearAttention(nn.Module):
     """
-    Lightweight self-attention over M points.
-    Input/output: (B, M, C)
+    Linear-complexity attention (Shen et al. 2018 / lucidrains), O(N) in points.
+
+    Faithful port of LION's models/pvcnn2_ada.py::LinearAttention, but with a
+    (B, M, C) interface and a residual + LayerNorm wrapper so it is a drop-in
+    replacement for the previous dense MultiheadAttention.
+
+    Mechanism: softmax is applied to the KEYS over the point axis (not to the
+    full N x N score matrix), so the cost is O(N * d^2) instead of O(N^2 * d).
     """
-    def __init__(self, dim: int, num_heads: int = 4):
+    def __init__(self, dim: int, num_heads: int = 4, dim_head: int = 32):
         super().__init__()
-        self.attn = nn.MultiheadAttention(dim, num_heads, batch_first=True)
-        self.norm = nn.LayerNorm(dim)
+        self.heads = num_heads
+        hidden_dim = dim_head * num_heads
+        self.to_qkv = nn.Conv1d(dim, hidden_dim * 3, 1, bias=False)
+        self.to_out = nn.Conv1d(hidden_dim, dim, 1)
+        self.norm   = nn.LayerNorm(dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out, _ = self.attn(x, x, x)
+        # x: (B, M, C)
+        B, M, C = x.shape
+        h   = x.transpose(1, 2)                          # (B, C, M)
+        qkv = self.to_qkv(h)                             # (B, 3*hidden, M)
+        qkv = qkv.reshape(B, 3, self.heads, -1, M)       # (B,3,heads,dim_head,M)
+        q, k, v = qkv[:, 0], qkv[:, 1], qkv[:, 2]        # (B,heads,dim_head,M)
+
+        # The two einsums accumulate over the point axis and can overflow
+        # float16 under AMP (|values| > 65504 -> inf -> NaN). Run the attention
+        # math in float32 regardless of the autocast context, then cast back.
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            q, k, v = q.float(), k.float(), v.float()
+            k = k.softmax(dim=-1)                            # softmax over points
+            context = torch.einsum('bhdn,bhen->bhde', k, v)  # (B,heads,dh,dh)
+            out     = torch.einsum('bhde,bhdn->bhen', context, q)  # (B,heads,dh,M)
+            out     = out.reshape(B, -1, M)                  # (B, hidden, M)
+        out = self.to_out(out.to(h.dtype)).transpose(1, 2)   # (B, M, C)
         return self.norm(x + out)
+
+
+# Backwards-compatible alias: existing call sites import PointSelfAttention.
+PointSelfAttention = LinearAttention

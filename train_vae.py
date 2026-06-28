@@ -296,9 +296,12 @@ def log_latent_analysis(writer, model, loader, device, epoch):
     for d, v in enumerate(kl_global[:32].tolist()):
         writer.add_scalar(f"latent/kl_global_dim{d}", v, epoch)
 
-    # Histogram of per-dim KL (most compact summary)
-    writer.add_histogram("latent/kl_local_hist",  kl_local,  epoch)
-    writer.add_histogram("latent/kl_global_hist", kl_global, epoch)
+    # Histogram of per-dim KL (most compact summary).
+    # Guard against NaN/Inf: add_histogram raises on non-finite values.
+    if torch.isfinite(kl_local).all():
+        writer.add_histogram("latent/kl_local_hist",  kl_local,  epoch)
+    if torch.isfinite(kl_global).all():
+        writer.add_histogram("latent/kl_global_hist", kl_global, epoch)
 
     model.train()
 
@@ -398,6 +401,12 @@ def train_one_epoch(model, loader, optimiser, scaler, cfg, epoch, logger, device
                 normal_weight=cfg.normal_weight,
             )
 
+        # NaN/Inf guard: skip the batch instead of letting it poison the weights.
+        if not torch.isfinite(losses["total"]):
+            optimiser.zero_grad(set_to_none=True)
+            logger.warning(f"  Epoch {epoch:03d}  Batch {batch_idx+1}: loss não-finita, batch ignorado")
+            continue
+
         optimiser.zero_grad(set_to_none=True)
         scaler.scale(losses["total"]).backward()
         scaler.unscale_(optimiser)
@@ -406,7 +415,14 @@ def train_one_epoch(model, loader, optimiser, scaler, cfg, epoch, logger, device
         if writer is not None and (batch_idx + 1) % cfg.log_every == 0:
             log_gradient_norms(writer, model, epoch * len(loader) + batch_idx)
 
-        nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+        # Clip; if grads are non-finite, skip the optimiser step (AMP-safe).
+        grad_norm = nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+        if not torch.isfinite(grad_norm):
+            optimiser.zero_grad(set_to_none=True)
+            scaler.update()
+            logger.warning(f"  Epoch {epoch:03d}  Batch {batch_idx+1}: grad não-finito, step ignorado")
+            continue
+
         scaler.step(optimiser)
         scaler.update()
 

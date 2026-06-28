@@ -36,6 +36,14 @@ def save_ply(xyz: torch.Tensor, path: str):
     o3d.io.write_point_cloud(path, pcd)
 
 
+def denorm_zg(z_g, stats):
+    return z_g if stats is None else z_g * stats["zg_std"] + stats["zg_mean"]
+
+
+def denorm_zl(z_l, stats):
+    return z_l if stats is None else z_l * stats["zl_std"] + stats["zl_mean"]
+
+
 def load_models(args, device):
     # ── VAE ──────────────────────────────────────────────────
     vae_ckpt = torch.load(args.vae_ckpt, map_location=device, weights_only=False)
@@ -74,20 +82,39 @@ def load_models(args, device):
         T          = diff_cfg.get("T", 1000),
     ).to(device)
 
-    # prefer EMA weights if available
-    sd_style = diff_ckpt.get("ema_style", diff_ckpt.get("style_dn"))
-    sd_point = diff_ckpt.get("ema_point", diff_ckpt.get("point_dn"))
+    # EMA weights are only trustworthy once the EMA has warmed up. On short
+    # runs the EMA stays ~equal to the random init and produces cube-shaped
+    # garbage, so --use_ema False falls back to the raw trained weights.
+    if args.use_ema and "ema_style" in diff_ckpt:
+        sd_style, sd_point = diff_ckpt["ema_style"], diff_ckpt["ema_point"]
+        n_avg = int(diff_ckpt["ema_style"].get("n_averaged", torch.tensor(0)))
+        print(f"Usando pesos EMA (n_averaged={n_avg})")
+        if n_avg < 2000:
+            print(f"  AVISO: EMA com poucos updates ({n_avg}) pode gerar lixo. "
+                  f"Considere --use_ema False")
+    else:
+        sd_style, sd_point = diff_ckpt["style_dn"], diff_ckpt["point_dn"]
+        print("Usando pesos RAW (treinados)")
 
-    # AveragedModel wraps parameters under module.*
+    # AveragedModel wraps parameters under module.* and adds an n_averaged buffer
     def strip_module(sd):
-        return {k.replace("module.", ""): v for k, v in sd.items()}
+        return {k.replace("module.", ""): v for k, v in sd.items() if k != "n_averaged"}
 
     style_dn.load_state_dict(strip_module(sd_style))
     point_dn.load_state_dict(strip_module(sd_point))
     style_dn.eval(); point_dn.eval()
     print(f"Diffusion loaded from {args.diff_ckpt}")
 
-    return vae, schedule, style_dn, point_dn
+    # Latent standardisation stats (required to denormalise sampled latents).
+    stats = diff_ckpt.get("latent_stats")
+    if stats is not None:
+        stats = {k: v.to(device) for k, v in stats.items()}
+        print("Latent stats carregados (latentes serão desnormalizados)")
+    else:
+        print("AVISO: checkpoint sem latent_stats — geração pode ter escala errada "
+              "(retreine com a versão nova do train_diffusion.py)")
+
+    return vae, schedule, style_dn, point_dn, stats
 
 
 # ─────────────────────────────────────────────────────────────
@@ -96,7 +123,7 @@ def load_models(args, device):
 
 @torch.no_grad()
 def generate(vae, schedule, style_dn, point_dn, n_gen, guidance, device,
-             num_points=2048, batch_size=16):
+             num_points=2048, batch_size=16, stats=None):
     clouds = []
     total_zl = vae.total_z_dim
     num_classes = style_dn.uncond_idx  # = num_classes (before uncond token)
@@ -111,7 +138,9 @@ def generate(vae, schedule, style_dn, point_dn, n_gen, guidance, device,
                                  guidance=guidance, device=device)
         z_l    = schedule.sample(point_dn, (num_points, total_zl),
                                  condition=z_g, device=device)
-        xyz, _ = vae.decoder(z_l, z_g)
+        z_g_dec = denorm_zg(z_g, stats)
+        z_l_dec = denorm_zl(z_l, stats)
+        xyz, _ = vae.decoder(z_l_dec, z_g_dec)
         clouds.append(xyz.float().cpu())
         print(f"  generated {start + B}/{n_gen}", end="\r")
 
@@ -121,13 +150,12 @@ def generate(vae, schedule, style_dn, point_dn, n_gen, guidance, device,
 
 @torch.no_grad()
 def generate_per_class(vae, schedule, style_dn, point_dn, class_ids,
-                       n_per_class, guidance, device, num_points=2048):
+                       n_per_class, guidance, device, num_points=2048, stats=None):
     """Generate n_per_class samples for each class in class_ids."""
     results = {}
     total_zl = vae.total_z_dim
 
     for cls_idx in class_ids:
-        clouds = []
         cls = torch.full((n_per_class,), cls_idx, device=device, dtype=torch.long)
         uncond = style_dn.uncond(n_per_class, device)
         z_g = schedule.sample(style_dn, (vae.style_dim,),
@@ -135,7 +163,9 @@ def generate_per_class(vae, schedule, style_dn, point_dn, class_ids,
                               guidance=guidance, device=device)
         z_l = schedule.sample(point_dn, (num_points, total_zl),
                               condition=z_g, device=device)
-        xyz, _ = vae.decoder(z_l, z_g)
+        z_g_dec = denorm_zg(z_g, stats)
+        z_l_dec = denorm_zl(z_l, stats)
+        xyz, _ = vae.decoder(z_l_dec, z_g_dec)
         results[cls_idx] = xyz.float().cpu()
     return results
 
@@ -173,20 +203,23 @@ def main():
     p.add_argument("--num_points", type=int,   default=2048)
     p.add_argument("--save_ply",   action="store_true",
                    help="Save each generated cloud as a .ply file")
+    p.add_argument("--use_ema",    type=lambda x: x.lower() != "false", default=True,
+                   help="Use EMA weights (True) or raw trained weights (False). "
+                        "Use False for short runs where the EMA hasn't warmed up.")
     args = p.parse_args()
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     os.makedirs(args.out_dir, exist_ok=True)
 
     # ── Load ─────────────────────────────────────────────────
-    vae, schedule, style_dn, point_dn = load_models(args, device)
+    vae, schedule, style_dn, point_dn, stats = load_models(args, device)
 
     # ── Generate random samples ───────────────────────────────
     print(f"\nGerando {args.n_gen} amostras (guidance={args.guidance})...")
     gen = generate(vae, schedule, style_dn, point_dn,
                    n_gen=args.n_gen, guidance=args.guidance,
                    device=device, num_points=args.num_points,
-                   batch_size=args.batch_size)
+                   batch_size=args.batch_size, stats=stats)
     print(f"  shape gerada: {gen.shape}")
 
     # ── Per-class generation ──────────────────────────────────
@@ -202,7 +235,7 @@ def main():
     per_class = generate_per_class(vae, schedule, style_dn, point_dn,
                                    class_ids=present_ids, n_per_class=8,
                                    guidance=args.guidance, device=device,
-                                   num_points=args.num_points)
+                                   num_points=args.num_points, stats=stats)
 
     for cls_idx, xyz in per_class.items():
         name = idx_to_name.get(cls_idx, str(cls_idx))

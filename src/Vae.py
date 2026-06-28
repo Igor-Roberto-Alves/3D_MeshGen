@@ -48,6 +48,10 @@ class Vae(nn.Module):
         self.style_dim   = style_dim
         self.latent_dim  = latent_dim
         self.total_z_dim = 3 + latent_dim   # full channels of z_l
+        # LION position-skip weight (default_config.py: skip_weight = 0.1).
+        # Centralised here so forward(), reconstruct() and the diffusion
+        # latent extraction all use the SAME value (they MUST match).
+        self.skip_weight = 0.1
 
         self.global_encoder = GlobalEncoder(in_channels, style_dim)
         # LocalEncoder outputs (3 + latent_dim) channels with position anchor.
@@ -92,7 +96,7 @@ class Vae(nn.Module):
         # Feature channels (3:) are passed as-is (no position constraint).
         xyz_anchor = x[..., :3]
         z_l = delta.clone()
-        z_l[..., :3] = xyz_anchor + 0.01 * delta[..., :3]
+        z_l[..., :3] = xyz_anchor + self.skip_weight * delta[..., :3]
 
         # Optional position noise: breaks shortcut, forces decoder to use z_g.
         if pos_noise_std > 0.0 and self.training:
@@ -116,7 +120,7 @@ class Vae(nn.Module):
         mu_l, _  = self.local_encoder(x, mu_g)   # raw deltas (≈0 at init)
         xyz_anchor = x[..., :3]
         z_l        = mu_l.clone()
-        z_l[..., :3] = xyz_anchor + 0.01 * mu_l[..., :3]
+        z_l[..., :3] = xyz_anchor + self.skip_weight * mu_l[..., :3]
         xyz_out, nrm_out = self.decoder(z_l, mu_g)
         return xyz_out, nrm_out
 

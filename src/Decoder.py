@@ -4,16 +4,36 @@ import torch.nn.functional as F
 from src.utils import AdaGN, SqueezeExcitation
 
 
-class SharedMLP(nn.Sequential):
-    def __init__(self, channels, bn=True, act=True):
-        layers = []
+class SharedMLP(nn.Module):
+    """
+    Point-wise MLP (1x1 Conv1d) operating on (B, C, N).
+
+    BatchNorm1d was replaced by AdaGN: when ``style_dim`` is given each layer is
+    normalised with Adaptive GroupNorm conditioned on the global style z_g
+    (matches the rest of the decoder). When ``style_dim`` is None it falls back
+    to plain GroupNorm. This removes the small-batch instability of BatchNorm.
+    """
+    def __init__(self, channels, style_dim: int | None = None, act: bool = True):
+        super().__init__()
+        self.style_dim = style_dim
+        self.convs = nn.ModuleList()
+        self.norms = nn.ModuleList()
+        self.act   = nn.GELU() if act else nn.Identity()
         for i in range(len(channels) - 1):
-            layers.append(nn.Conv1d(channels[i], channels[i + 1], 1, bias=not bn))
-            if bn:
-                layers.append(nn.BatchNorm1d(channels[i + 1]))
-            if act:
-                layers.append(nn.GELU())
-        super().__init__(*layers)
+            cout = channels[i + 1]
+            self.convs.append(nn.Conv1d(channels[i], cout, 1, bias=False))
+            if style_dim is None:
+                self.norms.append(nn.GroupNorm(min(8, cout), cout))
+            else:
+                self.norms.append(AdaGN(cout, style_dim, num_groups=min(8, cout)))
+
+    def forward(self, x: torch.Tensor, style: torch.Tensor | None = None) -> torch.Tensor:
+        # x: (B, C, N)
+        for conv, norm in zip(self.convs, self.norms):
+            x = conv(x)
+            x = norm(x, style) if self.style_dim is not None else norm(x)
+            x = self.act(x)
+        return x
 
 
 class VoxelBranch(nn.Module):
@@ -65,12 +85,13 @@ class VoxelBranch(nn.Module):
 
 
 class PointBranch(nn.Module):
-    def __init__(self, feat_channels, out_channels):
+    def __init__(self, feat_channels, out_channels, style_dim: int | None = None):
         super().__init__()
-        self.mlp = SharedMLP([feat_channels, out_channels * 2, out_channels])
+        self.mlp = SharedMLP([feat_channels, out_channels * 2, out_channels],
+                             style_dim=style_dim)
 
-    def forward(self, xyz, feat):
-        return self.mlp(feat.permute(0, 2, 1)).permute(0, 2, 1)
+    def forward(self, xyz, feat, style=None):
+        return self.mlp(feat.permute(0, 2, 1), style).permute(0, 2, 1)
 
 
 class PVConvBlockDecoder(nn.Module):
@@ -79,7 +100,7 @@ class PVConvBlockDecoder(nn.Module):
         super().__init__()
         half = feat_out // 2
         self.voxel   = VoxelBranch(feat_in, half, resolution)
-        self.point   = PointBranch(feat_in, half)
+        self.point   = PointBranch(feat_in, half, style_dim=style_dim)
         self.adagn   = AdaGN(num_channels=feat_out, style_dim=style_dim, num_groups=8)
         self.act     = nn.GELU()
         self.conv    = nn.Conv1d(feat_out, feat_out, 1)
@@ -87,7 +108,7 @@ class PVConvBlockDecoder(nn.Module):
 
     def forward(self, xyz, feat, style):
         v = self.voxel(xyz, feat)
-        p = self.point(xyz, feat)
+        p = self.point(xyz, feat, style)
         x = torch.cat([v, p], dim=2).permute(0, 2, 1)  # (B, feat_out, N)
         x = self.adagn(x, style)
         return self.dropout(self.conv(self.act(x))).permute(0, 2, 1)  # (B, N, feat_out)
@@ -124,7 +145,8 @@ class LIONDecoder(nn.Module):
 
         # feat_proj maps the FEATURE part of z_l (latent_dim channels) to 256-dim.
         # The POSITION part (first 3 channels) is used directly as xyz_init.
-        self.feat_proj = SharedMLP([latent_dim, 128, 256])
+        # Conditioned on z_g via AdaGN (no BatchNorm).
+        self.feat_proj = SharedMLP([latent_dim, 128, 256], style_dim=style_dim)
 
         self.stage0 = PVConvBlockDecoder(256, 256, style_dim, resolution=16)
         self.stage1 = PVConvBlockDecoder(256, 128, style_dim, resolution=32)
@@ -169,9 +191,9 @@ class LIONDecoder(nn.Module):
         # The VoxelBranch already clamps out-of-range coords safely.
         xyz_init = xyz_latent                              # (B, N, 3)
 
-        # Project feature latents to PVCNN feature dimension.
+        # Project feature latents to PVCNN feature dimension (AdaGN on z_global).
         z_f  = feat_raw.permute(0, 2, 1)                   # (B, latent_dim, N)
-        feat = self.feat_proj(z_f).permute(0, 2, 1)        # (B, N, 256)
+        feat = self.feat_proj(z_f, z_global).permute(0, 2, 1)  # (B, N, 256)
 
         # PVCNN: uses xyz_init for spatial structure (voxelisation reference)
         feat = self.stage0(xyz_init, feat, z_global)
