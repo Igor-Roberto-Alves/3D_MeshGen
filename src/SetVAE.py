@@ -317,3 +317,50 @@ class SetVAE(nn.Module):
             device = next(self.parameters()).device
         xyz, _ = self.decode(n, bottom_up=None, device=device)
         return xyz
+
+    @property
+    def z_flat_dim(self) -> int:
+        """Total flat latent dimensionality: sum(z_scales) * z_dim."""
+        return sum(self.z_scales) * self.z_dim
+
+    @torch.no_grad()
+    def encode_latents(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Extract flattened posterior mean z_flat ∈ ℝ^{sum(z_scales)*z_dim}.
+        Uses posterior means (deterministic) — suitable for diffusion training.
+        """
+        x_in = normalize_pc(x)[..., :3]
+        B, device = x_in.shape[0], x_in.device
+        features = self.encode(x_in)
+        o = self.pre_dec(self.init_set(B, device=device))
+        zs = []
+        for i, dec in enumerate(self.decoder):
+            h = dec.project(o)
+            _, mu_p, logvar_p = dec.compute_prior(h)
+            td_h = h if dec.cond_prior else None
+            # posterior mean: mu_q = mu_p + delta_mu
+            inp = features[i] + td_h if td_h is not None else features[i]
+            out = dec.posterior(inp)
+            delta_mu = out[..., :dec.z_dim]
+            mu_q = mu_p + delta_mu          # (B, M_l, z_dim), no sampling
+            zs.append(mu_q.reshape(B, -1))  # (B, M_l * z_dim)
+            # advance o with posterior mean for next level's context
+            o = dec.att_broad(o, dec.fc(mu_q))
+        return torch.cat(zs, dim=-1)        # (B, sum(z_scales)*z_dim)
+
+    @torch.no_grad()
+    def decode_latents(self, z_flat: torch.Tensor) -> torch.Tensor:
+        """
+        Decode from a flat latent vector z_flat ∈ ℝ^{sum(z_scales)*z_dim}.
+        Inverse of encode_latents — used at diffusion inference time.
+        """
+        B, device = z_flat.shape[0], z_flat.device
+        o = self.pre_dec(self.init_set(B, device=device))
+        offset = 0
+        for i, (dec, m) in enumerate(zip(self.decoder, self.z_scales)):
+            chunk = z_flat[:, offset: offset + m * self.z_dim]   # (B, M_l*z_dim)
+            z = chunk.reshape(B, m, self.z_dim)                  # (B, M_l, z_dim)
+            offset += m * self.z_dim
+            o = dec.att_broad(o, dec.fc(z))
+        xyz = self.output_proj(self.post_dec(o))
+        return xyz
