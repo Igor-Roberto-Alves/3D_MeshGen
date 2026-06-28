@@ -38,7 +38,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from src.dataset import Ds_point_sampled_already
 from src.Vae import Vae, normalize_pc
-from src.Diffusion import CosineSchedule, StyleDenoiser, LatentPointDenoiser
+from src.Diffusion import LinearSchedule, CosineSchedule, StyleDenoiser, LatentPointDenoiser
 from src.metric import generation_metrics
 
 
@@ -184,7 +184,7 @@ def denorm_zl(z_l: torch.Tensor, stats: dict | None) -> torch.Tensor:
 # ============================================================
 
 def diffusion_loss(
-    schedule:   CosineSchedule,
+    schedule:   LinearSchedule,
     denoiser:   nn.Module,
     x0:         torch.Tensor,
     condition:  torch.Tensor,
@@ -223,7 +223,7 @@ def _side_by_side(clouds, colors, gap=2.5):
 @torch.no_grad()
 def log_generations(
     writer:         SummaryWriter,
-    schedule:       CosineSchedule,
+    schedule:       LinearSchedule,
     style_dn:       StyleDenoiser,
     point_dn:       LatentPointDenoiser,
     vae:            Vae,
@@ -285,7 +285,7 @@ def log_generations(
 
 def train_one_epoch(
     vae:       Vae,
-    schedule:  CosineSchedule,
+    schedule:  LinearSchedule,
     style_dn:  StyleDenoiser,
     point_dn:  LatentPointDenoiser,
     loader:    DataLoader,
@@ -355,7 +355,7 @@ def train_one_epoch(
 @torch.no_grad()
 def validate(
     vae:       Vae,
-    schedule:  CosineSchedule,
+    schedule:  LinearSchedule,
     style_dn:  StyleDenoiser,
     point_dn:  LatentPointDenoiser,
     loader:    DataLoader,
@@ -402,7 +402,7 @@ def validate(
 
 @torch.no_grad()
 def _eval_generation(
-    schedule:  CosineSchedule,
+    schedule:  LinearSchedule,
     style_dn:  StyleDenoiser,
     point_dn:  LatentPointDenoiser,
     vae:       Vae,
@@ -527,7 +527,7 @@ def main(cfg: DiffusionConfig) -> None:
                    enumerate(Ds_point_model.map().items())}
 
     # ---- Diffusion models -----------------------------------------
-    schedule  = CosineSchedule(T=cfg.T).to(device)
+    schedule  = LinearSchedule(T=cfg.T).to(device)   # LION uses linear, not cosine
 
     style_dn  = StyleDenoiser(
         style_dim=vae_style_dim,

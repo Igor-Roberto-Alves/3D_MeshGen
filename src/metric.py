@@ -120,23 +120,14 @@ def normal_consistency(pred_pts: Tensor, pred_nrm: Tensor, tgt_pts: Tensor, tgt_
 # KL Divergence
 # ============================================================
 
-def kl_divergence(mu: Tensor, logvar: Tensor, free_bits: float = 0.1, reduce: str = "mean") -> Tensor:
+def kl_divergence(mu: Tensor, logvar: Tensor, free_bits: float = 0.0, reduce: str = "mean") -> Tensor:
     """
-    KL[q(z|x) || p(z)] with free-bits per dimension to prevent posterior collapse.
+    KL[q(z|x) || p(z)] — matches LION's vae_adain.py get_loss().
 
-    FIX #1: the original code used .sum(dim=(1,2)) / shape[1] which
-    heavily under-weights the KL for the point cloud (B, N, D) case —
-    dividing by N instead of N*D makes the KL ~D times too small,
-    meaning beta effectively acts as beta/D.  We now use .mean() over
-    all latent dimensions so the KL is dimensionally consistent with
-    the reconstruction loss regardless of whether z is (B,D) or (B,N,D).
-
-    FIX #2: free_bits threshold prevents posterior collapse.  Any
-    dimension with KL < free_bits is treated as zero — the encoder is
-    not penalised for using those dimensions.  Without this, the KL
-    term can dominate early in training and force the encoder to ignore
-    the input (mean-field collapse), which manifests as the decoder
-    having to reconstruct from pure noise → cuboid outputs.
+    LION does NOT use free-bits: KL is computed raw per element and then
+    averaged over all latent dims (N and D for the local cloud, D for style).
+    free_bits=0.0 by default to match this; pass free_bits>0 only if you
+    explicitly want the original behaviour.
     """
     logvar = torch.clamp(logvar, -10.0, 10.0)
     mu     = torch.clamp(mu,     -10.0, 10.0)
@@ -144,10 +135,8 @@ def kl_divergence(mu: Tensor, logvar: Tensor, free_bits: float = 0.1, reduce: st
     # Element-wise KL: (B, ...) same shape as input
     kl_elem = -0.5 * (1.0 + logvar - mu.pow(2) - logvar.exp())  # (B, [N,] D)
 
-    # Free-bits: dimensions with KL < free_bits are not penalised.
-    # This lets the encoder freely use low-KL dimensions for reconstruction
-    # before the KL term dominates, preventing posterior collapse.
-    kl_elem = torch.clamp(kl_elem, min=free_bits)
+    if free_bits > 0.0:
+        kl_elem = torch.clamp(kl_elem, min=free_bits)
 
     # Reduce over all latent dims — mean keeps scale invariant to D and N
     if kl_elem.dim() == 3:          # (B, N, D)  — local latent cloud

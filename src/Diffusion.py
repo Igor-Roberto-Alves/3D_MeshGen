@@ -6,7 +6,7 @@ Two DDPM denoisers for the LION two-stage diffusion:
   Stage 1  StyleDenoiser        : class label → z_g  (global style, R^style_dim)
   Stage 2  LatentPointDenoiser  : z_g         → z_local  (R^{N × point_dim})
 
-Both share the same CosineSchedule forward/reverse process.
+Both share the same noise schedule (LinearSchedule by default, matching LION).
 """
 
 import math
@@ -19,10 +19,90 @@ import torch.nn.functional as F
 # Noise schedule
 # ────────────────────────────────────────────────────────────────────────────
 
+class LinearSchedule(nn.Module):
+    """
+    Linear beta schedule — matches LION's diffusion_pvd.py exactly.
+    beta_1=1e-4, beta_T=2e-2, T=1000 are LION's defaults.
+    """
+
+    def __init__(self, T: int = 1000, beta_1: float = 1e-4, beta_T: float = 2e-2):
+        super().__init__()
+        betas  = torch.linspace(beta_1, beta_T, T)
+        alphas = 1.0 - betas
+        acp    = torch.cumprod(alphas, dim=0)
+
+        self.T = T
+        self.register_buffer('betas',          betas)
+        self.register_buffer('alphas',         alphas)
+        self.register_buffer('acp',            acp)
+        self.register_buffer('sqrt_acp',       acp.sqrt())
+        self.register_buffer('sqrt_one_m_acp', (1.0 - acp).sqrt())
+
+    def q_sample(self, x0: torch.Tensor, t: torch.Tensor,
+                 noise: torch.Tensor | None = None):
+        """Forward process: xₜ = √ᾱₜ·x₀ + √(1−ᾱₜ)·ε"""
+        if noise is None:
+            noise = torch.randn_like(x0)
+        s1 = self.sqrt_acp[t]
+        s2 = self.sqrt_one_m_acp[t]
+        for _ in range(x0.dim() - 1):
+            s1 = s1.unsqueeze(-1)
+            s2 = s2.unsqueeze(-1)
+        return s1 * x0 + s2 * noise, noise
+
+    @torch.no_grad()
+    def sample(
+        self,
+        denoiser:  nn.Module,
+        shape:     tuple,
+        condition: torch.Tensor,
+        uncond:    torch.Tensor | None = None,
+        guidance:  float = 1.0,
+        device:    torch.device | None = None,
+    ) -> torch.Tensor:
+        """Full DDPM reverse chain with optional classifier-free guidance."""
+        B = condition.shape[0]
+        if device is None:
+            device = condition.device
+        x = torch.randn(B, *shape, device=device)
+        for i in reversed(range(self.T)):
+            t = torch.full((B,), i, device=device, dtype=torch.long)
+            x = self._p_step(denoiser, x, t, condition, uncond, guidance)
+        return x
+
+    def _p_step(self, denoiser, xt, t, cond, uncond, guidance):
+        eps = denoiser(xt, t, cond)
+        if guidance != 1.0 and uncond is not None:
+            eps_u = denoiser(xt, t, uncond)
+            eps   = eps_u + guidance * (eps - eps_u)
+
+        beta_t   = self.betas[t]
+        alpha_t  = self.alphas[t]
+        acp_t    = self.acp[t]
+        acp_prev = torch.where(t > 0, self.acp[t - 1], torch.ones_like(acp_t))
+
+        def bcast(v):
+            for _ in range(xt.dim() - 1):
+                v = v.unsqueeze(-1)
+            return v
+
+        beta_t, alpha_t, acp_t, acp_prev = map(bcast, [beta_t, alpha_t, acp_t, acp_prev])
+
+        x0_pred = (xt - (1 - acp_t).sqrt() * eps) / acp_t.sqrt()
+        x0_pred = x0_pred.clamp(-10, 10)
+
+        mean = (beta_t * acp_prev.sqrt() / (1 - acp_t)) * x0_pred \
+             + ((1 - acp_prev) * alpha_t.sqrt() / (1 - acp_t)) * xt
+
+        var  = beta_t * (1 - acp_prev) / (1 - acp_t)
+        mask = bcast((t > 0).float())
+        return mean + mask * var.clamp(min=1e-20).sqrt() * torch.randn_like(xt)
+
+
 class CosineSchedule(nn.Module):
     """
     Cosine variance schedule (Nichol & Dhariwal 2021).
-    All tensors are registered as buffers so they move with .to(device).
+    Kept for reference; LION uses LinearSchedule.
     """
 
     def __init__(self, T: int = 1000, s: float = 0.008):
