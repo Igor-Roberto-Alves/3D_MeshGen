@@ -29,20 +29,13 @@ class Vae(nn.Module):
     Two-level latent space
     ----------------------
     z_g  (B, style_dim)              – global shape prior
-    z_l  (B, N, 3 + latent_dim)     – local per-point latent
-                                       first 3 channels : position latents
-                                       next latent_dim  : abstract feature latents
+    z_l  (B, N, 3 + latent_dim)     – local per-point latent passed to decoder:
+                                         z_l[:,:,:3] = xyz + 0.01 * delta_pos
+                                         z_l[:,:,3:] = delta_feat  (+ noise)
 
-    Position anchor (LION PointTransPVC design)
-    -------------------------------------------
-    The LocalEncoder builds a skip connection inside its forward():
-        mu_l[:, :, :3] = PVCNN_delta + input_xyz
-
-    At initialisation, PVCNN_delta ≈ 0 (near-zero fc_mu init), so
-    mu_l[:, :, :3] ≈ input_xyz. The decoder uses z_l[:, :, :3] directly
-    as the spatial reference (xyz_init), giving near-perfect reconstruction
-    from epoch 0. Over training, the encoder refines the delta while KL
-    regularises both position and feature channels toward N(0, I).
+    The encoder outputs RAW deltas (mu_l ≈ 0 at init). The position skip
+    is applied in forward() so KL is computed on the small delta, not on xyz.
+    This follows LION paper D.1: "z_l = xyz + 0.01 * mu_l".
     """
 
     def __init__(
@@ -88,17 +81,23 @@ class Vae(nn.Module):
         z_g = mu_g + torch.randn_like(mu_g) * (0.5 * logvar_g).exp()
 
         # --- Local level ---
-        # LocalEncoder internally sets mu_l[:,:,:3] = PVCNN_delta + input_xyz.
-        # Sampling z_l = mu_l + eps gives a stochastic version of this anchor.
+        # Encoder returns raw deltas (mu ≈ 0 at init, logvar ≈ -6).
+        # KL is computed on these raw deltas — NOT on xyz.
         mu_l, logvar_l = self.local_encoder(x, z_g)
         logvar_l = logvar_l.clamp(-10.0, 10.0)
-        z_l = mu_l + torch.randn_like(mu_l) * (0.5 * logvar_l).exp()
+        eps_l    = torch.randn_like(mu_l) * (0.5 * logvar_l).exp()
+        delta    = mu_l + eps_l                          # (B, N, total_z_dim)
 
-        # Optional position noise: corrupt z_l[:,:,:3] before decoding so the
-        # decoder cannot rely solely on the position shortcut and must use z_g.
+        # LION paper D.1 skip: position channels use xyz + 0.01 * delta.
+        # Feature channels (3:) are passed as-is (no position constraint).
+        xyz_anchor = x[..., :3]
+        z_l = delta.clone()
+        z_l[..., :3] = xyz_anchor + 0.01 * delta[..., :3]
+
+        # Optional position noise: breaks shortcut, forces decoder to use z_g.
         if pos_noise_std > 0.0 and self.training:
             z_l = z_l.clone()
-            z_l[:, :, :3] = z_l[:, :, :3] + torch.randn_like(z_l[:, :, :3]) * pos_noise_std
+            z_l[..., :3] = z_l[..., :3] + torch.randn_like(z_l[..., :3]) * pos_noise_std
 
         xyz_out, nrm_out = self.decoder(z_l, z_g)
         return xyz_out, nrm_out, mu_l, logvar_l, mu_g, logvar_g
@@ -114,12 +113,11 @@ class Vae(nn.Module):
         x = normalize_pc(x)
 
         mu_g, _  = self.global_encoder(x)
-        mu_l, _  = self.local_encoder(x, mu_g)
-
-        # mu_l[:,:,:3] ≈ input_xyz (anchor), so the decoder sees the real
-        # point positions. With delta≈0 init, the first epoch already gives
-        # near-perfect reconstruction.
-        xyz_out, nrm_out = self.decoder(mu_l, mu_g)
+        mu_l, _  = self.local_encoder(x, mu_g)   # raw deltas (≈0 at init)
+        xyz_anchor = x[..., :3]
+        z_l        = mu_l.clone()
+        z_l[..., :3] = xyz_anchor + 0.01 * mu_l[..., :3]
+        xyz_out, nrm_out = self.decoder(z_l, mu_g)
         return xyz_out, nrm_out
 
     # ------------------------------------------------------------------

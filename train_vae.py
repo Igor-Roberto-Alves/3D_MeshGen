@@ -40,7 +40,7 @@ class TrainConfig:
 
     # --- architecture ---
     latent_dim:    int   = 3      # per-point latent features (LION paper: ~3)
-    style_dim:     int   = 256    # global shape latent dim
+    style_dim:     int   = 128    # paper Table 5: shape latent = 128
     in_channels:   int   = 6
 
     # --- training ---
@@ -52,9 +52,10 @@ class TrainConfig:
     grad_clip:     float = 1.0
 
     # --- VAE beta scheduling (KL annealing) ---
-    beta_start:    float = 0.0
-    beta_end:      float = 1.0
-    beta_epochs:   int   = 150
+    # Paper D.4: λ starts at 1e-7, annealed linearly for first 50% of epochs → final 0.5.
+    beta_start:    float = 1e-7
+    beta_end:      float = 0.5
+    beta_epochs:   int   = 150   # = epochs // 2
     # Per-latent KL weights — mirrors LION's weight_kl_pt / weight_kl_feat / weight_kl_glb.
     # beta_style:    z_g KL weight  — 1.0: z_g is a standard VAE latent; DDPM level 1
     #                                  generates it from N(0,I).

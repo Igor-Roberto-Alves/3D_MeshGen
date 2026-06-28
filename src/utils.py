@@ -79,3 +79,51 @@ class AdaGN(nn.Module):
         gamma, beta   = torch.chunk(style_effects, 2, dim=1)  # factor, shift
         # gamma bias initialised to 1 → identity scale at init; beta bias 0 → no shift
         return x_norm * gamma + beta
+
+
+def ball_query(xyz: torch.Tensor, new_xyz: torch.Tensor, radius: float, K: int) -> torch.Tensor:
+    """
+    xyz:     (B, N, 3) — all points
+    new_xyz: (B, M, 3) — query centers (FPS output)
+    Returns: (B, M, K) indices into xyz for the K nearest neighbors within radius.
+    If fewer than K neighbors exist within radius, repeats the nearest one.
+    """
+    dist = torch.cdist(new_xyz.float(), xyz.float())   # (B, M, N)
+    dist_masked = dist.clone()
+    dist_masked[dist > radius] = 1e10
+    _, idx = dist_masked.topk(K, dim=-1, largest=False)  # (B, M, K)
+    nearest = idx[..., :1].expand_as(idx)
+    mask = (dist_masked.gather(2, idx) >= 1e10)
+    idx = torch.where(mask, nearest, idx)
+    return idx
+
+
+class SqueezeExcitation(nn.Module):
+    """Channel-wise attention (Hu et al. 2018). Applied to (B, C, N) tensors."""
+    def __init__(self, channels: int, reduction: int = 4):
+        super().__init__()
+        mid = max(channels // reduction, 1)
+        self.net = nn.Sequential(
+            nn.Linear(channels, mid), nn.ReLU(inplace=True),
+            nn.Linear(mid, channels), nn.Sigmoid(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        s = x.mean(dim=-1)              # (B, C) global average
+        w = self.net(s).unsqueeze(-1)   # (B, C, 1)
+        return x * w
+
+
+class PointSelfAttention(nn.Module):
+    """
+    Lightweight self-attention over M points.
+    Input/output: (B, M, C)
+    """
+    def __init__(self, dim: int, num_heads: int = 4):
+        super().__init__()
+        self.attn = nn.MultiheadAttention(dim, num_heads, batch_first=True)
+        self.norm = nn.LayerNorm(dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out, _ = self.attn(x, x, x)
+        return self.norm(x + out)

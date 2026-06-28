@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from src.utils import AdaGN
+from src.utils import AdaGN, SqueezeExcitation
 
 
 class SharedMLP(nn.Sequential):
@@ -21,14 +21,11 @@ class VoxelBranch(nn.Module):
         super().__init__()
         self.resolution = resolution
         mid = max(out_channels * 2, 8)
-        self.voxel_net = nn.Sequential(
-            nn.Conv3d(feat_channels, mid, 3, padding=1, bias=False),
-            nn.GroupNorm(min(8, mid), mid),
-            nn.GELU(),
-            nn.Conv3d(mid, out_channels, 3, padding=1, bias=False),
-            nn.GroupNorm(min(8, out_channels), out_channels),
-            nn.GELU(),
-        )
+        self.vox_conv1 = nn.Conv3d(feat_channels, mid, 3, padding=1, bias=False)
+        self.vox_gn1   = nn.GroupNorm(min(8, mid), mid)
+        self.vox_conv2 = nn.Conv3d(mid, out_channels, 3, padding=1, bias=False)
+        self.vox_gn2   = nn.GroupNorm(min(8, out_channels), out_channels)
+        self.vox_se    = SqueezeExcitation(out_channels)
 
     def _voxelise(self, coords, features, R):
         B, C, N = features.shape
@@ -52,7 +49,13 @@ class VoxelBranch(nn.Module):
         norm_coords = (coords + 1.0) * 0.5 * (R - 1)
         norm_coords = norm_coords.clamp(0.0, float(R - 1))
         voxel_grid  = self._voxelise(norm_coords, feats, R)
-        voxel_feats = self.voxel_net(voxel_grid)
+        vx = F.gelu(self.vox_gn1(self.vox_conv1(voxel_grid)))
+        vx = self.vox_gn2(self.vox_conv2(vx))
+        # SE operates on (B, C, N) — flatten spatial dims to N for SE, then restore
+        B2, C2, R2, _, _ = vx.shape
+        vx_flat = vx.view(B2, C2, -1)          # (B, C, R^3)
+        vx_flat = self.vox_se(vx_flat)
+        voxel_feats = vx_flat.view(B2, C2, R2, R2, R2)
         sample_grid = (norm_coords / (R - 1) * 2 - 1).clamp(-1.0, 1.0)
         sample_grid = sample_grid.permute(0, 2, 1).unsqueeze(1).unsqueeze(1)
         sample_grid = sample_grid.expand(-1, 1, 1, N, 3)

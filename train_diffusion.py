@@ -56,7 +56,7 @@ class DiffusionConfig:
 
     # --- VAE architecture (must match the loaded checkpoint) ---
     vae_latent_dim:  int = 3   # LION paper: latent_dim=3 (z_l lives in position space)
-    vae_style_dim:   int = 256
+    vae_style_dim:   int = 128   # must match train_vae.py style_dim
     vae_in_channels: int = 6
 
     # --- diffusion schedule ---
@@ -126,8 +126,12 @@ def extract_latents(vae: Vae, points: torch.Tensor):
     """
     x_norm  = normalize_pc(points)
     mu_g, _ = vae.global_encoder(x_norm)         # (B, style_dim)
-    mu_l, _ = vae.local_encoder(x_norm, mu_g)    # (B, N, 3+latent_dim); anchor already inside
-    return mu_g, mu_l
+    mu_l, _ = vae.local_encoder(x_norm, mu_g)    # (B, N, total_z_dim) — raw deltas
+    # Apply the LION position skip (mirrors Vae.forward exactly)
+    xyz_anchor = x_norm[..., :3]
+    z_l = mu_l.clone()
+    z_l[..., :3] = xyz_anchor + 0.01 * mu_l[..., :3]
+    return mu_g, z_l
 
 
 # ============================================================
@@ -246,6 +250,8 @@ def train_one_epoch(
     epoch:     int,
     logger:    logging.Logger,
     device:    torch.device,
+    ema_style=None,
+    ema_point=None,
 ) -> dict:
     style_dn.train(); point_dn.train()
     totals    = {}
@@ -280,6 +286,11 @@ def train_one_epoch(
 
         scaler.update()
 
+        if ema_style is not None:
+            ema_style.update_parameters(style_dn)
+        if ema_point is not None:
+            ema_point.update_parameters(point_dn)
+
         totals["loss_style"] = totals.get("loss_style", 0.0) + loss_s.item()
         totals["loss_point"] = totals.get("loss_point", 0.0) + loss_p.item()
         n_batches += 1
@@ -304,6 +315,8 @@ def validate(
     cfg:       DiffusionConfig,
     device:    torch.device,
     compute_gen_metrics: bool = False,
+    ema_style=None,
+    ema_point=None,
 ) -> dict:
     style_dn.eval(); point_dn.eval()
     totals    = {}
@@ -330,8 +343,10 @@ def validate(
     out = {k: v / max(n_batches, 1) for k, v in totals.items()}
 
     if compute_gen_metrics:
+        gen_style = ema_style.module if ema_style is not None else style_dn
+        gen_point = ema_point.module if ema_point is not None else point_dn
         out.update(_eval_generation(
-            schedule, style_dn, point_dn, vae, ref_clouds, cfg, device
+            schedule, gen_style, gen_point, vae, ref_clouds, cfg, device
         ))
 
     return out
@@ -483,6 +498,10 @@ def main(cfg: DiffusionConfig) -> None:
     logger.info(f"StyleDenoiser      params: {count_parameters(style_dn):,}")
     logger.info(f"LatentPointDenoiser params: {count_parameters(point_dn):,}")
 
+    from torch.optim.swa_utils import AveragedModel
+    ema_style = AveragedModel(style_dn, multi_avg_fn=torch.optim.swa_utils.get_ema_multi_avg_fn(0.9999))
+    ema_point  = AveragedModel(point_dn, multi_avg_fn=torch.optim.swa_utils.get_ema_multi_avg_fn(0.9999))
+
     # ---- Data ---------------------------------------------------------
     base_ds = Ds_point_sampled_already(root=cfg.data_root, augment=False)
     indices = torch.randperm(len(base_ds),
@@ -526,6 +545,10 @@ def main(cfg: DiffusionConfig) -> None:
         ckpt_d = torch.load(resume_path, map_location=device, weights_only=False)
         style_dn.load_state_dict(ckpt_d["style_dn"])
         point_dn.load_state_dict(ckpt_d["point_dn"])
+        if "ema_style" in ckpt_d:
+            ema_style.load_state_dict(ckpt_d["ema_style"])
+        if "ema_point" in ckpt_d:
+            ema_point.load_state_dict(ckpt_d["ema_point"])
         opt_s.load_state_dict(ckpt_d["opt_s"])
         opt_p.load_state_dict(ckpt_d["opt_p"])
         sched_s.load_state_dict(ckpt_d["sched_s"])
@@ -543,10 +566,12 @@ def main(cfg: DiffusionConfig) -> None:
         trn = train_one_epoch(
             vae, schedule, style_dn, point_dn,
             trn_loader, opt_s, opt_p, scaler, cfg, epoch, logger, device,
+            ema_style=ema_style, ema_point=ema_point,
         )
         compute_gen = (cfg.gen_metrics_every > 0 and epoch % cfg.gen_metrics_every == 0)
         val = validate(vae, schedule, style_dn, point_dn, val_loader, cfg, device,
-                       compute_gen_metrics=compute_gen)
+                       compute_gen_metrics=compute_gen,
+                       ema_style=ema_style, ema_point=ema_point)
 
         sched_s.step(); sched_p.step()
         elapsed = time.time() - t0
@@ -564,7 +589,7 @@ def main(cfg: DiffusionConfig) -> None:
 
         if epoch % cfg.vis_every == 0:
             log_generations(
-                writer, schedule, style_dn, point_dn, vae, cfg, epoch,
+                writer, schedule, ema_style.module, ema_point.module, vae, cfg, epoch,
                 device, idx_to_name,
             )
 
@@ -578,6 +603,8 @@ def main(cfg: DiffusionConfig) -> None:
             "epoch":         epoch,
             "style_dn":      style_dn.state_dict(),
             "point_dn":      point_dn.state_dict(),
+            "ema_style":     ema_style.state_dict(),
+            "ema_point":     ema_point.state_dict(),
             "opt_s":         opt_s.state_dict(),
             "opt_p":         opt_p.state_dict(),
             "sched_s":       sched_s.state_dict(),
