@@ -33,44 +33,48 @@ from src.Vae import Vae, normalize_pc
 @dataclass
 class TrainConfig:
     # --- paths ---
-    data_root:     str   = "point_clouds"
-    ckpt_dir:      str   = "checkpoints"
-    log_dir:       str   = "logs"
+    data_root:        str   = "point_clouds"
+    ckpt_dir:         str   = "checkpoints"
+    log_dir:          str   = "logs"
 
     # --- architecture ---
-    latent_dim:    int   = 3      # per-point latent features (LION paper: ~3)
-    style_dim:     int   = 256    # global shape latent dim
-    in_channels:   int   = 6
+    latent_dim:       int   = 3
+    style_dim:        int   = 256
+    in_channels:      int   = 6
 
     # --- training ---
-    epochs:        int   = 200
-    batch_size:    int   = 16
-    lr:            float = 3e-4
-    weight_decay:  float = 1e-4
-    warmup_epochs: int   = 10
-    grad_clip:     float = 1.0
+    epochs:           int   = 200
+    batch_size:       int   = 8       # 8 é seguro com recon_loss="both" + PVCNN
+    lr:               float = 3e-4
+    weight_decay:     float = 1e-4
+    warmup_epochs:    int   = 10
+    grad_clip:        float = 1.0
 
     # --- VAE beta scheduling (KL annealing) ---
-    beta_start:    float = 0.0
-    beta_end:      float = 2.0
-    beta_epochs:   int   = 80
+    beta_start:       float = 0.0
+    beta_end:         float = 2.0
+    beta_epochs:      int   = 80
 
     # --- reconstruction loss ---
-    recon_loss:    str   = "chamfer"
-    emd_weight:    float = 0.5
+    recon_loss:       str   = "both"  # chamfer + EMD combinados
+    emd_weight:       float = 0.5
+    emd_iters:        int   = 15     # iterações Sinkhorn (50→15 ≈ 3x mais rápido)
+    emd_n_subsample:  int   = 512    # subsample EMD a 512 pts (2048→512 = 16x mais rápido)
 
     # --- data ---
-    val_split:     float = 0.1
-    num_workers:   int   = 4
-    pin_memory:    bool  = True
+    val_split:        float = 0.1
+    num_workers:      int   = 4
+    pin_memory:       bool  = True
 
     # --- misc ---
-    seed:          int   = 42
-    save_every:    int   = 5
-    log_every:     int   = 50
-    device:        str   = "cuda"
-    amp:           bool  = True
-    resume:        int   = 0
+    seed:             int   = 42
+    save_every:       int   = 5
+    log_every:        int   = 50
+    device:           str   = "cuda"
+    amp:              bool  = True
+    resume:           int   = 0
+    compile_model:    bool  = False   # torch.compile (PyTorch 2+, ~20-50% speedup)
+    grad_hist_every:  int   = 20      # histogramas de gradiente (caro) a cada N epochs
 
 
 # ============================================================
@@ -105,12 +109,26 @@ def _side_by_side(clouds: list[torch.Tensor], colors: list[torch.Tensor], gap: f
     return verts, clrs
 
 
+def log_grad_norms(writer, model, epoch):
+    """Log per-parameter gradient L2 norms (fast — scalars only)."""
+    for name, param in model.named_parameters():
+        if param.grad is not None:
+            writer.add_scalar(f"grad_norm/{name}", param.grad.norm().item(), epoch)
+
+
+def log_grad_histograms(writer, model, epoch):
+    """Log full gradient histograms (slow — run less frequently)."""
+    for name, param in model.named_parameters():
+        if param.grad is not None:
+            writer.add_histogram(f"gradients/{name}", param.grad, epoch)
+
+
 @torch.no_grad()
-def log_reconstructions(writer, model, loader, device, epoch, max_items=4):
+def log_reconstructions(writer, model, loader, device, epoch, split="train", max_items=4):
     """
     For each of max_items samples: log a single mesh showing
         [GT (green) | Reconstruction (red) | Prior sample (blue)]
-    side-by-side so all three are always synchronised in the same panel.
+    side-by-side. `split` controls the TensorBoard tag prefix ("train" or "val").
     """
     model.eval()
     points, _ = next(iter(loader))
@@ -122,7 +140,6 @@ def log_reconstructions(writer, model, loader, device, epoch, max_items=4):
     recon = xyz_out.detach().float().cpu()
     B     = min(max_items, gt.shape[0])
 
-    # One prior sample per displayed shape (same N)
     prior_samples = model.generate(num_samples=B, num_points=N, device=device)
     prior_samples = prior_samples.detach().float().cpu()
 
@@ -133,7 +150,7 @@ def log_reconstructions(writer, model, loader, device, epoch, max_items=4):
         pri_c  = torch.tensor([[0, 80, 220]], dtype=torch.uint8).expand(N, -1)
 
         verts, clrs = _side_by_side([gt_v, rec_v, pri_v], [gt_c, rec_c, pri_c])
-        writer.add_mesh(f"sample_{i}/gt_recon_prior", vertices=verts, colors=clrs, global_step=epoch)
+        writer.add_mesh(f"recon_{split}/sample_{i}", vertices=verts, colors=clrs, global_step=epoch)
 
     model.train()
 
@@ -184,10 +201,10 @@ def train_one_epoch(model, loader, optimiser, scaler, cfg, epoch, logger, device
 
     for batch_idx, data in enumerate(loader):
         points, _ = data
-        points     = points.to(device, non_blocking=True)
-        # Normalize before extracting target so it matches the model's output space.
-        # model(points) calls normalize_pc internally; the loss must compare in the same scale.
+        points    = points.to(device, non_blocking=True)
         target_xyz = normalize_pc(points)[..., :3]
+
+        optimiser.zero_grad(set_to_none=True)  # antes do forward → menos memória ocupada
 
         with torch.autocast(device_type=device.type, enabled=cfg.amp):
             xyz_out, mu_l, logvar_l, mu_g, logvar_g = model(points)
@@ -201,9 +218,10 @@ def train_one_epoch(model, loader, optimiser, scaler, cfg, epoch, logger, device
                 beta=beta,
                 recon_loss=cfg.recon_loss,
                 emd_weight=cfg.emd_weight,
+                emd_iters=cfg.emd_iters,
+                emd_n_subsample=cfg.emd_n_subsample,
             )
 
-        optimiser.zero_grad(set_to_none=True)
         scaler.scale(losses["total"]).backward()
         scaler.unscale_(optimiser)
         nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
@@ -247,6 +265,8 @@ def validate(model, loader, cfg, epoch, device):
                 beta=beta,
                 recon_loss=cfg.recon_loss,
                 emd_weight=cfg.emd_weight,
+                emd_iters=cfg.emd_iters,
+                emd_n_subsample=cfg.emd_n_subsample,
             )
 
         fs = f_score(xyz_out, target_xyz, threshold=0.01)
@@ -271,6 +291,12 @@ def main(cfg: TrainConfig) -> None:
     device = torch.device(cfg.device if (cfg.device == "cuda" and torch.cuda.is_available()) else "cpu")
     logger.info(f"Using device: {device}")
 
+    # CUDA performance flags
+    if device.type == "cuda":
+        torch.backends.cuda.matmul.allow_tf32  = True   # ~2x matmul em Ampere+
+        torch.backends.cudnn.allow_tf32         = True
+        torch.backends.cudnn.benchmark          = True   # auto-tuning convs
+
     # ---- Datasets -------------------------------------------------------
     base_ds  = Ds_point_sampled_already(root=cfg.data_root, augment=False)
     indices  = torch.randperm(len(base_ds), generator=torch.Generator().manual_seed(cfg.seed)).tolist()
@@ -280,10 +306,16 @@ def main(cfg: TrainConfig) -> None:
     trn_ds = torch.utils.data.Subset(Ds_point_sampled_already(root=cfg.data_root, augment=True),  train_idx)
     val_ds = torch.utils.data.Subset(Ds_point_sampled_already(root=cfg.data_root, augment=False), val_idx)
 
+    _dl_kwargs = dict(
+        num_workers=cfg.num_workers,
+        pin_memory=cfg.pin_memory and device.type == "cuda",
+        persistent_workers=cfg.num_workers > 0,   # evita respawn de workers a cada epoch
+        prefetch_factor=2 if cfg.num_workers > 0 else None,
+    )
     trn_loader = DataLoader(trn_ds, batch_size=cfg.batch_size, shuffle=True,
-                            num_workers=cfg.num_workers, pin_memory=cfg.pin_memory)
+                            drop_last=True, **_dl_kwargs)
     val_loader = DataLoader(val_ds, batch_size=cfg.batch_size, shuffle=False,
-                            num_workers=cfg.num_workers, pin_memory=cfg.pin_memory)
+                            drop_last=False, **_dl_kwargs)
     logger.info(f"Dataset: {len(train_idx)} train / {len(val_idx)} val samples")
 
     # ---- Model ----------------------------------------------------------
@@ -294,6 +326,11 @@ def main(cfg: TrainConfig) -> None:
     ).to(device)
     logger.info(f"LION VAE  |  params: {count_parameters(model):,}")
     logger.info(f"  latent_dim={cfg.latent_dim}  style_dim={cfg.style_dim}")
+    logger.info(f"  recon_loss={cfg.recon_loss}  emd_iters={cfg.emd_iters}  emd_n_subsample={cfg.emd_n_subsample}")
+
+    if cfg.compile_model and hasattr(torch, "compile"):
+        logger.info("Compilando modelo com torch.compile (reduce-overhead)...")
+        model = torch.compile(model, mode="reduce-overhead")
 
     # ---- Optimiser & scheduler ------------------------------------------
     optimiser = AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
@@ -341,7 +378,12 @@ def main(cfg: TrainConfig) -> None:
         log_metrics_tensorboard(writer, val_metrics, "val",   epoch)
 
         if epoch % 5 == 0:
-            log_reconstructions(writer, model, trn_loader, device, epoch, max_items=4)
+            log_reconstructions(writer, model, trn_loader, device, epoch, split="train", max_items=4)
+            log_reconstructions(writer, model, val_loader,  device, epoch, split="val",   max_items=4)
+            log_grad_norms(writer, model, epoch)         # scalars — rápido
+
+        if epoch % cfg.grad_hist_every == 0:
+            log_grad_histograms(writer, model, epoch)   # histogramas — lento, menos frequente
 
         val_cd = val_metrics.get("recon", math.inf)
         is_best = val_cd < best_val_cd

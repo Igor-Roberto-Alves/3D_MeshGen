@@ -26,7 +26,7 @@ from src.Diffus import (
 @dataclass
 class DiffusionConfig:
     # --- paths ---
-    data_root:      str   = "point_clouds"
+    data_root:      str   = "point_clouds__DIvided"
     vae_ckpt:       str   = "checkpoints/best.pt"   # frozen VAE checkpoint
     ckpt_dir:       str   = "checkpoints_diffusion"
     log_dir:        str   = "logs_diffusion"

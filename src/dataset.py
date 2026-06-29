@@ -187,11 +187,17 @@ class Ds_point_sampled:
 class Ds_point_sampled_already:
     def __init__(self, root="point_clouds", augment=True):
         self.root = root
-        self.files = []
+        all_files = []
         for rt, dirs, files in os.walk(root):
             for file in files:
                 if file.endswith(".ply"):
-                    self.files.append(os.path.join(rt, file))
+                    all_files.append(os.path.join(rt, file))
+
+        # Drop files that don't exist or are empty (avoids zero-point tensors in collate)
+        self.files = [f for f in all_files if os.path.exists(f) and os.path.getsize(f) > 0]
+        skipped = len(all_files) - len(self.files)
+        if skipped:
+            print(f"[dataset] Skipped {skipped} missing/empty PLY files.")
 
         self.augment = augment
         self.transform = data_augs
@@ -214,6 +220,10 @@ class Ds_point_sampled_already:
         points = np.asarray(pcd.points, dtype=np.float32)
         normals = np.asarray(pcd.normals, dtype=np.float32)
 
+        # Fallback: corrupt/unreadable file returns 0 points — pick a random valid sample
+        if points.shape[0] == 0:
+            return self.__getitem__(int(torch.randint(len(self), (1,)).item()))
+
         features = np.concatenate([points, normals], axis=1)
         features = torch.from_numpy(features).float()
 
@@ -223,6 +233,58 @@ class Ds_point_sampled_already:
         return features, cls_tensor
 
 
+def generate_subset(shapenet_root: str, out_dir: str, classes: list[str], n_points: int = 2048):
+    """
+    Sample point clouds from ShapeNet OBJ meshes and save as PLY files.
+    Only processes the class IDs listed in `classes`.
+
+    Usage:
+        python src/dataset.py --shapenet_root /path/to/ShapeNet --out_dir point_clouds
+    """
+    import argparse
+
+    os.makedirs(out_dir, exist_ok=True)
+
+    model = Ds_point_model(root=shapenet_root)
+    subset = [(cls, path) for cls, path in model.all_files if cls in classes]
+
+    print(f"Found {len(subset)} meshes across classes {classes}")
+    skipped = 0
+    saved = 0
+    for i, (cls, file_path) in enumerate(tqdm.tqdm(subset, desc="Sampling")):
+        save_path = os.path.join(out_dir, f"{cls}_{i}.ply")
+        if os.path.exists(save_path):
+            saved += 1
+            continue
+        mesh = o3d.io.read_triangle_mesh(file_path)
+        if not mesh.has_vertices():
+            skipped += 1
+            continue
+        mesh.compute_vertex_normals()
+        pcd = mesh.sample_points_uniformly(number_of_points=n_points)
+        o3d.io.write_point_cloud(save_path, pcd)
+        saved += 1
+
+    print(f"Done. {saved} saved, {skipped} skipped (unreadable meshes).")
+
+
 if __name__ == "__main__":
-    ds = Ds_point_sampled(Ds_point_model())
-    print(len(ds))
+    import argparse
+
+    CLASSES = ["02691156", "02958343"]  # airplane, car
+
+    p = argparse.ArgumentParser(description="Generate PLY point clouds from ShapeNet OBJ meshes.")
+    p.add_argument("--shapenet_root", type=str, required=True,
+                   help="Path to ShapeNet root directory (contains class-id subdirs)")
+    p.add_argument("--out_dir", type=str, default="point_clouds",
+                   help="Output directory for PLY files (default: point_clouds)")
+    p.add_argument("--n_points", type=int, default=2048,
+                   help="Number of points to sample per mesh (default: 2048)")
+    args = p.parse_args()
+
+    generate_subset(
+        shapenet_root=args.shapenet_root,
+        out_dir=args.out_dir,
+        classes=CLASSES,
+        n_points=args.n_points,
+    )

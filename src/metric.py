@@ -59,9 +59,17 @@ def chamfer_distance_knn(pred: Tensor, target: Tensor, k: int = 1, reduce: str =
 # Approximate EMD (Sinkhorn)
 # ============================================================
 
-def emd_approx(pred: Tensor, target: Tensor, n_iters: int = 50, eps: float = 0.05, reduce: str = "mean") -> Tensor:
+def emd_approx(pred: Tensor, target: Tensor, n_iters: int = 30, eps: float = 0.05,
+               reduce: str = "mean", n_subsample: int = 0) -> Tensor:
     B, N, _ = pred.shape
     assert pred.shape == target.shape
+
+    # Subsample for speed: O(N^2) cost matrix → O(n_subsample^2)
+    if 0 < n_subsample < N:
+        idx    = torch.randperm(N, device=pred.device)[:n_subsample]
+        pred   = pred[:, idx]
+        target = target[:, idx]
+        N      = n_subsample
 
     cost = torch.cdist(pred.float(), target.float())
 
@@ -163,21 +171,22 @@ def kl_divergence(mu: Tensor, logvar: Tensor, free_bits: float = 0.5, reduce: st
 # ============================================================
 
 def vae_loss(
-    pred_xyz:      Tensor,
-    target_xyz:    Tensor,
-    mu_points:     Tensor,
-    logvar_points: Tensor,
-    mu_style:      Tensor,
-    logvar_style:  Tensor,
-    beta:          float          = 1.0,
-    beta_points:   float          = 1.0,
-    beta_style:    float          = 1.0,
-    recon_loss:    str            = "chamfer",
-    emd_weight:    float          = 0.5,
-    emd_iters:     int            = 30,
-    normals_pred:  Tensor | None  = None,
-    normal_target: Tensor | None  = None,
-    normal_weight: float          = 0.0,
+    pred_xyz:        Tensor,
+    target_xyz:      Tensor,
+    mu_points:       Tensor,
+    logvar_points:   Tensor,
+    mu_style:        Tensor,
+    logvar_style:    Tensor,
+    beta:            float          = 1.0,
+    beta_points:     float          = 1.0,
+    beta_style:      float          = 1.0,
+    recon_loss:      str            = "chamfer",
+    emd_weight:      float          = 0.5,
+    emd_iters:       int            = 15,
+    emd_n_subsample: int            = 0,
+    normals_pred:    Tensor | None  = None,
+    normal_target:   Tensor | None  = None,
+    normal_weight:   float          = 0.0,
 ) -> dict[str, Tensor]:
 
     # --- 1. Reconstruction loss ----------------------------------------
@@ -186,15 +195,13 @@ def vae_loss(
         out = {"recon": recon, "cd_forward": cd_f, "cd_backward": cd_b}
 
     elif recon_loss == "emd":
-        # FIX #3: EMD requires equal point counts — fall back if sizes differ
         if pred_xyz.shape[1] != target_xyz.shape[1]:
-            # subsample / upsample target to match pred
             B, N_pred, _ = pred_xyz.shape
             idx = torch.randperm(target_xyz.shape[1], device=target_xyz.device)[:N_pred]
             target_emd = target_xyz[:, idx, :]
         else:
             target_emd = target_xyz
-        recon = emd_approx(pred_xyz, target_emd, n_iters=emd_iters)
+        recon = emd_approx(pred_xyz, target_emd, n_iters=emd_iters, n_subsample=emd_n_subsample)
         out   = {"recon": recon}
 
     elif recon_loss == "both":
@@ -204,7 +211,7 @@ def vae_loss(
             target_emd = target_xyz[:, idx, :]
         else:
             target_emd = target_xyz
-        emd   = emd_approx(pred_xyz, target_emd, n_iters=emd_iters)
+        emd   = emd_approx(pred_xyz, target_emd, n_iters=emd_iters, n_subsample=emd_n_subsample)
         recon = (1 - emd_weight) * cd + emd_weight * emd
         out   = {"recon": recon, "cd": cd, "emd": emd, "cd_forward": cd_f, "cd_backward": cd_b}
     else:
