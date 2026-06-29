@@ -145,8 +145,7 @@ def kl_divergence(mu: Tensor, logvar: Tensor, free_bits: float = 0.5, reduce: st
     kl_elem = -0.5 * (1.0 + logvar - mu.pow(2) - logvar.exp())  # (B, [N,] D)
 
     # Free-bits: zero out dimensions where KL is already below threshold
-    # kl_elem = torch.clamp(kl_elem, min=free_bits)
-    kl_elem = torch.clamp(kl_elem, min=0.01) # WAITING WAITING 
+    kl_elem = torch.clamp(kl_elem, min=free_bits)
 
     # Reduce over all latent dims — mean keeps scale invariant to D and N
     if kl_elem.dim() == 3:          # (B, N, D)  — local latent cloud
