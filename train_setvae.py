@@ -12,7 +12,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, Subset
 from torch.utils.tensorboard import SummaryWriter
 
-from src.SetVAE import SetVAE
+from src.SetVAE import SetVAE, normalize_pc
 from src.dataset import Ds_point_sampled_already
 from src.metric import chamfer_distance_knn
 
@@ -46,6 +46,7 @@ class SetVaeConfig:
     grad_clip: float = 1.0
     beta: float = 1.0
     kl_warmup_epochs: int = 50
+    free_bits: float = 0.5   # nats mínimos por camada (previne posterior collapse)
 
     # data
     val_split: float = 0.1
@@ -85,6 +86,7 @@ def parse_args():
     p.add_argument("--grad_clip", type=float, default=cfg.grad_clip)
     p.add_argument("--beta", type=float, default=cfg.beta)
     p.add_argument("--kl_warmup_epochs", type=int, default=cfg.kl_warmup_epochs)
+    p.add_argument("--free_bits", type=float, default=cfg.free_bits)
     p.add_argument("--val_split", type=float, default=cfg.val_split)
     p.add_argument("--num_workers", type=int, default=cfg.num_workers)
     p.add_argument("--seed", type=int, default=cfg.seed)
@@ -129,7 +131,7 @@ def visualize_reconstructions(model, batch, writer, step, device, tag="recon"):
     with torch.no_grad():
         pts = batch[0][:4].to(device)  # (4, N, C)
         xyz_out = model.reconstruct(pts)  # (4, N, 3)
-        gt_xyz = pts[..., :3]
+        gt_xyz = normalize_pc(pts)[..., :3]
         cd, _, _ = chamfer_distance_knn(xyz_out, gt_xyz, reduce="mean")
         writer.add_scalar(f"{tag}/cd", cd.item(), step)
         # log point clouds as 3D scatter (add_mesh if available, else skip)
@@ -210,7 +212,8 @@ def main(cfg: SetVaeConfig):
 
         for batch_idx, (pts, _) in enumerate(train_loader):
             pts = pts.to(device, non_blocking=True)  # (B, N, 6)
-            target_xyz = pts[..., :3]
+            # normaliza para o mesmo espaço que o decoder produz
+            target_xyz = normalize_pc(pts)[..., :3]
             B = pts.shape[0]
 
             # lr warmup
@@ -222,7 +225,10 @@ def main(cfg: SetVaeConfig):
                 recon, _, _ = chamfer_distance_knn(xyz_out, target_xyz, reduce="mean")
 
                 if len(kls) > 0:
-                    kl_total = torch.stack(kls, dim=1).sum(dim=1).mean()
+                    # free bits: cada camada contribui no mínimo free_bits nats
+                    # previne posterior collapse (posterior → prior → z inútil)
+                    kl_free = [kl.clamp(min=cfg.free_bits) for kl in kls]
+                    kl_total = torch.stack(kl_free, dim=1).sum(dim=1).mean()
                 else:
                     kl_total = torch.tensor(0.0, device=device)
 
@@ -269,7 +275,7 @@ def main(cfg: SetVaeConfig):
             with torch.no_grad():
                 for pts, _ in val_loader:
                     pts = pts.to(device)
-                    target_xyz = pts[..., :3]
+                    target_xyz = normalize_pc(pts)[..., :3]
                     xyz_out = model.reconstruct(pts)
                     cd, _, _ = chamfer_distance_knn(xyz_out, target_xyz, reduce="mean")
                     val_recon += cd.item() * pts.shape[0]
@@ -281,12 +287,14 @@ def main(cfg: SetVaeConfig):
             # visualize with first val batch
             val_iter = iter(val_loader)
             val_batch = next(val_iter)
-            recon_cd = visualize_reconstructions(model, val_batch, writer, epoch, device, tag="recon")
+            train_iter = iter(train_loader)
+            train_batch = next(train_iter)
+            recon_cd = visualize_reconstructions(model, train_batch, writer, epoch, device, tag="recon")
             writer.add_scalar("val/recon_cd", recon_cd, epoch)
 
             # save checkpoint
             ckpt_path = os.path.join(cfg.ckpt_dir, f"epoch_{epoch+1:04d}.pt")
-            save_checkpoint(model, optimizer, epoch + 1, cfg, ckpt_path)
+            #save_checkpoint(model, optimizer, epoch + 1, cfg, ckpt_path)
             print(f"  saved {ckpt_path}")
 
     writer.close()

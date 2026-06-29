@@ -51,7 +51,8 @@ class MAB(nn.Module):
         k_ = torch.cat(k.split(self.dim_split, -1), 0)
         v_ = torch.cat(v.split(self.dim_split, -1), 0)
 
-        scale = math.sqrt(self.dim_split)
+        # Scale by sqrt(dim_out) to match original SetVAE (not sqrt(d_head))
+        scale = math.sqrt(self.dim_split * self.num_heads)
         attn = q_.bmm(k_.transpose(1, 2)) / scale  # (H*B, N, M)
 
         if self.slot_att:
@@ -178,11 +179,13 @@ class DecoderBlock(nn.Module):
         self.att_broad = MAB(D, D, D, num_heads, ln=ln, slot_att=False, dropout=dropout)
 
         if cond_prior:
-            self.prior = ElemMLP(D, D, 2 * z_dim, n_layers=2)
+            # Linear (no hidden layers) matches original SetVAE i_net_layers=0
+            self.prior = nn.Linear(D, 2 * z_dim)
         else:
             self.prior_param = nn.Parameter(torch.zeros(1, num_inds, 2 * z_dim))
 
-        self.posterior = ElemMLP(D, D, 2 * z_dim, n_layers=2)
+        # Linear posterior matches original SetVAE i_net_layers=0
+        self.posterior = nn.Linear(D, 2 * z_dim)
         self.fc = nn.Linear(z_dim, D)
 
     def project(self, o):
