@@ -377,6 +377,10 @@ def main(cfg: TrainConfig) -> None:
         log_metrics_tensorboard(writer, trn_metrics, "train", epoch)
         log_metrics_tensorboard(writer, val_metrics, "val",   epoch)
 
+        if epoch >= cfg.beta_epochs:
+            log_metrics_tensorboard(writer, trn_metrics, "post_beta/train", epoch)
+            log_metrics_tensorboard(writer, val_metrics, "post_beta/val",   epoch)
+
         if epoch % 5 == 0:
             log_reconstructions(writer, model, trn_loader, device, epoch, split="train", max_items=4)
             log_reconstructions(writer, model, val_loader,  device, epoch, split="val",   max_items=4)
@@ -386,7 +390,7 @@ def main(cfg: TrainConfig) -> None:
             log_grad_histograms(writer, model, epoch)   # histogramas — lento, menos frequente
 
         val_cd = val_metrics.get("recon", math.inf)
-        is_best = val_cd < best_val_cd
+        is_best = (epoch >= cfg.beta_epochs) and (val_cd < best_val_cd)
         if is_best:
             best_val_cd = val_cd
             logger.info(f"  New best val recon: {best_val_cd:.6f}")
