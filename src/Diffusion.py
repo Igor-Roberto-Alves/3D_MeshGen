@@ -158,6 +158,59 @@ class Conv1dResBlock(nn.Module):
         return x + self.c2(F.silu(self.c1(h)))
 
 
+class LatentBottleneckAttention(nn.Module):
+    """
+    Global cross-attention bottleneck (Perceiver-style pooling).
+
+    The per-point Conv1dResBlock stack only ever mixes information within a
+    single point (kernel_size=1 convs) — points never talk to each other.
+    Real geometric grouping (kNN, voxelisation) is not an option here because
+    z_local carries no true xyz position (see Vae.LocalEncoder — z_l is a
+    fully learned per-point code, not an anchor offset).
+
+    Instead we pool the N point features into K learned query tokens via
+    cross-attention (cost O(N·K), no coordinates needed), let the K tokens
+    exchange information with self-attention, then broadcast the result back
+    to all N points via the inverse cross-attention. This gives the network
+    one shot at global, cross-point reasoning per forward pass, at a cost far
+    below dense O(N²) self-attention over all 2048 points.
+    """
+    def __init__(self, dim: int, cond_dim: int, n_tokens: int = 16, n_heads: int = 4):
+        super().__init__()
+        self.tokens = nn.Parameter(torch.randn(n_tokens, dim) * 0.02)
+
+        n_groups = min(8, dim // 4) or 1
+        self.norm_in    = nn.GroupNorm(n_groups, dim)
+        self.cond       = nn.Linear(cond_dim, dim * 2)   # → scale + shift
+
+        self.pool_attn   = nn.MultiheadAttention(dim, n_heads, batch_first=True)
+        self.token_norm  = nn.LayerNorm(dim)
+        self.self_attn   = nn.MultiheadAttention(dim, n_heads, batch_first=True)
+        self.unpool_attn = nn.MultiheadAttention(dim, n_heads, batch_first=True)
+
+        self.out_proj = nn.Linear(dim, dim)
+        nn.init.zeros_(self.out_proj.weight)
+        nn.init.zeros_(self.out_proj.bias)
+
+    def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+        # x: (B, dim, N);  cond: (B, cond_dim)
+        B, C, N = x.shape
+
+        h = self.norm_in(x)
+        sc, sh = self.cond(cond).chunk(2, dim=-1)
+        h = h * (1 + sc.unsqueeze(-1)) + sh.unsqueeze(-1)
+        h = h.permute(0, 2, 1)                                     # (B, N, C)
+
+        tokens = self.tokens.unsqueeze(0).expand(B, -1, -1)        # (B, K, C)
+        pooled, _ = self.pool_attn(tokens, h, h)                   # (B, K, C)
+        pn = self.token_norm(pooled)
+        pooled = pooled + self.self_attn(pn, pn, pn)[0]            # (B, K, C)
+
+        out, _ = self.unpool_attn(h, pooled, pooled)               # (B, N, C)
+        out = self.out_proj(out).permute(0, 2, 1)                  # (B, C, N)
+        return x + out
+
+
 # ────────────────────────────────────────────────────────────────────────────
 # Stage 1  –  Style Denoiser   (class → z_g)
 # ────────────────────────────────────────────────────────────────────────────
@@ -242,11 +295,13 @@ class LatentPointDenoiser(nn.Module):
 
     def __init__(
         self,
-        point_dim:  int = 8,   # must match Vae latent_dim — no anchors in z_l anymore
-        style_dim:  int = 256,
-        hidden:     int = 256,
-        n_layers:   int = 8,
-        T:          int = 1000,
+        point_dim:        int = 8,   # must match Vae latent_dim — no anchors in z_l anymore
+        style_dim:        int = 256,
+        hidden:           int = 256,
+        n_layers:         int = 8,
+        T:                int = 1000,
+        bottleneck_tokens: int = 16,   # K pooled tokens for the global attention bottleneck
+        bottleneck_heads:  int = 4,
     ):
         super().__init__()
         time_dim = hidden
@@ -259,7 +314,19 @@ class LatentPointDenoiser(nn.Module):
         self.cond_proj = nn.Linear(time_dim + style_dim, time_dim)
 
         self.input_proj  = nn.Conv1d(point_dim, hidden, 1)
-        self.blocks      = nn.ModuleList([Conv1dResBlock(hidden, time_dim) for _ in range(n_layers)])
+
+        # Conv1dResBlocks handle purely per-point processing; a single
+        # LatentBottleneckAttention is inserted at the midpoint of the stack
+        # to give the network one pass of global, cross-point reasoning.
+        blocks = []
+        mid = n_layers // 2
+        for i in range(n_layers):
+            blocks.append(Conv1dResBlock(hidden, time_dim))
+            if i == mid - 1:
+                blocks.append(LatentBottleneckAttention(
+                    hidden, time_dim, n_tokens=bottleneck_tokens, n_heads=bottleneck_heads))
+        self.blocks = nn.ModuleList(blocks)
+
         self.output_proj = nn.Conv1d(hidden, point_dim, 1)
         nn.init.zeros_(self.output_proj.weight)
         nn.init.zeros_(self.output_proj.bias)

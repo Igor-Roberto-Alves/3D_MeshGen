@@ -167,6 +167,107 @@ def kl_divergence(mu: Tensor, logvar: Tensor, free_bits: float = 0.5, reduce: st
 
 
 # ============================================================
+# Generation-quality metrics (LION / PointFlow protocol)
+# ============================================================
+#
+# These evaluate a *set* of generated shapes against a *set* of real
+# reference shapes from the same class — they answer "does the generator
+# produce a distribution close to the real one?", which the per-sample
+# reconstruction losses above cannot.
+#
+#   MMD   (Minimum Matching Distance) — for every reference shape, the
+#         distance to its closest generated match, averaged over the
+#         reference set. Lower is better (0 = perfect coverage & fidelity).
+#   COV   (Coverage) — fraction of reference shapes that are the nearest
+#         neighbour of at least one generated shape. Higher is better
+#         (low COV ⇒ mode collapse: many generated shapes cluster around
+#         the same few reference shapes).
+#   1-NNA (1-Nearest-Neighbour Accuracy) — leave-one-out accuracy of a 1-NN
+#         classifier trained to tell generated from real shapes on the
+#         pooled set. 0.5 is best (the two sets are indistinguishable);
+#         it is symmetric, unlike MMD/COV, and considered the most
+#         reliable single number in the LION/PointFlow papers.
+
+def pairwise_distance_matrix(
+    a:          Tensor,
+    b:          Tensor,
+    metric:     str = "cd",
+    batch_size: int = 32,
+) -> Tensor:
+    """
+    All-pairs shape distance between two sets of point clouds.
+
+    a: (Na, N, 3)   b: (Nb, M, 3)   (N, M need not match — CD/EMD don't require it)
+    returns: (Na, Nb) distance matrix, D[i, j] = distance(a[i], b[j])
+    """
+    Na, Nb = a.shape[0], b.shape[0]
+    out = a.new_zeros(Na, Nb)
+    for i in range(Na):
+        ai = a[i:i + 1].expand(Nb, -1, -1)
+        for s in range(0, Nb, batch_size):
+            e = min(s + batch_size, Nb)
+            if metric == "cd":
+                d, _, _ = chamfer_distance_knn(ai[s:e], b[s:e], reduce="none")
+            elif metric == "emd":
+                d = emd_approx(ai[s:e], b[s:e], reduce="none")
+            else:
+                raise ValueError(f"Unknown metric: '{metric}'. Use 'cd' or 'emd'.")
+            out[i, s:e] = d
+    return out
+
+
+def generation_metrics(
+    gen:        Tensor,
+    ref:        Tensor,
+    metric:     str = "cd",
+    batch_size: int = 32,
+) -> dict[str, float]:
+    """
+    MMD / COV / 1-NNA for one class, as defined in the LION and PointFlow papers.
+
+    gen: (Ng, N, 3)  generated point clouds (already in the same normalised
+                      frame the VAE decoder outputs, e.g. via normalize_pc)
+    ref: (Nr, M, 3)  real reference point clouds from the same class,
+                      normalised the same way
+
+    Requires Ng >= 1 and Nr >= 2 (1-NNA needs at least 2 reference shapes
+    so every point has a valid same-class neighbour to compare against).
+    """
+    Ng, Nr = gen.shape[0], ref.shape[0]
+    if Nr < 2:
+        raise ValueError(f"Need at least 2 reference shapes for 1-NNA, got {Nr}.")
+
+    with torch.no_grad():
+        M_rg = pairwise_distance_matrix(ref, gen, metric, batch_size)   # (Nr, Ng)
+
+        # MMD: for every reference shape, distance to its closest generated match.
+        mmd = M_rg.min(dim=1).values.mean().item()
+
+        # COV: fraction of reference shapes that are "claimed" as nearest
+        # neighbour by at least one generated shape.
+        nn_ref_of_gen = M_rg.argmin(dim=0)                              # (Ng,)
+        cov = torch.unique(nn_ref_of_gen).numel() / Nr
+
+        # 1-NNA: pool ref ∪ gen, run leave-one-out 1-NN classification.
+        M_rr = pairwise_distance_matrix(ref, ref, metric, batch_size)
+        M_gg = pairwise_distance_matrix(gen, gen, metric, batch_size)
+
+        M = gen.new_zeros(Nr + Ng, Nr + Ng)
+        M[:Nr, :Nr] = M_rr
+        M[:Nr, Nr:] = M_rg
+        M[Nr:, :Nr] = M_rg.t()
+        M[Nr:, Nr:] = M_gg
+        M.fill_diagonal_(float("inf"))   # exclude self as its own neighbour
+
+        labels   = torch.cat([torch.zeros(Nr), torch.ones(Ng)]).to(M.device)
+        nn_idx   = M.argmin(dim=1)
+        nn_label = labels[nn_idx]
+        one_nna  = (nn_label == labels).float().mean().item()
+
+    return {"mmd": mmd, "cov": cov, "1nna": one_nna}
+
+
+# ============================================================
 # Full VAE ELBO loss
 # ============================================================
 
