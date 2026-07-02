@@ -39,6 +39,7 @@ from torch.utils.tensorboard import SummaryWriter
 from src.dataset import Ds_point_sampled_already
 from src.Vae import Vae, normalize_pc
 from src.Diffusion import CosineSchedule, StyleDenoiser, LatentPointDenoiser
+from src.metric import generative_metrics
 
 
 # ============================================================
@@ -69,8 +70,9 @@ class DiffusionConfig:
     guidance:       float = 3.0    # CFG scale at inference
 
     # --- Latent point denoiser (Stage 2) ---
-    point_hidden:   int   = 256
-    point_layers:   int   = 8
+    point_hidden:     int = 160
+    point_layers:     int = 8
+    point_resolution: int = 16   # voxelisation grid for cross-point mixing
 
     # --- training ---
     epochs:         int   = 300
@@ -96,6 +98,13 @@ class DiffusionConfig:
     # --- generation visualization ---
     vis_every:      int   = 10    # log generated meshes every N epochs
     vis_per_class:  int   = 2     # samples per class to visualize
+
+    # --- generation metrics (MMD-CD / COV-CD / 1-NNA-CD) ---
+    eval_every:  int = 50     # compute every N epochs — expensive (full DDPM sampling)
+    eval_n_gen:  int = 16     # generated samples per class
+    eval_n_ref:  int = 16     # held-out real samples per class to compare against
+    eval_points: int = 1024   # subsample point clouds to this many points before CD
+    eval_chunk:  int = 4      # row-chunk size for the pairwise CD matrix (memory control)
 
 
 # ============================================================
@@ -163,17 +172,53 @@ def _side_by_side(clouds, colors, gap=2.5):
             torch.cat(shifted_c).unsqueeze(0))
 
 
+N_POINTS = 2048   # points per cloud — matches Ds_point_sampled_already
+
+
+@torch.no_grad()
+def sample_class(
+    schedule:  CosineSchedule,
+    style_dn:  StyleDenoiser,
+    point_dn:  LatentPointDenoiser,
+    vae:       Vae,
+    cfg:       DiffusionConfig,
+    cls_idx:   int,
+    B:         int,
+    device:    torch.device,
+) -> torch.Tensor:
+    """Full two-stage DDPM chain for one class → decoded (B, N_POINTS, 3) point clouds."""
+    cls = torch.full((B,), cls_idx, device=device, dtype=torch.long)
+
+    # --- Stage 1: sample z_g ---
+    uncond = style_dn.uncond(B, device)
+    z_g    = schedule.sample(
+        style_dn, (cfg.vae_style_dim,),
+        condition=cls, uncond=uncond,
+        guidance=cfg.guidance, device=device,
+    )   # (B, style_dim)
+
+    # --- Stage 2: sample z_local conditioned on z_g ---
+    z_local = schedule.sample(
+        point_dn, (N_POINTS, cfg.vae_latent_dim),
+        condition=z_g, device=device,
+    )   # (B, N_POINTS, latent_dim)
+
+    # --- Decode ---
+    return vae.decoder(z_local, z_g).float()  # (B, N_POINTS, 3)
+
+
 @torch.no_grad()
 def log_generations(
-    writer:         SummaryWriter,
-    schedule:       CosineSchedule,
-    style_dn:       StyleDenoiser,
-    point_dn:       LatentPointDenoiser,
-    vae:            Vae,
-    cfg:            DiffusionConfig,
-    epoch:          int,
-    device:         torch.device,
-    class_names:    dict,          # idx → name string
+    writer:          SummaryWriter,
+    schedule:        CosineSchedule,
+    style_dn:        StyleDenoiser,
+    point_dn:        LatentPointDenoiser,
+    vae:             Vae,
+    cfg:             DiffusionConfig,
+    epoch:           int,
+    device:          torch.device,
+    class_names:     dict,          # idx → name string
+    present_classes: list,          # class indices that actually exist in the dataset
 ):
     """
     For a handful of classes, generate shapes via the full two-stage chain
@@ -181,43 +226,90 @@ def log_generations(
     """
     style_dn.eval(); point_dn.eval(); vae.eval()
 
-    # Pick a few representative classes
-    show_classes = list(range(min(4, cfg.num_classes)))
-    N  = 2048
-    pd = cfg.vae_latent_dim
+    show_classes = present_classes[:4]
 
     for cls_idx in show_classes:
-        B   = cfg.vis_per_class
-        cls = torch.full((B,), cls_idx, device=device, dtype=torch.long)
-
-        # --- Stage 1: sample z_g ---
-        uncond = style_dn.uncond(B, device)
-        z_g    = schedule.sample(
-            style_dn, (cfg.vae_style_dim,),
-            condition=cls, uncond=uncond,
-            guidance=cfg.guidance, device=device,
-        )   # (B, style_dim)
-
-        # --- Stage 2: sample z_local conditioned on z_g ---
-        z_local = schedule.sample(
-            point_dn, (N, pd),
-            condition=z_g, device=device,
-        )   # (B, N, 6)
-
-        # --- Decode ---
-        xyz_out = vae.decoder(z_local, z_g).float().cpu()  # (B, N, 3)  z_local is z_l here
+        B = cfg.vis_per_class
+        xyz_out = sample_class(schedule, style_dn, point_dn, vae, cfg, cls_idx, B, device).cpu()
 
         for i in range(B):
             gen_v = xyz_out[i]
-            gen_c = torch.tensor([[0, 80, 220]], dtype=torch.uint8).expand(N, -1)
+            gen_c = torch.tensor([[0, 80, 220]], dtype=torch.uint8).expand(N_POINTS, -1)
             verts, clrs = _side_by_side([gen_v], [gen_c])
             cls_name    = class_names.get(cls_idx, str(cls_idx))
             writer.add_mesh(
-                f"generated/{cls_name}_sample{i}",
+                f"generated/{cls_name}/sample{i}",
                 vertices=verts, colors=clrs, global_step=epoch,
             )
 
     style_dn.train(); point_dn.train()
+
+
+@torch.no_grad()
+def evaluate_generation_metrics(
+    writer:          SummaryWriter,
+    schedule:        CosineSchedule,
+    style_dn:        StyleDenoiser,
+    point_dn:        LatentPointDenoiser,
+    vae:             Vae,
+    cfg:             DiffusionConfig,
+    epoch:           int,
+    device:          torch.device,
+    class_names:     dict,                    # idx → name string
+    ref_by_class:    dict,                    # idx → (M, N_POINTS, 3) real xyz, normalised
+    logger:          logging.Logger,
+) -> dict:
+    """
+    MMD-CD / COV-CD / 1-NNA-CD against held-out real samples, per class.
+
+    diffusion_loss (train/val) only measures whether the network denoises
+    individual noised examples well — it says nothing about whether the
+    *distribution* it generates matches the real one (mode collapse and
+    off-distribution shapes can both hide behind a low denoising loss).
+    These are the standard metrics (PointFlow / LION) for picking a
+    checkpoint by actual generation quality. Expensive: full 1000-step DDPM
+    sampling per class, so only run every cfg.eval_every epochs.
+    """
+    style_dn.eval(); point_dn.eval(); vae.eval()
+    agg = {"mmd": [], "cov": [], "nna_1nn": []}
+
+    for cls_idx, ref_xyz in ref_by_class.items():
+        n_ref = min(cfg.eval_n_ref, ref_xyz.shape[0])
+        if n_ref < 2:
+            continue
+        ref_idx = torch.randperm(ref_xyz.shape[0], device=device)[:n_ref]
+        ref = ref_xyz[ref_idx]
+
+        gen = sample_class(schedule, style_dn, point_dn, vae, cfg, cls_idx, cfg.eval_n_gen, device)
+
+        if cfg.eval_points < gen.shape[1]:
+            g_idx = torch.randperm(gen.shape[1], device=device)[:cfg.eval_points]
+            r_idx = torch.randperm(ref.shape[1], device=device)[:cfg.eval_points]
+            gen, ref = gen[:, g_idx], ref[:, r_idx]
+
+        m = generative_metrics(gen, ref, chunk=cfg.eval_chunk)
+        name = class_names.get(cls_idx, str(cls_idx))
+        writer.add_scalar(f"eval_mmd/{name}",  m["mmd"],     epoch)
+        writer.add_scalar(f"eval_cov/{name}",  m["cov"],     epoch)
+        writer.add_scalar(f"eval_1nna/{name}", m["nna_1nn"], epoch)
+        for k in agg:
+            agg[k].append(m[k].item())
+
+    style_dn.train(); point_dn.train()
+
+    if not agg["mmd"]:
+        return {}
+
+    summary = {k: sum(v) / len(v) for k, v in agg.items()}
+    writer.add_scalar("eval/mmd_mean",  summary["mmd"],     epoch)
+    writer.add_scalar("eval/cov_mean",  summary["cov"],     epoch)
+    writer.add_scalar("eval/1nna_mean", summary["nna_1nn"], epoch)
+    logger.info(
+        f"  [eval @ epoch {epoch:03d}]  "
+        f"MMD-CD={summary['mmd']:.5f}  COV-CD={summary['cov']:.3f}  "
+        f"1-NNA-CD={summary['nna_1nn']:.3f}  (0.5=ideal, 1.0=fully separable)"
+    )
+    return summary
 
 
 # ============================================================
@@ -371,10 +463,28 @@ def main(cfg: DiffusionConfig) -> None:
         p.requires_grad_(False)
     logger.info(f"VAE loaded from {cfg.vae_ckpt}  (frozen)")
 
-    # ---- Class name map for logging --------------------------------
+    # ---- Data (loaded first: StyleDenoiser needs the real class count) ---
+    base_ds = Ds_point_sampled_already(root=cfg.data_root, augment=False)
+
+    # class_to_idx is derived from whatever class ids are actually present in
+    # cfg.data_root (sorted by id string) — NOT from the full 55-class
+    # ShapeNet map(). Building idx_to_name from map() directly, independent
+    # of class_to_idx, silently mislabels classes whenever data_root holds a
+    # different subset/order (and previously left StyleDenoiser's embedding
+    # table oversized with untrained rows if fewer classes were present).
     from src.dataset import Ds_point_model
-    idx_to_name = {idx: name for idx, (_, name) in
-                   enumerate(Ds_point_model.map().items())}
+    name_map        = Ds_point_model.map()   # class id string → readable name
+    idx_to_name     = {idx: name_map.get(cid, cid) for cid, idx in base_ds.class_to_idx.items()}
+    present_classes = sorted(idx_to_name.keys())
+
+    n_classes_actual = len(base_ds.class_to_idx)
+    if n_classes_actual != cfg.num_classes:
+        logger.info(
+            f"num_classes={cfg.num_classes} in config but {n_classes_actual} class(es) "
+            f"found in '{cfg.data_root}' ({[idx_to_name[i] for i in present_classes]}) "
+            f"— using {n_classes_actual}."
+        )
+        cfg.num_classes = n_classes_actual
 
     # ---- Diffusion models -----------------------------------------
     schedule  = CosineSchedule(T=cfg.T).to(device)
@@ -394,13 +504,12 @@ def main(cfg: DiffusionConfig) -> None:
         hidden=cfg.point_hidden,
         n_layers=cfg.point_layers,
         T=cfg.T,
+        resolution=cfg.point_resolution,
     ).to(device)
 
     logger.info(f"StyleDenoiser      params: {count_parameters(style_dn):,}")
     logger.info(f"LatentPointDenoiser params: {count_parameters(point_dn):,}")
 
-    # ---- Data ---------------------------------------------------------
-    base_ds = Ds_point_sampled_already(root=cfg.data_root, augment=False)
     indices = torch.randperm(len(base_ds),
                              generator=torch.Generator().manual_seed(cfg.seed)).tolist()
     val_n   = max(1, int(len(base_ds) * cfg.val_split))
@@ -416,6 +525,19 @@ def main(cfg: DiffusionConfig) -> None:
     val_loader = DataLoader(val_ds, batch_size=cfg.batch_size, shuffle=False,
                             num_workers=cfg.num_workers, pin_memory=cfg.pin_memory)
     logger.info(f"Dataset: {len(train_idx)} train / {len(val_idx)} val")
+
+    # ---- Reference cache for MMD / COV / 1-NNA (held-out real samples) ---
+    logger.info("Building per-class reference cache for generation metrics...")
+    ref_by_class: dict = {}
+    for feats, cls in val_ds:
+        ref_by_class.setdefault(int(cls.item()), []).append(feats[:, :3])
+    for cls_idx, pts_list in ref_by_class.items():
+        xyz = torch.stack(pts_list).to(device)          # (M, N_POINTS, 3) raw xyz
+        ref_by_class[cls_idx] = normalize_pc(xyz)        # same space as the decoder's output
+    logger.info(
+        "Reference cache: "
+        + ", ".join(f"{idx_to_name.get(k, k)}={v.shape[0]}" for k, v in ref_by_class.items())
+    )
 
     # ---- Optimisers (separate per model) ---------------------------
     def make_opt_sched(model):
@@ -479,7 +601,14 @@ def main(cfg: DiffusionConfig) -> None:
         if epoch % cfg.vis_every == 0:
             log_generations(
                 writer, schedule, style_dn, point_dn, vae, cfg, epoch,
-                device, idx_to_name,
+                device, idx_to_name, present_classes,
+            )
+
+        eval_summary = {}
+        if epoch % cfg.eval_every == 0:
+            eval_summary = evaluate_generation_metrics(
+                writer, schedule, style_dn, point_dn, vae, cfg, epoch,
+                device, idx_to_name, ref_by_class, logger,
             )
 
         val_loss = val.get("loss_style", math.inf) + val.get("loss_point", math.inf)
@@ -508,7 +637,8 @@ def main(cfg: DiffusionConfig) -> None:
             torch.save(save_state, os.path.join(cfg.ckpt_dir, "best.pt"))
 
         history.append({"epoch": epoch, **{f"trn_{k}": v for k, v in trn.items()},
-                                          **{f"val_{k}": v for k, v in val.items()}})
+                                          **{f"val_{k}": v for k, v in val.items()},
+                                          **{f"eval_{k}": v for k, v in eval_summary.items()}})
         with open(os.path.join(cfg.log_dir, "history.json"), "w") as f:
             json.dump(history, f, indent=2)
 

@@ -125,6 +125,94 @@ def normal_consistency(pred_pts: Tensor, pred_nrm: Tensor, tgt_pts: Tensor, tgt_
 
 
 # ============================================================
+# Generative-model set metrics (MMD-CD / COV-CD / 1-NNA-CD)
+# ============================================================
+#
+# Unlike the losses above (which score a single prediction against its own
+# target), these score a *set* of generated point clouds against a held-out
+# *set* of real ones — i.e. whether the generator's output distribution
+# matches the real one, not just whether individual samples denoise well.
+# A model can have a great denoising loss and still mode-collapse or produce
+# off-distribution shapes; these are the standard metrics (PointFlow, used by
+# LION) for catching that when picking a checkpoint.
+
+def _pairwise_cd_cross(a: Tensor, b: Tensor, chunk: int = 4) -> Tensor:
+    """
+    a: (Ma, N, 3)   b: (Mb, N, 3)   →   (Ma, Mb) Chamfer-distance matrix.
+
+    Computed in row chunks (`chunk` clouds of `a` against all of `b` per
+    step) instead of building the full Ma*Mb x N x N tensor at once, to
+    bound GPU memory regardless of how many samples are requested.
+    """
+    Ma, Mb = a.shape[0], b.shape[0]
+    D = a.new_zeros(Ma, Mb)
+    for start in range(0, Ma, chunk):
+        end  = min(start + chunk, Ma)
+        rows = a[start:end]
+        c    = rows.shape[0]
+        rows_exp = rows.unsqueeze(1).expand(c, Mb, -1, -1).reshape(c * Mb, *a.shape[1:])
+        cols_exp = b.unsqueeze(0).expand(c, Mb, -1, -1).reshape(c * Mb, *b.shape[1:])
+        cd, _, _ = chamfer_distance_knn(rows_exp, cols_exp, reduce="none")
+        D[start:end] = cd.view(c, Mb)
+    return D
+
+
+def mmd_cov(gen: Tensor, ref: Tensor, chunk: int = 4) -> dict[str, Tensor]:
+    """
+    MMD-CD and COV-CD (Yang et al., PointFlow 2019 — Sec 5.1; also used by LION).
+
+    gen: (Ng, N, 3)  generated point clouds
+    ref: (Nr, N, 3)  held-out real point clouds, SAME normalised coordinate
+                      space as gen (see Vae.normalize_pc — apply it to real
+                      clouds before calling this, since the decoder's output
+                      already lives in that space).
+
+    MMD — for each real sample, distance to its closest generated sample,
+          averaged over the real set. Lower = generated samples are on
+          average closer to real ones (fidelity).
+    COV  — fraction of real samples that are *someone's* nearest neighbour
+          among the generated set. Lower = many real modes are never
+          produced by any generated sample (mode collapse / low diversity).
+    """
+    D = _pairwise_cd_cross(gen, ref, chunk=chunk)          # D[i, j] = CD(gen_i, ref_j)
+    mmd = D.min(dim=0).values.mean()                        # per ref: closest gen, avg over ref
+    cov = D.min(dim=1).indices.unique().numel() / ref.shape[0]  # frac of ref hit as NN by some gen
+    return {"mmd": mmd, "cov": gen.new_tensor(cov)}
+
+
+def nna_1nn(gen: Tensor, ref: Tensor, chunk: int = 4) -> Tensor:
+    """
+    1-NNA-CD (Lopez-Paz & Oquab 2017, adapted by PointFlow for point clouds).
+
+    Pools gen and ref into one set; for every sample, finds its nearest
+    neighbour (leave-one-out) in the pooled set and checks whether that
+    neighbour comes from the same set (gen or ref). Returns the resulting
+    classification accuracy.
+
+    0.5 == ideal: gen and ref are statistically indistinguishable by 1-NN.
+    1.0 == gen and ref are trivially separable (bad — either the generator
+           is off-distribution, or it's producing near-duplicates that
+           cluster tightly instead of matching the real spread).
+    """
+    Ng, Nr = gen.shape[0], ref.shape[0]
+    all_pts = torch.cat([gen, ref], dim=0)
+    D = _pairwise_cd_cross(all_pts, all_pts, chunk=chunk)
+    D.fill_diagonal_(float("inf"))                          # exclude self as its own neighbour
+
+    labels  = torch.cat([gen.new_zeros(Ng), gen.new_ones(Nr)])
+    nn_idx  = D.argmin(dim=1)
+    correct = (labels[nn_idx] == labels).float().mean()
+    return correct
+
+
+def generative_metrics(gen: Tensor, ref: Tensor, chunk: int = 4) -> dict[str, Tensor]:
+    """MMD-CD, COV-CD and 1-NNA-CD in one call. See mmd_cov / nna_1nn for definitions."""
+    out = mmd_cov(gen, ref, chunk=chunk)
+    out["nna_1nn"] = nna_1nn(gen, ref, chunk=chunk)
+    return out
+
+
+# ============================================================
 # KL Divergence
 # ============================================================
 

@@ -202,7 +202,10 @@ class Ds_point_sampled_already:
         self.augment = augment
         self.transform = data_augs
 
-        self.class_to_idx = {cls_id: idx for idx, cls_id in enumerate(Ds_point_model.map().keys())}
+        present_classes = sorted({
+            os.path.basename(f).replace(".ply", "").split("_")[0] for f in self.files
+        })
+        self.class_to_idx = {cls_id: idx for idx, cls_id in enumerate(present_classes)}
 
     def __len__(self):
         return len(self.files)

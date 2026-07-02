@@ -14,6 +14,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from src.Encoder import PVConvBlockConditioned
+
 
 # ────────────────────────────────────────────────────────────────────────────
 # Noise schedule
@@ -138,26 +140,6 @@ class MLPResBlock(nn.Module):
         return x + self.fc2(F.silu(self.fc1(h)))
 
 
-class Conv1dResBlock(nn.Module):
-    """Point-wise residual block for (B, C, N) tensors, conditioned via GroupNorm scale/shift."""
-    def __init__(self, dim: int, cond_dim: int):
-        super().__init__()
-        n_groups = min(8, dim // 4) or 1
-        self.norm = nn.GroupNorm(n_groups, dim)
-        self.c1   = nn.Conv1d(dim, dim * 4, 1)
-        self.c2   = nn.Conv1d(dim * 4, dim, 1)
-        self.cond = nn.Linear(cond_dim, dim * 2)   # → scale + shift
-        nn.init.zeros_(self.c2.weight)
-        nn.init.zeros_(self.c2.bias)
-
-    def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
-        # x: (B, dim, N);  cond: (B, cond_dim)
-        h  = self.norm(x)
-        sc, sh = self.cond(cond).chunk(2, dim=-1)
-        h  = h * (1 + sc.unsqueeze(-1)) + sh.unsqueeze(-1)
-        return x + self.c2(F.silu(self.c1(h)))
-
-
 # ────────────────────────────────────────────────────────────────────────────
 # Stage 1  –  Style Denoiser   (class → z_g)
 # ────────────────────────────────────────────────────────────────────────────
@@ -231,22 +213,32 @@ class LatentPointDenoiser(nn.Module):
     ε-predictor for the local latent cloud z_l ∈ ℝ^{N × point_dim}.
     point_dim must equal Vae.latent_dim — no anchor prefix since the anchor bypass was removed.
 
-    Processing is shared across N (Conv1d = per-point MLP), conditioned on
-    z_g + timestep via adaptive group normalisation.
+    Uses the same PVCNN block (voxel branch + point branch) as Vae's
+    LocalEncoder/LIONDecoder, instead of a purely per-point Conv1d stack.
 
-    Why no upsampling / attention across points here?  The latent cloud is
-    already at the final resolution (2048 pts), and z_g carries the global
-    shape context.  A simple per-point network suffices to model
-    the conditional distribution p(z_local | z_g).
+    Why: LocalEncoder and LIONDecoder both mix features across spatially
+    nearby points (via voxelisation) to produce/consume z_local, so the true
+    p(z_local | z_g) has real cross-point correlation baked in by
+    construction. A denoiser that only ever sees zt[i] in isolation cannot
+    represent that correlation at any width/depth — its MSE floor is
+    Var(ε[i] | zt[i], z_g, t), which is provably >= the floor achievable once
+    the network can also condition on zt of neighbouring points. The voxel
+    branch gives it exactly that.
+
+    zt carries no explicit xyz — like LIONDecoder, we derive a coarse xyz
+    proxy from zt itself purely to seed voxelisation, and refine it after
+    every block using the block's own output features (mirrors
+    LIONDecoder's stage-wise refine0/refine1).
     """
 
     def __init__(
         self,
-        point_dim:  int = 8,   # must match Vae latent_dim — no anchors in z_l anymore
+        point_dim:  int = 8,    # must match Vae latent_dim — no anchors in z_l anymore
         style_dim:  int = 256,
-        hidden:     int = 256,
+        hidden:     int = 160,
         n_layers:   int = 8,
         T:          int = 1000,
+        resolution: int = 16,
     ):
         super().__init__()
         time_dim = hidden
@@ -258,8 +250,17 @@ class LatentPointDenoiser(nn.Module):
         # Fuse time embedding + global style into a single conditioning vector
         self.cond_proj = nn.Linear(time_dim + style_dim, time_dim)
 
-        self.input_proj  = nn.Conv1d(point_dim, hidden, 1)
-        self.blocks      = nn.ModuleList([Conv1dResBlock(hidden, time_dim) for _ in range(n_layers)])
+        # Coarse xyz proxy from zt — voxelisation seed only, not a model output.
+        self.pos_head = nn.Sequential(
+            nn.Conv1d(point_dim, 64, 1), nn.GELU(), nn.Conv1d(64, 3, 1),
+        )
+
+        self.input_proj = nn.Conv1d(point_dim, hidden, 1)
+        self.blocks  = nn.ModuleList([
+            PVConvBlockConditioned(hidden, hidden, time_dim, resolution=resolution)
+            for _ in range(n_layers)
+        ])
+        self.refines = nn.ModuleList([nn.Conv1d(hidden, 3, 1) for _ in range(n_layers)])
         self.output_proj = nn.Conv1d(hidden, point_dim, 1)
         nn.init.zeros_(self.output_proj.weight)
         nn.init.zeros_(self.output_proj.bias)
@@ -273,7 +274,12 @@ class LatentPointDenoiser(nn.Module):
         t_emb = self.time_mlp(t_emb)
         cond  = self.cond_proj(torch.cat([t_emb, z_g], dim=-1))   # (B, time_dim)
 
-        h = self.input_proj(zt.permute(0, 2, 1))   # (B, hidden, N)
-        for block in self.blocks:
-            h = block(h, cond)
-        return self.output_proj(h).permute(0, 2, 1)  # (B, N, point_dim)
+        z   = zt.permute(0, 2, 1)                                 # (B, point_dim, N)
+        xyz = torch.tanh(self.pos_head(z)).permute(0, 2, 1)        # (B, N, 3) voxelisation seed
+
+        h = self.input_proj(z).permute(0, 2, 1)                    # (B, N, hidden)
+        for block, refine in zip(self.blocks, self.refines):
+            h   = block(xyz, h, cond)                               # cross-point mixing
+            xyz = torch.tanh(xyz + refine(h.permute(0, 2, 1)).permute(0, 2, 1))
+
+        return self.output_proj(h.permute(0, 2, 1)).permute(0, 2, 1)  # (B, N, point_dim)
