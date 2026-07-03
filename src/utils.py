@@ -12,8 +12,14 @@ def farthest_point_sample(xyz: torch.Tensor, npoint: int) -> torch.Tensor:
     centroids = torch.zeros(B, npoint, dtype=torch.long, device=device)
     distance = torch.full((B, N), 1e10, device=device)
 
-    # inicialização mais estável
-    farthest = torch.randint(0, N, (B,), device=device)
+    # Início DETERMINÍSTICO: ponto mais distante do centróide.
+    # Antes era torch.randint (aleatório), o que fazia o subconjunto de âncoras
+    # — e portanto o latente z_l — variar a cada chamada para a mesma nuvem.
+    # Na difusão isso injetava ruído no alvo (z_l extraído a cada step muda por
+    # época). Com um seed determinístico e canônico (independe da ordem em que
+    # os pontos estão salvos), o mesmo shape gera sempre o mesmo z_l.
+    centroid = xyz.mean(dim=1, keepdim=True)             # (B, 1, 3)
+    farthest = ((xyz - centroid) ** 2).sum(dim=-1).argmax(dim=1)  # (B,)
 
     batch_indices = torch.arange(B, device=device)
 
