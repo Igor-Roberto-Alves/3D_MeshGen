@@ -70,8 +70,9 @@ class DiffusionConfig:
     guidance:       float = 3.0    # CFG scale at inference
 
     # --- Latent point denoiser (Stage 2) ---
+    # U-Net depth/downsampling schedule (2048->1024->256->64->16) and attention
+    # placement are fixed in LatentPointDenoiser.NPOINTS / ATTN_NPTS.
     point_hidden:     int = 160
-    point_layers:     int = 8
     point_resolution: int = 16   # voxelisation grid for cross-point mixing
 
     # --- training ---
@@ -499,10 +500,9 @@ def main(cfg: DiffusionConfig) -> None:
     ).to(device)
 
     point_dn  = LatentPointDenoiser(
-        point_dim=cfg.vae_latent_dim,   # no anchor prefix — must match Vae.latent_dim
+        point_dim=cfg.vae_latent_dim,   # diffused channels = vae_latent_dim + 3 (xyz)
         style_dim=cfg.vae_style_dim,
         hidden=cfg.point_hidden,
-        n_layers=cfg.point_layers,
         T=cfg.T,
         resolution=cfg.point_resolution,
     ).to(device)
