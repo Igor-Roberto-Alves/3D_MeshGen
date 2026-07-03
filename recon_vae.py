@@ -43,9 +43,12 @@ def main():
     p.add_argument("--vae_in_channels", type=int, default=6)
     p.add_argument("--batch_size",      type=int, default=16)
     p.add_argument("--n_batches",       type=int, default=8)
-    p.add_argument("--fscore_thresh",   type=float, default=0.01)
     p.add_argument("--device",          default="cuda")
+    p.add_argument("--plot_samples",    type=int, default=4, help="quantas amostras plotar (0 = sem plot)")
+    p.add_argument("--plot_out",        default="recon_vae.png")
     args = p.parse_args()
+
+    FSCORE_THRESHOLDS = [0.01, 0.02, 0.05, 0.1]
 
     device = torch.device(args.device if (args.device == "cuda" and torch.cuda.is_available()) else "cpu")
     print(f"Device: {device}")
@@ -68,9 +71,11 @@ def main():
     ds = Ds_point_sampled_already(root=args.data_root, augment=False)
     loader = DataLoader(ds, batch_size=args.batch_size, shuffle=True)
 
-    cds, fss, zl_all = [], [], []
+    cds, zl_all = [], []
+    fss = {th: [] for th in FSCORE_THRESHOLDS}
+    plot_gt = plot_recon = None   # primeira batch, p/ visualizacao
     it = iter(loader)
-    for _ in range(args.n_batches):
+    for bi in range(args.n_batches):
         try:
             points, _ = next(it)
         except StopIteration:
@@ -86,19 +91,32 @@ def main():
 
         n = min(xyz_out.shape[1], target_xyz.shape[1])
         cd, _, _ = chamfer_distance_knn(xyz_out[:, :n], target_xyz[:, :n], reduce="none")
-        fs = f_score(xyz_out[:, :n], target_xyz[:, :n], threshold=args.fscore_thresh, reduce="none")
-
         cds.append(cd.cpu())
-        fss.append(fs["f_score"].cpu())
+        for th in FSCORE_THRESHOLDS:
+            fs = f_score(xyz_out[:, :n], target_xyz[:, :n], threshold=th, reduce="none")
+            fss[th].append(fs["f_score"].cpu())
         zl_all.append(mu_l.reshape(-1, mu_l.shape[-1]).cpu())
 
+        if bi == 0 and args.plot_samples > 0:
+            k = min(args.plot_samples, points.shape[0])
+            plot_gt    = target_xyz[:k].cpu()
+            plot_recon = xyz_out[:k].cpu()
+
     cds = torch.cat(cds)
-    fss = torch.cat(fss)
     zl  = torch.cat(zl_all)   # (n_pontos_total, latent_dim)
+
+    # Espacamento tipico DENTRO da nuvem real (referencia de escala p/ o F-Score)
+    ref = target_xyz[0, :n]
+    d_intra = torch.cdist(ref, ref)
+    d_intra.fill_diagonal_(float("inf"))
+    nn_intra = d_intra.min(dim=1).values.mean().item()
 
     print("=== Reconstrucao do VAE (deterministica) ===")
     print(f"  Chamfer:  mean={cds.mean():.5f}  median={cds.median():.5f}  max={cds.max():.5f}")
-    print(f"  F-Score@{args.fscore_thresh}: mean={fss.mean():.4f}  (1.0=perfeito)")
+    for th in FSCORE_THRESHOLDS:
+        print(f"  F-Score@{th:<4}: mean={torch.cat(fss[th]).mean():.4f}")
+    print(f"  (espacamento medio entre pontos vizinhos na nuvem real ~ {nn_intra:.4f})")
+    print("   -> use um limiar >= esse espacamento; abaixo dele o F-Score cai por amostragem, nao por forma errada")
     print(f"  (amostras avaliadas: {cds.shape[0]})\n")
 
     # ---- Estrutura do latente z_l ----
@@ -115,12 +133,40 @@ def main():
     print(f"  rank efetivo (participation ratio) = {part_ratio:.2f} de {zl.shape[1]}")
     print(f"  correlacao media |off-diag| = {cov.fill_diagonal_(0).abs().mean():.4f}\n")
 
+    # ---- Plot input vs reconstrucao ----
+    if plot_gt is not None:
+        _plot_recon(plot_gt, plot_recon, args.plot_out)
+        print(f"Plot salvo em: {args.plot_out}\n")
+
     print("=== Como ler ===")
-    print("  - F-Score alto (>~0.7) e Chamfer baixo => latente carrega estrutura")
+    print("  - Recon visual fiel + Chamfer baixo => latente carrega estrutura")
     print("    => 0.36 travado e problema do DENOISER (tunavel).")
-    print("  - F-Score baixo / Chamfer alto => latente pobre")
+    print("  - Recon visual errada / Chamfer alto => latente pobre")
     print("    => 0.36 e teto do VAE (mexer em KL / ancoras xyz).")
     print("  - rank efetivo << latent_dim ou dims com std~0 => colapso posterior parcial.")
+
+
+def _plot_recon(gt, recon, out_path):
+    """gt, recon: (k, N, 3). Salva um grid input-vs-recon em 3D."""
+    import matplotlib
+    matplotlib.use("Agg")   # headless-safe
+    import matplotlib.pyplot as plt
+    from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+
+    k = gt.shape[0]
+    fig = plt.figure(figsize=(6, 3 * k))
+    for i in range(k):
+        for col, (pts, title) in enumerate([(gt[i], "input"), (recon[i], "recon")]):
+            ax = fig.add_subplot(k, 2, i * 2 + col + 1, projection="3d")
+            p = pts.numpy()
+            ax.scatter(p[:, 0], p[:, 1], p[:, 2], s=2,
+                       c=("green" if col == 0 else "tab:blue"))
+            ax.set_title(f"#{i} {title}", fontsize=9)
+            ax.set_box_aspect([1, 1, 1])
+            ax.set_xticks([]); ax.set_yticks([]); ax.set_zticks([])
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=110)
+    plt.close(fig)
 
 
 if __name__ == "__main__":
