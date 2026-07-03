@@ -45,11 +45,12 @@ class VaeUp(nn.Module):
 
         Returns
         -------
-        xyz_out   (B, N, 3)
-        mu_l      (B, n_latent, latent_dim)
-        logvar_l  (B, n_latent, latent_dim)
-        mu_g      (B, style_dim)
-        logvar_g  (B, style_dim)
+        xyz_out    (B, N, 3)
+        xyz_coarse (B, n_latent, 3)   — coarse 512-point output before folding
+        mu_l       (B, n_latent, latent_dim)
+        logvar_l   (B, n_latent, latent_dim)
+        mu_g       (B, style_dim)
+        logvar_g   (B, style_dim)
         """
         x = normalize_pc(x)
 
@@ -61,8 +62,8 @@ class VaeUp(nn.Module):
         logvar_l = logvar_l.clamp(-10.0, 10.0)
         z_l = mu_l + torch.randn_like(mu_l) * (0.5 * logvar_l).exp()
 
-        xyz_out = self.decoder(z_l, z_g)
-        return xyz_out, mu_l, logvar_l, mu_g, logvar_g
+        xyz_out, xyz_coarse = self.decoder(z_l, z_g, return_coarse=True)
+        return xyz_out, xyz_coarse, mu_l, logvar_l, mu_g, logvar_g
 
     @torch.no_grad()
     def generate(

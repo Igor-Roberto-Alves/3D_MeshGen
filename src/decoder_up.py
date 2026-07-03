@@ -54,9 +54,9 @@ class LIONDecoderUp(nn.Module):
         )
         self.feat_proj = SharedMLP([latent_dim, 128, 256])
 
-        self.stage0  = PVConvBlockDecoder(256, 256, style_dim, resolution=8)
-        self.stage1  = PVConvBlockDecoder(256, 128, style_dim, resolution=8)
-        self.stage2  = PVConvBlockDecoder(128, 64,  style_dim, resolution=8)
+        self.stage0  = PVConvBlockDecoder(256, 256, style_dim, resolution=16)
+        self.stage1  = PVConvBlockDecoder(256, 128, style_dim, resolution=16)
+        self.stage2  = PVConvBlockDecoder(128, 64,  style_dim, resolution=16)
 
         self.refine0 = nn.Conv1d(256, 3, 1)
         self.refine1 = nn.Conv1d(128, 3, 1)
@@ -72,11 +72,17 @@ class LIONDecoderUp(nn.Module):
         seeds = _make_seeds(self.ratio)          # (ratio, 2)  — fixed, non-trainable
         self.register_buffer("seeds", seeds)
 
-    def forward(self, z_l: torch.Tensor, z_global: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        z_l: torch.Tensor,
+        z_global: torch.Tensor,
+        return_coarse: bool = False,
+    ):
         """
         z_l     : (B, n_latent, latent_dim)
         z_global: (B, style_dim)
         Returns : (B, n_latent * ratio, 3)
+                  or ((B, n_latent * ratio, 3), (B, n_latent, 3)) if return_coarse=True
         """
         B = z_l.shape[0]
         z = z_l.permute(0, 2, 1)                                              # (B, D, n_latent)
@@ -109,4 +115,7 @@ class LIONDecoderUp(nn.Module):
         xyz_rep  = xyz_cur.unsqueeze(2).expand(-1, -1, self.ratio, -1)       # (B, n_latent, ratio, 3)
         xyz_fine = torch.tanh(xyz_rep + delta)                               # (B, n_latent, ratio, 3)
 
-        return xyz_fine.reshape(B, self.n_latent * self.ratio, 3)            # (B, N, 3)
+        xyz_fine = xyz_fine.reshape(B, self.n_latent * self.ratio, 3)         # (B, N, 3)
+        if return_coarse:
+            return xyz_fine, xyz_cur
+        return xyz_fine

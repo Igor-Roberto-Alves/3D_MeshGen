@@ -23,7 +23,7 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
 from src.dataset import Ds_point_sampled_already
-from src.metric import f_score, vae_loss
+from src.metric import chamfer_distance_knn, f_score, vae_loss
 from src.vae_up import VaeUp
 from src.Vae import normalize_pc
 
@@ -57,8 +57,14 @@ class TrainConfig:
 
     # --- VAE beta scheduling (KL annealing) ---
     beta_start:       float = 0.0
-    beta_end:         float = 2.0
-    beta_epochs:      int   = 80
+    beta_end:         float = 1.0
+    beta_epochs:      int   = 100
+
+    # --- KL ---
+    free_bits:        float = 0.0   # 0.0 = puro beta-VAE; 0.5 (antigo padrão) travava no piso
+
+    # --- coarse supervision (auxiliary loss on 512-point folding anchors) ---
+    coarse_weight:    float = 0.5
 
     # --- reconstruction loss ---
     recon_loss:       str   = "both"
@@ -198,7 +204,7 @@ def train_one_epoch(model, loader, optimiser, scaler, cfg, epoch, logger, device
         optimiser.zero_grad(set_to_none=True)
 
         with torch.autocast(device_type=device.type, enabled=cfg.amp):
-            xyz_out, mu_l, logvar_l, mu_g, logvar_g = model(points)
+            xyz_out, xyz_coarse, mu_l, logvar_l, mu_g, logvar_g = model(points)
             losses = vae_loss(
                 pred_xyz=xyz_out,
                 target_xyz=target_xyz,
@@ -207,11 +213,22 @@ def train_one_epoch(model, loader, optimiser, scaler, cfg, epoch, logger, device
                 mu_style=mu_g,
                 logvar_style=logvar_g,
                 beta=beta,
+                free_bits=cfg.free_bits,
                 recon_loss=cfg.recon_loss,
                 emd_weight=cfg.emd_weight,
                 emd_iters=cfg.emd_iters,
                 emd_n_subsample=cfg.emd_n_subsample,
             )
+
+            # Coarse supervision: Chamfer entre os 512 pontos âncora do folding
+            # e uma subamostra aleatória de 512 pontos do alvo.
+            # Força os pontos grosseiros a cobrir a superfície antes de fazer o folding.
+            if cfg.coarse_weight > 0.0:
+                perm = torch.randperm(target_xyz.shape[1], device=device)[:cfg.n_latent]
+                target_coarse = target_xyz[:, perm, :]
+                coarse_cd, _, _ = chamfer_distance_knn(xyz_coarse, target_coarse)
+                losses["coarse_cd"] = coarse_cd
+                losses["total"] = losses["total"] + cfg.coarse_weight * coarse_cd
 
         scaler.scale(losses["total"]).backward()
         scaler.unscale_(optimiser)
@@ -245,7 +262,7 @@ def validate(model, loader, cfg, epoch, device):
         target_xyz = normalize_pc(points)[..., :3]
 
         with torch.autocast(device_type=device.type, enabled=cfg.amp):
-            xyz_out, mu_l, logvar_l, mu_g, logvar_g = model(points)
+            xyz_out, xyz_coarse, mu_l, logvar_l, mu_g, logvar_g = model(points)
             losses = vae_loss(
                 pred_xyz=xyz_out,
                 target_xyz=target_xyz,
@@ -254,16 +271,19 @@ def validate(model, loader, cfg, epoch, device):
                 mu_style=mu_g,
                 logvar_style=logvar_g,
                 beta=beta,
+                free_bits=cfg.free_bits,
                 recon_loss=cfg.recon_loss,
                 emd_weight=cfg.emd_weight,
                 emd_iters=cfg.emd_iters,
                 emd_n_subsample=cfg.emd_n_subsample,
             )
 
-        fs = f_score(xyz_out, target_xyz, threshold=0.01)
+        fs05 = f_score(xyz_out, target_xyz, threshold=0.05)
+        fs10 = f_score(xyz_out, target_xyz, threshold=0.10)
         for k, v in losses.items():
             totals[k] = totals.get(k, 0.0) + v.item()
-        totals["f_score"] = totals.get("f_score", 0.0) + fs["f_score"].item()
+        totals["f05"] = totals.get("f05", 0.0) + fs05["f_score"].item()
+        totals["f10"] = totals.get("f10", 0.0) + fs10["f_score"].item()
         n_batches += 1
 
     return {k: v / max(n_batches, 1) for k, v in totals.items()}
@@ -340,7 +360,7 @@ def main(cfg: TrainConfig) -> None:
 
     # ---- Resume ---------------------------------------------------------
     start_epoch = 0
-    best_val_cd = math.inf
+    best_val_f10 = 0.0
     history: list = []
 
     resume_path = os.path.join(cfg.ckpt_dir, "latest.pt")
@@ -350,9 +370,9 @@ def main(cfg: TrainConfig) -> None:
         optimiser.load_state_dict(ckpt["optimiser"])
         scheduler.load_state_dict(ckpt["scheduler"])
         scaler.load_state_dict(ckpt["scaler"])
-        start_epoch = ckpt["epoch"] + 1
-        best_val_cd = ckpt.get("best_val_cd", math.inf)
-        history     = ckpt.get("history", [])
+        start_epoch  = ckpt["epoch"] + 1
+        best_val_f10 = ckpt.get("best_val_f10", 0.0)
+        history      = ckpt.get("history", [])
         logger.info(f"Resumed from epoch {start_epoch}")
 
     # ---- Training loop --------------------------------------------------
@@ -388,21 +408,21 @@ def main(cfg: TrainConfig) -> None:
         if epoch % cfg.grad_hist_every == 0:
             log_grad_histograms(writer, model, epoch)
 
-        val_cd  = val_metrics.get("recon", math.inf)
-        is_best = (epoch >= cfg.beta_epochs) and (val_cd < best_val_cd)
+        val_f10 = val_metrics.get("f10", 0.0)
+        is_best = (epoch >= cfg.beta_epochs) and (val_f10 > best_val_f10)
         if is_best:
-            best_val_cd = val_cd
-            logger.info(f"  New best val recon: {best_val_cd:.6f}")
+            best_val_f10 = val_f10
+            logger.info(f"  New best val F@0.10: {best_val_f10:.4f}")
 
         save_state = {
-            "epoch":       epoch,
-            "model":       model.state_dict(),
-            "optimiser":   optimiser.state_dict(),
-            "scheduler":   scheduler.state_dict(),
-            "scaler":      scaler.state_dict(),
-            "best_val_cd": best_val_cd,
-            "config":      asdict(cfg),
-            "history":     history,
+            "epoch":        epoch,
+            "model":        model.state_dict(),
+            "optimiser":    optimiser.state_dict(),
+            "scheduler":    scheduler.state_dict(),
+            "scaler":       scaler.state_dict(),
+            "best_val_f10": best_val_f10,
+            "config":       asdict(cfg),
+            "history":      history,
         }
         torch.save(save_state, os.path.join(cfg.ckpt_dir, "latest.pt"))
         if (epoch + 1) % cfg.save_every == 0:

@@ -268,6 +268,7 @@ def vae_loss(
     beta:            float          = 1.0,
     beta_points:     float          = 1.0,
     beta_style:      float          = 1.0,
+    free_bits:       float          = 0.0,
     recon_loss:      str            = "chamfer",
     emd_weight:      float          = 0.5,
     emd_iters:       int            = 15,
@@ -317,8 +318,8 @@ def vae_loss(
     # --- 3. KL losses --------------------------------------------------
     # mu_points / logvar_points are (B, N, latent_dim) — full local latent,
     # no xyz prefix, so we use the full tensor here.
-    kl_pts = kl_divergence(mu_points, logvar_points)
-    kl_sty = kl_divergence(mu_style,  logvar_style)
+    kl_pts = kl_divergence(mu_points, logvar_points, free_bits=free_bits)
+    kl_sty = kl_divergence(mu_style,  logvar_style,  free_bits=free_bits)
     out["kl_points"] = kl_pts
     out["kl_style"]  = kl_sty
 
