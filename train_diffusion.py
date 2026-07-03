@@ -21,6 +21,7 @@ Generation (end of training / TensorBoard):
 import argparse
 import json
 import logging
+from contextlib import contextmanager
 import math
 import os
 from dataclasses import asdict, dataclass
@@ -85,6 +86,8 @@ class DiffusionConfig:
     weight_decay:   float = 1e-4
     warmup_epochs:  int   = 10
     grad_clip:      float = 1.0
+    min_snr_gamma:  float = 5.0    # Min-SNR-γ loss weighting (<=0 desativa)
+    ema_decay:      float = 0.999  # EMA dos pesos p/ amostragem (<=0 desativa)
 
     # --- data ---
     val_split:   float = 0.1
@@ -220,21 +223,151 @@ def compute_latent_stats(
 
 
 # ============================================================
+# Latent caching (precompute once, train on the cache)
+# ============================================================
+
+@torch.no_grad()
+def build_latent_cache(
+    vae:    Vae | VaeUp,
+    subset,
+    cfg:    "DiffusionConfig",
+    device: torch.device,
+    logger: logging.Logger,
+    tag:    str,
+) -> torch.utils.data.TensorDataset:
+    """
+    Precompute (z_g, z_l, class_idx) for every sample once, using the frozen VAE
+    with augmentation OFF and the (now deterministic) FPS.
+
+    This removes the VAE encoder — the dominant per-step cost — from the training
+    loop entirely, so many more epochs fit in the same wall-clock budget, and it
+    makes the diffusion target fully deterministic (the same shape always yields
+    the same z_l), which is what we want for stable convergence.
+    """
+    loader = DataLoader(subset, batch_size=cfg.batch_size, shuffle=False,
+                        num_workers=cfg.num_workers, pin_memory=cfg.pin_memory)
+    ZG, ZL, CLS = [], [], []
+    for points, cls in loader:
+        z_g, z_l = extract_latents(vae, points.to(device))
+        ZG.append(z_g.cpu()); ZL.append(z_l.cpu()); CLS.append(cls)
+    ZG, ZL, CLS = torch.cat(ZG), torch.cat(ZL), torch.cat(CLS).long()
+    logger.info(f"  cached {tag}: z_g {tuple(ZG.shape)}  z_l {tuple(ZL.shape)}  ({CLS.numel()} samples)")
+    return torch.utils.data.TensorDataset(ZG, ZL, CLS)
+
+
+def normalizer_from_cache(cache, device, logger) -> LatentNormalizer:
+    """Per-dim mean/std of the cached latents (replaces the extra stat pass)."""
+    ZG, ZL, _ = cache.tensors
+    zg_mean, zg_std = ZG.mean(0), ZG.std(0).clamp(min=1e-6)
+    zl_flat = ZL.reshape(-1, ZL.shape[-1])
+    zl_mean, zl_std = zl_flat.mean(0), zl_flat.std(0).clamp(min=1e-6)
+    logger.info(
+        f"Latent stats (from cache): "
+        f"z_g std mean={zg_std.mean():.4f}  z_l std mean={zl_std.mean():.4f}"
+    )
+    return LatentNormalizer(zg_mean.to(device), zg_std.to(device),
+                            zl_mean.to(device), zl_std.to(device))
+
+
+# ============================================================
+# EMA (exponential moving average of the denoiser weights)
+# ============================================================
+
+class EMA:
+    """
+    Mantém uma cópia suavizada dos pesos, usada para AMOSTRAR (não para treinar).
+
+    Difusão treina com loss duplamente estocástica (t e ε aleatórios por step),
+    então os pesos balançam mesmo já convergidos. Amostrar da média EMA em vez
+    dos pesos crus dá amostras bem mais limpas — prática padrão (DDPM/LION/EDM).
+
+    O decay tem warmup adaptativo `min(decay, (1+step)/(10+step))` para não ficar
+    travado no início quando o treino é curto (poucos steps).
+    """
+    def __init__(self, model, decay: float = 0.999):
+        self.decay  = decay
+        self.step   = 0
+        self.shadow = {k: p.detach().clone()
+                       for k, p in model.named_parameters() if p.requires_grad}
+        self._backup = None
+
+    @torch.no_grad()
+    def update(self, model):
+        self.step += 1
+        d = min(self.decay, (1 + self.step) / (10 + self.step))
+        for k, p in model.named_parameters():
+            if p.requires_grad:
+                self.shadow[k].mul_(d).add_(p.detach(), alpha=1 - d)
+
+    def copy_to(self, model):
+        for k, p in model.named_parameters():
+            if k in self.shadow:
+                p.data.copy_(self.shadow[k])
+
+    def store(self, model):
+        self._backup = {k: p.detach().clone()
+                        for k, p in model.named_parameters() if p.requires_grad}
+
+    def restore(self, model):
+        for k, p in model.named_parameters():
+            if k in self._backup:
+                p.data.copy_(self._backup[k])
+        self._backup = None
+
+    def state_dict(self):
+        return {"decay": self.decay, "step": self.step,
+                "shadow": {k: v.cpu() for k, v in self.shadow.items()}}
+
+    def load_state_dict(self, sd, device):
+        self.decay  = sd["decay"]
+        self.step   = sd["step"]
+        self.shadow = {k: v.to(device) for k, v in sd["shadow"].items()}
+
+
+@contextmanager
+def use_ema(pairs):
+    """Troca temporariamente os pesos dos modelos pelos EMA; restaura ao sair.
+    pairs: lista de (ema, model)."""
+    for ema, m in pairs:
+        ema.store(m); ema.copy_to(m)
+    try:
+        yield
+    finally:
+        for ema, m in pairs:
+            ema.restore(m)
+
+
+# ============================================================
 # Loss
 # ============================================================
 
 def diffusion_loss(
-    schedule:   CosineSchedule,
-    denoiser:   nn.Module,
-    x0:         torch.Tensor,
-    condition:  torch.Tensor,
+    schedule:      CosineSchedule,
+    denoiser:      nn.Module,
+    x0:            torch.Tensor,
+    condition:     torch.Tensor,
+    min_snr_gamma: float | None = 5.0,
 ) -> torch.Tensor:
-    """Simple DDPM ε-prediction MSE loss."""
+    """
+    DDPM ε-prediction MSE loss with optional Min-SNR-γ weighting (Hang et al. 2023).
+
+    With uniform-t sampling the many easy low-noise steps dominate the gradient
+    and slow convergence. Min-SNR truncates each timestep's weight to
+    min(SNR_t, γ)/SNR_t (the ε-prediction form), which down-weights the low-noise
+    steps and lets the model spend capacity where signal actually exists. γ=5 is
+    the value from the paper; pass None to disable.
+    """
     B  = x0.shape[0]
     t  = torch.randint(0, schedule.T, (B,), device=x0.device)
     xt, noise = schedule.q_sample(x0, t)
     pred      = denoiser(xt, t, condition)
-    return F.mse_loss(pred, noise)
+
+    mse = F.mse_loss(pred, noise, reduction="none").flatten(1).mean(1)   # (B,)
+    if min_snr_gamma is not None:
+        snr    = schedule.acp[t] / (1 - schedule.acp[t]).clamp(min=1e-8)  # (B,)
+        weight = snr.clamp(max=min_snr_gamma) / snr.clamp(min=1e-8)
+        mse    = weight * mse
+    return mse.mean()
 
 
 # ============================================================
@@ -417,7 +550,6 @@ def evaluate_generation_metrics(
 # ============================================================
 
 def train_one_epoch(
-    vae:        Vae | VaeUp,
     schedule:   CosineSchedule,
     style_dn:   StyleDenoiser,
     point_dn:   LatentPointDenoiser,
@@ -431,24 +563,26 @@ def train_one_epoch(
     logger:     logging.Logger,
     device:     torch.device,
     normalizer: LatentNormalizer | None = None,
+    ema_s:      "EMA | None" = None,
+    ema_p:      "EMA | None" = None,
 ) -> dict:
     style_dn.train(); point_dn.train()
     totals    = {}
     n_batches = 0
+    gamma = cfg.min_snr_gamma if cfg.min_snr_gamma > 0 else None
 
-    for batch_idx, (points, class_idx) in enumerate(loader):
-        points    = points.to(device, non_blocking=True)
+    for batch_idx, (z_g, z_local, class_idx) in enumerate(loader):
+        # Latents are precomputed (frozen VAE) — just move + normalise.
+        z_g       = z_g.to(device, non_blocking=True)
+        z_local   = z_local.to(device, non_blocking=True)
         class_idx = class_idx.to(device, non_blocking=True)
-
-        # --- Extract clean latents from frozen VAE, then normalise ---
-        z_g, z_local = extract_latents(vae, points)
         if normalizer is not None:
-            z_g   = normalizer.norm_zg(z_g)
+            z_g     = normalizer.norm_zg(z_g)
             z_local = normalizer.norm_zl(z_local)
 
         # --- Stage 1: style DDPM loss (separate scaler avoids cross-contamination) ---
         with torch.autocast(device_type=device.type, enabled=cfg.amp):
-            loss_s = diffusion_loss(schedule, style_dn, z_g, class_idx)
+            loss_s = diffusion_loss(schedule, style_dn, z_g, class_idx, gamma)
 
         opt_s.zero_grad(set_to_none=True)
         scaler_s.scale(loss_s).backward()
@@ -456,10 +590,12 @@ def train_one_epoch(
         nn.utils.clip_grad_norm_(style_dn.parameters(), cfg.grad_clip)
         scaler_s.step(opt_s)
         scaler_s.update()
+        if ema_s is not None:
+            ema_s.update(style_dn)
 
         # --- Stage 2: latent point DDPM loss (conditioned on normalised z_g) ---
         with torch.autocast(device_type=device.type, enabled=cfg.amp):
-            loss_p = diffusion_loss(schedule, point_dn, z_local, z_g)
+            loss_p = diffusion_loss(schedule, point_dn, z_local, z_g, gamma)
 
         opt_p.zero_grad(set_to_none=True)
         scaler_p.scale(loss_p).backward()
@@ -467,6 +603,8 @@ def train_one_epoch(
         nn.utils.clip_grad_norm_(point_dn.parameters(), cfg.grad_clip)
         scaler_p.step(opt_p)
         scaler_p.update()
+        if ema_p is not None:
+            ema_p.update(point_dn)
 
         totals["loss_style"] = totals.get("loss_style", 0.0) + loss_s.item()
         totals["loss_point"] = totals.get("loss_point", 0.0) + loss_p.item()
@@ -484,7 +622,6 @@ def train_one_epoch(
 
 @torch.no_grad()
 def validate(
-    vae:        Vae | VaeUp,
     schedule:   CosineSchedule,
     style_dn:   StyleDenoiser,
     point_dn:   LatentPointDenoiser,
@@ -496,19 +633,19 @@ def validate(
     style_dn.eval(); point_dn.eval()
     totals    = {}
     n_batches = 0
+    gamma = cfg.min_snr_gamma if cfg.min_snr_gamma > 0 else None
 
-    for points, class_idx in loader:
-        points    = points.to(device, non_blocking=True)
+    for z_g, z_local, class_idx in loader:
+        z_g       = z_g.to(device, non_blocking=True)
+        z_local   = z_local.to(device, non_blocking=True)
         class_idx = class_idx.to(device, non_blocking=True)
-
-        z_g, z_local = extract_latents(vae, points)
         if normalizer is not None:
-            z_g   = normalizer.norm_zg(z_g)
+            z_g     = normalizer.norm_zg(z_g)
             z_local = normalizer.norm_zl(z_local)
 
         with torch.autocast(device_type=device.type, enabled=cfg.amp):
-            loss_s = diffusion_loss(schedule, style_dn, z_g, class_idx)
-            loss_p = diffusion_loss(schedule, point_dn, z_local, z_g)
+            loss_s = diffusion_loss(schedule, style_dn, z_g, class_idx, gamma)
+            loss_p = diffusion_loss(schedule, point_dn, z_local, z_g, gamma)
 
         totals["loss_style"] = totals.get("loss_style", 0.0) + loss_s.item()
         totals["loss_point"] = totals.get("loss_point", 0.0) + loss_p.item()
@@ -649,22 +786,33 @@ def main(cfg: DiffusionConfig) -> None:
         test_idx = []
         val_idx  = val_pool
 
-    trn_ds  = torch.utils.data.Subset(
-        Ds_point_sampled_already(root=cfg.data_root, augment=True), train_idx)
+    # Point-cloud subsets (augment OFF everywhere — latents are cached once).
+    # val_ds/test_ds are still needed as raw points for the MMD/COV/1-NNA caches.
+    trn_pts = torch.utils.data.Subset(
+        Ds_point_sampled_already(root=cfg.data_root, augment=False), train_idx)
     val_ds  = torch.utils.data.Subset(
         Ds_point_sampled_already(root=cfg.data_root, augment=False), val_idx)
     test_ds = torch.utils.data.Subset(
         Ds_point_sampled_already(root=cfg.data_root, augment=False), test_idx)
-
-    trn_loader  = DataLoader(trn_ds, batch_size=cfg.batch_size, shuffle=True,
-                             num_workers=cfg.num_workers, pin_memory=cfg.pin_memory)
-    val_loader  = DataLoader(val_ds, batch_size=cfg.batch_size, shuffle=False,
-                             num_workers=cfg.num_workers, pin_memory=cfg.pin_memory)
-    test_loader = DataLoader(test_ds, batch_size=cfg.batch_size, shuffle=False,
-                             num_workers=cfg.num_workers, pin_memory=cfg.pin_memory)
     logger.info(
         f"Dataset: {len(train_idx)} train / {len(val_idx)} val / {len(test_idx)} test"
     )
+
+    # Precompute latents once (frozen VAE) and train on the cache — removes the
+    # VAE forward from every step and makes the target fully deterministic.
+    logger.info("Caching VAE latents (one pass, augment off, deterministic FPS)...")
+    trn_cache  = build_latent_cache(vae, trn_pts, cfg, device, logger, "train")
+    val_cache  = build_latent_cache(vae, val_ds,  cfg, device, logger, "val")
+    test_cache = (build_latent_cache(vae, test_ds, cfg, device, logger, "test")
+                  if len(test_idx) > 0 else None)
+
+    trn_loader  = DataLoader(trn_cache, batch_size=cfg.batch_size, shuffle=True,
+                             num_workers=cfg.num_workers, pin_memory=cfg.pin_memory)
+    val_loader  = DataLoader(val_cache, batch_size=cfg.batch_size, shuffle=False,
+                             num_workers=cfg.num_workers, pin_memory=cfg.pin_memory)
+    test_loader = (DataLoader(test_cache, batch_size=cfg.batch_size, shuffle=False,
+                              num_workers=cfg.num_workers, pin_memory=cfg.pin_memory)
+                   if test_cache is not None else None)
 
     # ---- Reference caches for MMD / COV / 1-NNA -------------------------
     def _build_ref_cache(subset) -> dict:
@@ -707,16 +855,14 @@ def main(cfg: DiffusionConfig) -> None:
     scaler_s = torch.amp.GradScaler("cuda", enabled=amp_on)
     scaler_p = torch.amp.GradScaler("cuda", enabled=amp_on)
 
-    # ---- Latent normalisation (one pass, computed from training loader) ---
-    # Use a plain DataLoader over the raw (non-augmented) training subset
-    # so stats are stable regardless of random augmentation.
-    stat_loader = DataLoader(
-        torch.utils.data.Subset(
-            Ds_point_sampled_already(root=cfg.data_root, augment=False), train_idx
-        ),
-        batch_size=cfg.batch_size * 2, shuffle=False,
-        num_workers=cfg.num_workers, pin_memory=cfg.pin_memory,
-    )
+    # ---- EMA dos pesos (amostragem usa a média suavizada) ----
+    ema_on = cfg.ema_decay > 0
+    ema_s  = EMA(style_dn, cfg.ema_decay) if ema_on else None
+    ema_p  = EMA(point_dn, cfg.ema_decay) if ema_on else None
+    if ema_on:
+        logger.info(f"EMA ativado (decay={cfg.ema_decay}, warmup adaptativo)")
+
+    # ---- Latent normalisation (computed directly from the cached latents) ---
     normalizer: LatentNormalizer | None = None
 
     # ---- Resume ---------------------------------------------------
@@ -741,21 +887,25 @@ def main(cfg: DiffusionConfig) -> None:
         if "normalizer" in ckpt_d:
             normalizer = LatentNormalizer.from_state_dict(ckpt_d["normalizer"], device)
             logger.info("Normaliser loaded from checkpoint.")
+        if ema_on and "ema_s" in ckpt_d:
+            ema_s.load_state_dict(ckpt_d["ema_s"], device)
+            ema_p.load_state_dict(ckpt_d["ema_p"], device)
+            logger.info("EMA loaded from checkpoint.")
         logger.info(f"Resumed from epoch {start_epoch}")
 
     if normalizer is None:
-        normalizer = compute_latent_stats(vae, stat_loader, device, logger)
+        normalizer = normalizer_from_cache(trn_cache, device, logger)
 
     # ---- Training loop --------------------------------------------
     for epoch in range(start_epoch, cfg.epochs):
         t0 = time.time()
 
         trn = train_one_epoch(
-            vae, schedule, style_dn, point_dn,
+            schedule, style_dn, point_dn,
             trn_loader, opt_s, opt_p, scaler_s, scaler_p,
-            cfg, epoch, logger, device, normalizer,
+            cfg, epoch, logger, device, normalizer, ema_s, ema_p,
         )
-        val = validate(vae, schedule, style_dn, point_dn, val_loader, cfg, device, normalizer)
+        val = validate(schedule, style_dn, point_dn, val_loader, cfg, device, normalizer)
 
         sched_s.step(); sched_p.step()
         elapsed = time.time() - t0
@@ -771,18 +921,23 @@ def main(cfg: DiffusionConfig) -> None:
         log_metrics(writer, trn, "train", epoch)
         log_metrics(writer, val, "val",   epoch)
 
+        # Amostragem/avaliação usam os pesos EMA (restaurados ao sair do bloco).
+        ema_pairs = [(ema_s, style_dn), (ema_p, point_dn)] if ema_on else []
+
         if epoch % cfg.vis_every == 0:
-            log_generations(
-                writer, schedule, style_dn, point_dn, vae, cfg, epoch,
-                device, idx_to_name, present_classes, normalizer,
-            )
+            with use_ema(ema_pairs):
+                log_generations(
+                    writer, schedule, style_dn, point_dn, vae, cfg, epoch,
+                    device, idx_to_name, present_classes, normalizer,
+                )
 
         eval_summary = {}
         if epoch % cfg.eval_every == 0:
-            eval_summary = evaluate_generation_metrics(
-                writer, schedule, style_dn, point_dn, vae, cfg, epoch,
-                device, idx_to_name, ref_by_class, logger, normalizer,
-            )
+            with use_ema(ema_pairs):
+                eval_summary = evaluate_generation_metrics(
+                    writer, schedule, style_dn, point_dn, vae, cfg, epoch,
+                    device, idx_to_name, ref_by_class, logger, normalizer,
+                )
 
         val_loss = val.get("loss_style", math.inf) + val.get("loss_point", math.inf)
         is_best  = val_loss < best_val_loss
@@ -801,6 +956,8 @@ def main(cfg: DiffusionConfig) -> None:
             "scaler_s":      scaler_s.state_dict(),
             "scaler_p":      scaler_p.state_dict(),
             "normalizer":    normalizer.state_dict(),
+            "ema_s":         ema_s.state_dict() if ema_on else None,
+            "ema_p":         ema_p.state_dict() if ema_on else None,
             "best_val_loss": best_val_loss,
             "config":        asdict(cfg),
             "history":       history,
@@ -821,15 +978,16 @@ def main(cfg: DiffusionConfig) -> None:
     if test_ref_by_class:
         logger.info("=== Final test-set evaluation ===")
         test_val = validate(
-            vae, schedule, style_dn, point_dn, test_loader, cfg, device, normalizer
+            schedule, style_dn, point_dn, test_loader, cfg, device, normalizer
         )
         log_metrics(writer, test_val, "test", cfg.epochs)
         logger.info(f"  test losses: {test_val}")
 
-        test_gen = evaluate_generation_metrics(
-            writer, schedule, style_dn, point_dn, vae, cfg, cfg.epochs,
-            device, idx_to_name, test_ref_by_class, logger, normalizer,
-        )
+        with use_ema([(ema_s, style_dn), (ema_p, point_dn)] if ema_on else []):
+            test_gen = evaluate_generation_metrics(
+                writer, schedule, style_dn, point_dn, vae, cfg, cfg.epochs,
+                device, idx_to_name, test_ref_by_class, logger, normalizer,
+            )
         with open(os.path.join(cfg.log_dir, "test_metrics.json"), "w") as f:
             json.dump({"losses": test_val, "generation": test_gen}, f, indent=2)
         logger.info(f"  test metrics saved → {cfg.log_dir}/test_metrics.json")
