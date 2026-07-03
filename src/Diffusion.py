@@ -138,77 +138,68 @@ class MLPResBlock(nn.Module):
         return x + self.fc2(F.silu(self.fc1(h)))
 
 
-class Conv1dResBlock(nn.Module):
-    """Point-wise residual block for (B, C, N) tensors, conditioned via GroupNorm scale/shift."""
-    def __init__(self, dim: int, cond_dim: int):
+def modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """adaLN modulation. x: (B, N, C); shift/scale: (B, C) broadcast over N."""
+    return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+
+
+class DiTBlock(nn.Module):
+    """
+    Diffusion-transformer block with adaLN-Zero conditioning (Peebles & Xie 2023).
+
+    Each latent point is a token; full self-attention lets every point attend to
+    every other point directly (O(N²), trivial at N≈512). This replaces the old
+    per-point Conv1d + Perceiver-bottleneck design: since z_local carries no xyz
+    position (see Vae.LocalEncoder — z_l is a fully learned per-point code, not an
+    anchor offset), dense self-attention is the natural way to learn inter-point
+    structure without coordinates or kNN grouping.
+
+    NO positional encoding is added: the token set is permutation-equivariant and
+    the FPS ordering that produced z_l is not canonical across samples, so an
+    index-based PE would inject a spurious signal.
+
+    Conditioning (timestep + global style z_g) modulates each sub-block via
+    adaLN-Zero: the modulation MLP is zero-initialised so every block starts as
+    the identity (gates = 0), which keeps early training stable.
+    """
+    def __init__(self, dim: int, cond_dim: int, n_heads: int, mlp_ratio: float = 4.0):
         super().__init__()
-        n_groups = min(8, dim // 4) or 1
-        self.norm = nn.GroupNorm(n_groups, dim)
-        self.c1   = nn.Conv1d(dim, dim * 4, 1)
-        self.c2   = nn.Conv1d(dim * 4, dim, 1)
-        self.cond = nn.Linear(cond_dim, dim * 2)   # → scale + shift
-        nn.init.zeros_(self.c2.weight)
-        nn.init.zeros_(self.c2.bias)
+        self.norm1 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+        self.attn  = nn.MultiheadAttention(dim, n_heads, batch_first=True)
+        self.norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+        hidden = int(dim * mlp_ratio)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, hidden), nn.GELU(), nn.Linear(hidden, dim),
+        )
+        # adaLN-Zero: 6 modulation vectors (shift/scale/gate × attn, mlp).
+        self.ada = nn.Linear(cond_dim, 6 * dim)
+        nn.init.zeros_(self.ada.weight)
+        nn.init.zeros_(self.ada.bias)
 
     def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
-        # x: (B, dim, N);  cond: (B, cond_dim)
-        h  = self.norm(x)
-        sc, sh = self.cond(cond).chunk(2, dim=-1)
-        h  = h * (1 + sc.unsqueeze(-1)) + sh.unsqueeze(-1)
-        return x + self.c2(F.silu(self.c1(h)))
+        # x: (B, N, C);  cond: (B, cond_dim)
+        shift_sa, scale_sa, gate_sa, shift_mlp, scale_mlp, gate_mlp = \
+            self.ada(cond).chunk(6, dim=-1)
+        h = modulate(self.norm1(x), shift_sa, scale_sa)
+        x = x + gate_sa.unsqueeze(1) * self.attn(h, h, h, need_weights=False)[0]
+        h = modulate(self.norm2(x), shift_mlp, scale_mlp)
+        x = x + gate_mlp.unsqueeze(1) * self.mlp(h)
+        return x
 
 
-class LatentBottleneckAttention(nn.Module):
-    """
-    Global cross-attention bottleneck (Perceiver-style pooling).
-
-    The per-point Conv1dResBlock stack only ever mixes information within a
-    single point (kernel_size=1 convs) — points never talk to each other.
-    Real geometric grouping (kNN, voxelisation) is not an option here because
-    z_local carries no true xyz position (see Vae.LocalEncoder — z_l is a
-    fully learned per-point code, not an anchor offset).
-
-    Instead we pool the N point features into K learned query tokens via
-    cross-attention (cost O(N·K), no coordinates needed), let the K tokens
-    exchange information with self-attention, then broadcast the result back
-    to all N points via the inverse cross-attention. This gives the network
-    one shot at global, cross-point reasoning per forward pass, at a cost far
-    below dense O(N²) self-attention over all 2048 points.
-    """
-    def __init__(self, dim: int, cond_dim: int, n_tokens: int = 16, n_heads: int = 4):
+class DiTFinalLayer(nn.Module):
+    """Final adaLN + linear projection back to point_dim, zero-initialised."""
+    def __init__(self, dim: int, cond_dim: int, point_dim: int):
         super().__init__()
-        self.tokens = nn.Parameter(torch.randn(n_tokens, dim) * 0.02)
-
-        n_groups = min(8, dim // 4) or 1
-        self.norm_in    = nn.GroupNorm(n_groups, dim)
-        self.cond       = nn.Linear(cond_dim, dim * 2)   # → scale + shift
-
-        self.pool_attn   = nn.MultiheadAttention(dim, n_heads, batch_first=True)
-        self.token_norm  = nn.LayerNorm(dim)
-        self.self_attn   = nn.MultiheadAttention(dim, n_heads, batch_first=True)
-        self.unpool_attn = nn.MultiheadAttention(dim, n_heads, batch_first=True)
-
-        self.out_proj = nn.Linear(dim, dim)
-        nn.init.zeros_(self.out_proj.weight)
-        nn.init.zeros_(self.out_proj.bias)
+        self.norm = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+        self.ada  = nn.Linear(cond_dim, 2 * dim)
+        self.proj = nn.Linear(dim, point_dim)
+        nn.init.zeros_(self.ada.weight);  nn.init.zeros_(self.ada.bias)
+        nn.init.zeros_(self.proj.weight); nn.init.zeros_(self.proj.bias)
 
     def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
-        # x: (B, dim, N);  cond: (B, cond_dim)
-        B, C, N = x.shape
-
-        h = self.norm_in(x)
-        sc, sh = self.cond(cond).chunk(2, dim=-1)
-        h = h * (1 + sc.unsqueeze(-1)) + sh.unsqueeze(-1)
-        h = h.permute(0, 2, 1)                                     # (B, N, C)
-
-        tokens = self.tokens.unsqueeze(0).expand(B, -1, -1)        # (B, K, C)
-        pooled, _ = self.pool_attn(tokens, h, h)                   # (B, K, C)
-        pn = self.token_norm(pooled)
-        pooled = pooled + self.self_attn(pn, pn, pn)[0]            # (B, K, C)
-
-        out, _ = self.unpool_attn(h, pooled, pooled)               # (B, N, C)
-        out = self.out_proj(out).permute(0, 2, 1)                  # (B, C, N)
-        return x + out
+        shift, scale = self.ada(cond).chunk(2, dim=-1)
+        return self.proj(modulate(self.norm(x), shift, scale))
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -281,55 +272,51 @@ class StyleDenoiser(nn.Module):
 
 class LatentPointDenoiser(nn.Module):
     """
-    ε-predictor for the local latent cloud z_l ∈ ℝ^{N × point_dim}.
-    point_dim must equal Vae.latent_dim — no anchor prefix since the anchor bypass was removed.
+    ε-predictor for the local latent cloud z_l ∈ ℝ^{N × point_dim}, implemented
+    as a DiT (diffusion transformer) over the N latent points.
+    point_dim must equal Vae.latent_dim — no anchor prefix since the anchor
+    bypass was removed.
 
-    Processing is shared across N (Conv1d = per-point MLP), conditioned on
-    z_g + timestep via adaptive group normalisation.
+    Each latent point is a token; a stack of DiTBlocks applies full self-attention
+    so every point attends to every other point directly. This replaces the old
+    per-point Conv1d + Perceiver-bottleneck design: because z_l has no xyz anchor,
+    dense self-attention is the natural way to model inter-point structure without
+    coordinates. Conditioning (timestep + global style z_g) is injected via
+    adaLN-Zero. The set is treated as permutation-equivariant — no positional
+    encoding, since the FPS ordering behind z_l is not canonical across samples.
 
-    Why no upsampling / attention across points here?  The latent cloud is
-    already at the final resolution (2048 pts), and z_g carries the global
-    shape context.  A simple per-point network suffices to model
-    the conditional distribution p(z_local | z_g).
+    Interface is unchanged: forward(zt, t, z_g) with zt (B, N, point_dim),
+    t (B,), z_g (B, style_dim) → (B, N, point_dim).
     """
 
     def __init__(
         self,
-        point_dim:        int = 8,   # must match Vae latent_dim — no anchors in z_l anymore
-        style_dim:        int = 256,
-        hidden:           int = 256,
-        n_layers:         int = 8,
-        T:                int = 1000,
-        bottleneck_tokens: int = 16,   # K pooled tokens for the global attention bottleneck
-        bottleneck_heads:  int = 4,
+        point_dim:  int   = 8,     # must match Vae latent_dim — no anchors in z_l
+        style_dim:  int   = 256,
+        hidden:     int   = 256,
+        n_layers:   int   = 8,
+        n_heads:    int   = 8,      # attention heads per DiT block (must divide hidden)
+        mlp_ratio:  float = 4.0,    # FFN expansion inside each DiT block
+        T:          int   = 1000,
     ):
         super().__init__()
+        assert hidden % n_heads == 0, (
+            f"hidden ({hidden}) must be divisible by n_heads ({n_heads})"
+        )
         time_dim = hidden
 
         self.time_mlp = nn.Sequential(
             nn.Linear(time_dim, time_dim * 2), nn.SiLU(),
             nn.Linear(time_dim * 2, time_dim),
         )
-        # Fuse time embedding + global style into a single conditioning vector
+        # Fuse time embedding + global style into a single conditioning vector.
         self.cond_proj = nn.Linear(time_dim + style_dim, time_dim)
 
-        self.input_proj  = nn.Conv1d(point_dim, hidden, 1)
-
-        # Conv1dResBlocks handle purely per-point processing; a single
-        # LatentBottleneckAttention is inserted at the midpoint of the stack
-        # to give the network one pass of global, cross-point reasoning.
-        blocks = []
-        mid = n_layers // 2
-        for i in range(n_layers):
-            blocks.append(Conv1dResBlock(hidden, time_dim))
-            if i == mid - 1:
-                blocks.append(LatentBottleneckAttention(
-                    hidden, time_dim, n_tokens=bottleneck_tokens, n_heads=bottleneck_heads))
-        self.blocks = nn.ModuleList(blocks)
-
-        self.output_proj = nn.Conv1d(hidden, point_dim, 1)
-        nn.init.zeros_(self.output_proj.weight)
-        nn.init.zeros_(self.output_proj.bias)
+        self.input_proj = nn.Linear(point_dim, hidden)
+        self.blocks = nn.ModuleList([
+            DiTBlock(hidden, time_dim, n_heads, mlp_ratio) for _ in range(n_layers)
+        ])
+        self.final = DiTFinalLayer(hidden, time_dim, point_dim)
 
     def forward(self, zt: torch.Tensor, t: torch.Tensor,
                 z_g: torch.Tensor) -> torch.Tensor:
@@ -340,7 +327,7 @@ class LatentPointDenoiser(nn.Module):
         t_emb = self.time_mlp(t_emb)
         cond  = self.cond_proj(torch.cat([t_emb, z_g], dim=-1))   # (B, time_dim)
 
-        h = self.input_proj(zt.permute(0, 2, 1))   # (B, hidden, N)
+        h = self.input_proj(zt)          # (B, N, hidden)
         for block in self.blocks:
             h = block(h, cond)
-        return self.output_proj(h).permute(0, 2, 1)  # (B, N, point_dim)
+        return self.final(h, cond)       # (B, N, point_dim)

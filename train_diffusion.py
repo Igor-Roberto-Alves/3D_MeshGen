@@ -38,6 +38,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from src.dataset import Ds_point_sampled_already
 from src.Vae import Vae, normalize_pc
+from src.vae_up import VaeUp
 from src.Diffusion import CosineSchedule, StyleDenoiser, LatentPointDenoiser
 from src.metric import generative_metrics
 
@@ -55,7 +56,9 @@ class DiffusionConfig:
     data_root:   str   = "point_clouds"
 
     # --- VAE architecture (must match the loaded checkpoint) ---
-    vae_latent_dim:  int = 8   # must match the latent_dim used in train_vae.py
+    vae_type:        str = "up"  # "up" → VaeUp (fold decoder), "base" → Vae
+    vae_latent_dim:  int = 8    # must match the latent_dim used in train_vae.py
+    vae_n_latent:    int = 512  # coarse latent points — only used when vae_type="up"
     vae_style_dim:   int = 256
     vae_in_channels: int = 6
 
@@ -69,11 +72,11 @@ class DiffusionConfig:
     cfg_dropout:    float = 0.1
     guidance:       float = 3.0    # CFG scale at inference
 
-    # --- Latent point denoiser (Stage 2) ---
-    # U-Net depth/downsampling schedule (2048->1024->256->64->16) and attention
-    # placement are fixed in LatentPointDenoiser.NPOINTS / ATTN_NPTS.
-    point_hidden:     int = 160
-    point_resolution: int = 16   # voxelisation grid for cross-point mixing
+    # --- Latent point denoiser (Stage 2) — DiT over the N latent points ---
+    point_hidden:    int   = 256
+    point_layers:    int   = 8
+    point_heads:     int   = 8      # attention heads per DiT block (must divide point_hidden)
+    point_mlp_ratio: float = 4.0    # FFN expansion inside each DiT block
 
     # --- training ---
     epochs:         int   = 300
@@ -85,6 +88,7 @@ class DiffusionConfig:
 
     # --- data ---
     val_split:   float = 0.1
+    test_split:  float = 0.5   # fraction of val_pool that becomes the test set
     num_workers: int   = 4
     pin_memory:  bool  = True
 
@@ -113,7 +117,7 @@ class DiffusionConfig:
 # ============================================================
 
 @torch.no_grad()
-def extract_latents(vae: Vae, points: torch.Tensor):
+def extract_latents(vae: Vae | VaeUp, points: torch.Tensor):
     """
     Run the frozen VAE encoder and return CLEAN latents (posterior mean, no sampling).
 
@@ -130,6 +134,89 @@ def extract_latents(vae: Vae, points: torch.Tensor):
     mu_g, _ = vae.global_encoder(x_norm)   # (B, style_dim)
     mu_l, _ = vae.local_encoder(x_norm, mu_g)  # (B, N, latent_dim)
     return mu_g, mu_l
+
+
+class LatentNormalizer:
+    """
+    Per-dimension affine normalisation of VAE latents.
+
+    The cosine DDPM schedule is calibrated for N(0,I) data; VAE posterior
+    means typically have std << 1 (e.g. 0.44 for z_g, 0.70 for z_l).
+    This mismatch shifts the effective SNR at every timestep and produces a
+    floor in loss_point that can't be crossed regardless of capacity.
+
+    We compute per-dim mean and std once over the training set, normalise
+    both latents to zero mean / unit variance before diffusion, and
+    denormalise after sampling for the VAE decoder.
+    """
+
+    def __init__(self,
+                 zg_mean: torch.Tensor, zg_std: torch.Tensor,
+                 zl_mean: torch.Tensor, zl_std: torch.Tensor):
+        self.zg_mean = zg_mean   # (style_dim,)
+        self.zg_std  = zg_std    # (style_dim,)
+        self.zl_mean = zl_mean   # (latent_dim,)
+        self.zl_std  = zl_std    # (latent_dim,)
+
+    def norm_zg(self, z_g: torch.Tensor) -> torch.Tensor:
+        return (z_g - self.zg_mean) / self.zg_std
+
+    def norm_zl(self, z_l: torch.Tensor) -> torch.Tensor:
+        return (z_l - self.zl_mean) / self.zl_std
+
+    def denorm_zg(self, z_g_n: torch.Tensor) -> torch.Tensor:
+        return z_g_n * self.zg_std + self.zg_mean
+
+    def denorm_zl(self, z_l_n: torch.Tensor) -> torch.Tensor:
+        return z_l_n * self.zl_std + self.zl_mean
+
+    def state_dict(self):
+        return {k: getattr(self, k).cpu() for k in
+                ("zg_mean", "zg_std", "zl_mean", "zl_std")}
+
+    @classmethod
+    def from_state_dict(cls, d: dict, device):
+        return cls(**{k: d[k].to(device) for k in
+                      ("zg_mean", "zg_std", "zl_mean", "zl_std")})
+
+
+@torch.no_grad()
+def compute_latent_stats(
+    vae:    Vae | VaeUp,
+    loader: DataLoader,
+    device: torch.device,
+    logger: logging.Logger,
+) -> LatentNormalizer:
+    """One pass over the training set to get per-dim mean/std of z_g and z_l."""
+    logger.info("Computing latent statistics for normalisation (one pass)...")
+
+    zg_sum = zg_sq = zg_n = 0
+    zl_sum = zl_sq = zl_n = 0
+
+    for points, _ in loader:
+        points = points.to(device)
+        z_g, z_l = extract_latents(vae, points)      # (B, S), (B, N, L)
+        B = z_g.shape[0]
+
+        zg_sum += z_g.sum(0);  zg_sq += (z_g ** 2).sum(0);  zg_n += B
+
+        zl_flat = z_l.reshape(-1, z_l.shape[-1])     # (B*N, L)
+        zl_sum += zl_flat.sum(0);  zl_sq += (zl_flat ** 2).sum(0);  zl_n += zl_flat.shape[0]
+
+    zg_mean = zg_sum / zg_n
+    zg_std  = ((zg_sq / zg_n) - zg_mean ** 2).clamp(min=1e-6).sqrt()
+    zl_mean = zl_sum / zl_n
+    zl_std  = ((zl_sq / zl_n) - zl_mean ** 2).clamp(min=1e-6).sqrt()
+
+    logger.info(
+        f"  z_g  mean_abs={zg_mean.abs().mean():.4f}  "
+        f"std [min={zg_std.min():.4f}  mean={zg_std.mean():.4f}  max={zg_std.max():.4f}]"
+    )
+    logger.info(
+        f"  z_l  mean_abs={zl_mean.abs().mean():.4f}  "
+        f"std [min={zl_std.min():.4f}  mean={zl_std.mean():.4f}  max={zl_std.max():.4f}]"
+    )
+    return LatentNormalizer(zg_mean, zg_std, zl_mean, zl_std)
 
 
 # ============================================================
@@ -178,33 +265,41 @@ N_POINTS = 2048   # points per cloud — matches Ds_point_sampled_already
 
 @torch.no_grad()
 def sample_class(
-    schedule:  CosineSchedule,
-    style_dn:  StyleDenoiser,
-    point_dn:  LatentPointDenoiser,
-    vae:       Vae,
-    cfg:       DiffusionConfig,
-    cls_idx:   int,
-    B:         int,
-    device:    torch.device,
+    schedule:   CosineSchedule,
+    style_dn:   StyleDenoiser,
+    point_dn:   LatentPointDenoiser,
+    vae:        Vae | VaeUp,
+    cfg:        DiffusionConfig,
+    cls_idx:    int,
+    B:          int,
+    device:     torch.device,
+    normalizer: LatentNormalizer | None = None,
 ) -> torch.Tensor:
     """Full two-stage DDPM chain for one class → decoded (B, N_POINTS, 3) point clouds."""
     cls = torch.full((B,), cls_idx, device=device, dtype=torch.long)
 
-    # --- Stage 1: sample z_g ---
+    # --- Stage 1: sample normalised z_g ---
     uncond = style_dn.uncond(B, device)
-    z_g    = schedule.sample(
+    z_g_n  = schedule.sample(
         style_dn, (cfg.vae_style_dim,),
         condition=cls, uncond=uncond,
         guidance=cfg.guidance, device=device,
-    )   # (B, style_dim)
+    )   # (B, style_dim) — normalised space
 
-    # --- Stage 2: sample z_local conditioned on z_g ---
-    z_local = schedule.sample(
-        point_dn, (N_POINTS, cfg.vae_latent_dim),
-        condition=z_g, device=device,
-    )   # (B, N_POINTS, latent_dim)
+    # --- Stage 2: sample normalised z_local conditioned on normalised z_g ---
+    n_lat   = getattr(vae, "n_latent", N_POINTS)   # VaeUp → 512, Vae → 2048
+    z_l_n   = schedule.sample(
+        point_dn, (n_lat, cfg.vae_latent_dim),
+        condition=z_g_n, device=device,
+    )   # (B, n_lat, latent_dim) — normalised space
 
-    # --- Decode ---
+    # --- Denormalise before decoding ---
+    if normalizer is not None:
+        z_g     = normalizer.denorm_zg(z_g_n)
+        z_local = normalizer.denorm_zl(z_l_n)
+    else:
+        z_g, z_local = z_g_n, z_l_n
+
     return vae.decoder(z_local, z_g).float()  # (B, N_POINTS, 3)
 
 
@@ -214,12 +309,13 @@ def log_generations(
     schedule:        CosineSchedule,
     style_dn:        StyleDenoiser,
     point_dn:        LatentPointDenoiser,
-    vae:             Vae,
+    vae:             Vae | VaeUp,
     cfg:             DiffusionConfig,
     epoch:           int,
     device:          torch.device,
     class_names:     dict,          # idx → name string
     present_classes: list,          # class indices that actually exist in the dataset
+    normalizer:      LatentNormalizer | None = None,
 ):
     """
     For a handful of classes, generate shapes via the full two-stage chain
@@ -231,7 +327,9 @@ def log_generations(
 
     for cls_idx in show_classes:
         B = cfg.vis_per_class
-        xyz_out = sample_class(schedule, style_dn, point_dn, vae, cfg, cls_idx, B, device).cpu()
+        xyz_out = sample_class(
+            schedule, style_dn, point_dn, vae, cfg, cls_idx, B, device, normalizer
+        ).cpu()
 
         for i in range(B):
             gen_v = xyz_out[i]
@@ -252,13 +350,14 @@ def evaluate_generation_metrics(
     schedule:        CosineSchedule,
     style_dn:        StyleDenoiser,
     point_dn:        LatentPointDenoiser,
-    vae:             Vae,
+    vae:             Vae | VaeUp,
     cfg:             DiffusionConfig,
     epoch:           int,
     device:          torch.device,
     class_names:     dict,                    # idx → name string
     ref_by_class:    dict,                    # idx → (M, N_POINTS, 3) real xyz, normalised
     logger:          logging.Logger,
+    normalizer:      LatentNormalizer | None = None,
 ) -> dict:
     """
     MMD-CD / COV-CD / 1-NNA-CD against held-out real samples, per class.
@@ -281,7 +380,7 @@ def evaluate_generation_metrics(
         ref_idx = torch.randperm(ref_xyz.shape[0], device=device)[:n_ref]
         ref = ref_xyz[ref_idx]
 
-        gen = sample_class(schedule, style_dn, point_dn, vae, cfg, cls_idx, cfg.eval_n_gen, device)
+        gen = sample_class(schedule, style_dn, point_dn, vae, cfg, cls_idx, cfg.eval_n_gen, device, normalizer)
 
         if cfg.eval_points < gen.shape[1]:
             g_idx = torch.randperm(gen.shape[1], device=device)[:cfg.eval_points]
@@ -318,18 +417,20 @@ def evaluate_generation_metrics(
 # ============================================================
 
 def train_one_epoch(
-    vae:       Vae,
-    schedule:  CosineSchedule,
-    style_dn:  StyleDenoiser,
-    point_dn:  LatentPointDenoiser,
-    loader:    DataLoader,
-    opt_s:     torch.optim.Optimizer,
-    opt_p:     torch.optim.Optimizer,
-    scaler:    torch.amp.GradScaler,
-    cfg:       DiffusionConfig,
-    epoch:     int,
-    logger:    logging.Logger,
-    device:    torch.device,
+    vae:        Vae | VaeUp,
+    schedule:   CosineSchedule,
+    style_dn:   StyleDenoiser,
+    point_dn:   LatentPointDenoiser,
+    loader:     DataLoader,
+    opt_s:      torch.optim.Optimizer,
+    opt_p:      torch.optim.Optimizer,
+    scaler_s:   torch.amp.GradScaler,
+    scaler_p:   torch.amp.GradScaler,
+    cfg:        DiffusionConfig,
+    epoch:      int,
+    logger:     logging.Logger,
+    device:     torch.device,
+    normalizer: LatentNormalizer | None = None,
 ) -> dict:
     style_dn.train(); point_dn.train()
     totals    = {}
@@ -339,30 +440,33 @@ def train_one_epoch(
         points    = points.to(device, non_blocking=True)
         class_idx = class_idx.to(device, non_blocking=True)
 
-        # --- Extract clean latents from frozen VAE ---
+        # --- Extract clean latents from frozen VAE, then normalise ---
         z_g, z_local = extract_latents(vae, points)
+        if normalizer is not None:
+            z_g   = normalizer.norm_zg(z_g)
+            z_local = normalizer.norm_zl(z_local)
 
-        # --- Stage 1: style DDPM loss ---
+        # --- Stage 1: style DDPM loss (separate scaler avoids cross-contamination) ---
         with torch.autocast(device_type=device.type, enabled=cfg.amp):
             loss_s = diffusion_loss(schedule, style_dn, z_g, class_idx)
 
         opt_s.zero_grad(set_to_none=True)
-        scaler.scale(loss_s).backward()
-        scaler.unscale_(opt_s)
+        scaler_s.scale(loss_s).backward()
+        scaler_s.unscale_(opt_s)
         nn.utils.clip_grad_norm_(style_dn.parameters(), cfg.grad_clip)
-        scaler.step(opt_s)
+        scaler_s.step(opt_s)
+        scaler_s.update()
 
-        # --- Stage 2: latent point DDPM loss (condition on z_g mean) ---
+        # --- Stage 2: latent point DDPM loss (conditioned on normalised z_g) ---
         with torch.autocast(device_type=device.type, enabled=cfg.amp):
             loss_p = diffusion_loss(schedule, point_dn, z_local, z_g)
 
         opt_p.zero_grad(set_to_none=True)
-        scaler.scale(loss_p).backward()
-        scaler.unscale_(opt_p)
+        scaler_p.scale(loss_p).backward()
+        scaler_p.unscale_(opt_p)
         nn.utils.clip_grad_norm_(point_dn.parameters(), cfg.grad_clip)
-        scaler.step(opt_p)
-
-        scaler.update()
+        scaler_p.step(opt_p)
+        scaler_p.update()
 
         totals["loss_style"] = totals.get("loss_style", 0.0) + loss_s.item()
         totals["loss_point"] = totals.get("loss_point", 0.0) + loss_p.item()
@@ -380,13 +484,14 @@ def train_one_epoch(
 
 @torch.no_grad()
 def validate(
-    vae:       Vae,
-    schedule:  CosineSchedule,
-    style_dn:  StyleDenoiser,
-    point_dn:  LatentPointDenoiser,
-    loader:    DataLoader,
-    cfg:       DiffusionConfig,
-    device:    torch.device,
+    vae:        Vae | VaeUp,
+    schedule:   CosineSchedule,
+    style_dn:   StyleDenoiser,
+    point_dn:   LatentPointDenoiser,
+    loader:     DataLoader,
+    cfg:        DiffusionConfig,
+    device:     torch.device,
+    normalizer: LatentNormalizer | None = None,
 ) -> dict:
     style_dn.eval(); point_dn.eval()
     totals    = {}
@@ -397,6 +502,9 @@ def validate(
         class_idx = class_idx.to(device, non_blocking=True)
 
         z_g, z_local = extract_latents(vae, points)
+        if normalizer is not None:
+            z_g   = normalizer.norm_zg(z_g)
+            z_local = normalizer.norm_zl(z_local)
 
         with torch.autocast(device_type=device.type, enabled=cfg.amp):
             loss_s = diffusion_loss(schedule, style_dn, z_g, class_idx)
@@ -446,11 +554,21 @@ def main(cfg: DiffusionConfig) -> None:
     logger.info(f"Device: {device}")
 
     # ---- Load & freeze VAE -----------------------------------------
-    vae = Vae(
-        latent_dim=cfg.vae_latent_dim,
-        style_dim=cfg.vae_style_dim,
-        in_channels=cfg.vae_in_channels,
-    ).to(device)
+    if cfg.vae_type == "up":
+        vae: Vae | VaeUp = VaeUp(
+            latent_dim=cfg.vae_latent_dim,
+            style_dim=cfg.vae_style_dim,
+            in_channels=cfg.vae_in_channels,
+            n_latent=cfg.vae_n_latent,
+        ).to(device)
+    elif cfg.vae_type == "base":
+        vae = Vae(
+            latent_dim=cfg.vae_latent_dim,
+            style_dim=cfg.vae_style_dim,
+            in_channels=cfg.vae_in_channels,
+        ).to(device)
+    else:
+        raise ValueError(f"Unknown vae_type '{cfg.vae_type}'. Choose 'up' or 'base'.")
 
     if not os.path.exists(cfg.vae_ckpt):
         raise FileNotFoundError(
@@ -500,44 +618,76 @@ def main(cfg: DiffusionConfig) -> None:
     ).to(device)
 
     point_dn  = LatentPointDenoiser(
-        point_dim=cfg.vae_latent_dim,   # diffused channels = vae_latent_dim + 3 (xyz)
+        point_dim=cfg.vae_latent_dim,
         style_dim=cfg.vae_style_dim,
         hidden=cfg.point_hidden,
+        n_layers=cfg.point_layers,
+        n_heads=cfg.point_heads,
+        mlp_ratio=cfg.point_mlp_ratio,
         T=cfg.T,
-        resolution=cfg.point_resolution,
     ).to(device)
 
     logger.info(f"StyleDenoiser      params: {count_parameters(style_dn):,}")
     logger.info(f"LatentPointDenoiser params: {count_parameters(point_dn):,}")
 
-    indices = torch.randperm(len(base_ds),
-                             generator=torch.Generator().manual_seed(cfg.seed)).tolist()
-    val_n   = max(1, int(len(base_ds) * cfg.val_split))
-    train_idx, val_idx = indices[val_n:], indices[:val_n]
+    indices   = torch.randperm(len(base_ds),
+                               generator=torch.Generator().manual_seed(cfg.seed)).tolist()
+    val_n     = max(1, int(len(base_ds) * cfg.val_split))
+    train_idx = indices[val_n:]          # unchanged vs. original split
+    val_pool  = indices[:val_n]          # this pool is split into val + test
 
-    trn_ds = torch.utils.data.Subset(
+    if cfg.test_split > 0:
+        # test_split is a fraction of val_pool (not the full dataset),
+        # since training indices must not change.
+        test_n   = min(
+            max(1, int(len(val_pool) * cfg.test_split)),
+            len(val_pool) - 1,  # leave at least 1 sample in val
+        )
+        test_idx = val_pool[:test_n]
+        val_idx  = val_pool[test_n:]
+    else:
+        test_idx = []
+        val_idx  = val_pool
+
+    trn_ds  = torch.utils.data.Subset(
         Ds_point_sampled_already(root=cfg.data_root, augment=True), train_idx)
-    val_ds = torch.utils.data.Subset(
+    val_ds  = torch.utils.data.Subset(
         Ds_point_sampled_already(root=cfg.data_root, augment=False), val_idx)
+    test_ds = torch.utils.data.Subset(
+        Ds_point_sampled_already(root=cfg.data_root, augment=False), test_idx)
 
-    trn_loader = DataLoader(trn_ds, batch_size=cfg.batch_size, shuffle=True,
-                            num_workers=cfg.num_workers, pin_memory=cfg.pin_memory)
-    val_loader = DataLoader(val_ds, batch_size=cfg.batch_size, shuffle=False,
-                            num_workers=cfg.num_workers, pin_memory=cfg.pin_memory)
-    logger.info(f"Dataset: {len(train_idx)} train / {len(val_idx)} val")
-
-    # ---- Reference cache for MMD / COV / 1-NNA (held-out real samples) ---
-    logger.info("Building per-class reference cache for generation metrics...")
-    ref_by_class: dict = {}
-    for feats, cls in val_ds:
-        ref_by_class.setdefault(int(cls.item()), []).append(feats[:, :3])
-    for cls_idx, pts_list in ref_by_class.items():
-        xyz = torch.stack(pts_list).to(device)          # (M, N_POINTS, 3) raw xyz
-        ref_by_class[cls_idx] = normalize_pc(xyz)        # same space as the decoder's output
+    trn_loader  = DataLoader(trn_ds, batch_size=cfg.batch_size, shuffle=True,
+                             num_workers=cfg.num_workers, pin_memory=cfg.pin_memory)
+    val_loader  = DataLoader(val_ds, batch_size=cfg.batch_size, shuffle=False,
+                             num_workers=cfg.num_workers, pin_memory=cfg.pin_memory)
+    test_loader = DataLoader(test_ds, batch_size=cfg.batch_size, shuffle=False,
+                             num_workers=cfg.num_workers, pin_memory=cfg.pin_memory)
     logger.info(
-        "Reference cache: "
+        f"Dataset: {len(train_idx)} train / {len(val_idx)} val / {len(test_idx)} test"
+    )
+
+    # ---- Reference caches for MMD / COV / 1-NNA -------------------------
+    def _build_ref_cache(subset) -> dict:
+        cache: dict = {}
+        for feats, cls in subset:
+            cache.setdefault(int(cls.item()), []).append(feats[:, :3])
+        for cls_idx, pts_list in cache.items():
+            xyz = torch.stack(pts_list).to(device)
+            cache[cls_idx] = normalize_pc(xyz)
+        return cache
+
+    logger.info("Building per-class reference caches (val + test)...")
+    ref_by_class      = _build_ref_cache(val_ds)   # used during training (eval_every)
+    test_ref_by_class = _build_ref_cache(test_ds)  # used only for final test metrics
+    logger.info(
+        "Val  cache: "
         + ", ".join(f"{idx_to_name.get(k, k)}={v.shape[0]}" for k, v in ref_by_class.items())
     )
+    if test_ref_by_class:
+        logger.info(
+            "Test cache: "
+            + ", ".join(f"{idx_to_name.get(k, k)}={v.shape[0]}" for k, v in test_ref_by_class.items())
+        )
 
     # ---- Optimisers (separate per model) ---------------------------
     def make_opt_sched(model):
@@ -552,7 +702,22 @@ def main(cfg: DiffusionConfig) -> None:
 
     opt_s, sched_s = make_opt_sched(style_dn)
     opt_p, sched_p = make_opt_sched(point_dn)
-    scaler = torch.amp.GradScaler("cuda", enabled=cfg.amp and device.type == "cuda")
+    # Separate scalers prevent style_dn inf/nan from suppressing point_dn updates.
+    amp_on   = cfg.amp and device.type == "cuda"
+    scaler_s = torch.amp.GradScaler("cuda", enabled=amp_on)
+    scaler_p = torch.amp.GradScaler("cuda", enabled=amp_on)
+
+    # ---- Latent normalisation (one pass, computed from training loader) ---
+    # Use a plain DataLoader over the raw (non-augmented) training subset
+    # so stats are stable regardless of random augmentation.
+    stat_loader = DataLoader(
+        torch.utils.data.Subset(
+            Ds_point_sampled_already(root=cfg.data_root, augment=False), train_idx
+        ),
+        batch_size=cfg.batch_size * 2, shuffle=False,
+        num_workers=cfg.num_workers, pin_memory=cfg.pin_memory,
+    )
+    normalizer: LatentNormalizer | None = None
 
     # ---- Resume ---------------------------------------------------
     start_epoch    = 0
@@ -568,11 +733,18 @@ def main(cfg: DiffusionConfig) -> None:
         opt_p.load_state_dict(ckpt_d["opt_p"])
         sched_s.load_state_dict(ckpt_d["sched_s"])
         sched_p.load_state_dict(ckpt_d["sched_p"])
-        scaler.load_state_dict(ckpt_d["scaler"])
+        scaler_s.load_state_dict(ckpt_d.get("scaler_s", ckpt_d.get("scaler", {})))
+        scaler_p.load_state_dict(ckpt_d.get("scaler_p", ckpt_d.get("scaler", {})))
         start_epoch   = ckpt_d["epoch"] + 1
         best_val_loss = ckpt_d.get("best_val_loss", math.inf)
         history       = ckpt_d.get("history", [])
+        if "normalizer" in ckpt_d:
+            normalizer = LatentNormalizer.from_state_dict(ckpt_d["normalizer"], device)
+            logger.info("Normaliser loaded from checkpoint.")
         logger.info(f"Resumed from epoch {start_epoch}")
+
+    if normalizer is None:
+        normalizer = compute_latent_stats(vae, stat_loader, device, logger)
 
     # ---- Training loop --------------------------------------------
     for epoch in range(start_epoch, cfg.epochs):
@@ -580,9 +752,10 @@ def main(cfg: DiffusionConfig) -> None:
 
         trn = train_one_epoch(
             vae, schedule, style_dn, point_dn,
-            trn_loader, opt_s, opt_p, scaler, cfg, epoch, logger, device,
+            trn_loader, opt_s, opt_p, scaler_s, scaler_p,
+            cfg, epoch, logger, device, normalizer,
         )
-        val = validate(vae, schedule, style_dn, point_dn, val_loader, cfg, device)
+        val = validate(vae, schedule, style_dn, point_dn, val_loader, cfg, device, normalizer)
 
         sched_s.step(); sched_p.step()
         elapsed = time.time() - t0
@@ -601,14 +774,14 @@ def main(cfg: DiffusionConfig) -> None:
         if epoch % cfg.vis_every == 0:
             log_generations(
                 writer, schedule, style_dn, point_dn, vae, cfg, epoch,
-                device, idx_to_name, present_classes,
+                device, idx_to_name, present_classes, normalizer,
             )
 
         eval_summary = {}
         if epoch % cfg.eval_every == 0:
             eval_summary = evaluate_generation_metrics(
                 writer, schedule, style_dn, point_dn, vae, cfg, epoch,
-                device, idx_to_name, ref_by_class, logger,
+                device, idx_to_name, ref_by_class, logger, normalizer,
             )
 
         val_loss = val.get("loss_style", math.inf) + val.get("loss_point", math.inf)
@@ -625,7 +798,9 @@ def main(cfg: DiffusionConfig) -> None:
             "opt_p":         opt_p.state_dict(),
             "sched_s":       sched_s.state_dict(),
             "sched_p":       sched_p.state_dict(),
-            "scaler":        scaler.state_dict(),
+            "scaler_s":      scaler_s.state_dict(),
+            "scaler_p":      scaler_p.state_dict(),
+            "normalizer":    normalizer.state_dict(),
             "best_val_loss": best_val_loss,
             "config":        asdict(cfg),
             "history":       history,
@@ -641,6 +816,23 @@ def main(cfg: DiffusionConfig) -> None:
                                           **{f"eval_{k}": v for k, v in eval_summary.items()}})
         with open(os.path.join(cfg.log_dir, "history.json"), "w") as f:
             json.dump(history, f, indent=2)
+
+    # ---- Final evaluation on the held-out test set ----------------------
+    if test_ref_by_class:
+        logger.info("=== Final test-set evaluation ===")
+        test_val = validate(
+            vae, schedule, style_dn, point_dn, test_loader, cfg, device, normalizer
+        )
+        log_metrics(writer, test_val, "test", cfg.epochs)
+        logger.info(f"  test losses: {test_val}")
+
+        test_gen = evaluate_generation_metrics(
+            writer, schedule, style_dn, point_dn, vae, cfg, cfg.epochs,
+            device, idx_to_name, test_ref_by_class, logger, normalizer,
+        )
+        with open(os.path.join(cfg.log_dir, "test_metrics.json"), "w") as f:
+            json.dump({"losses": test_val, "generation": test_gen}, f, indent=2)
+        logger.info(f"  test metrics saved → {cfg.log_dir}/test_metrics.json")
 
     writer.close()
     logger.info("Training complete.")
