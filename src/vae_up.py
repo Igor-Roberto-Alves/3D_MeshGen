@@ -22,18 +22,20 @@ class VaeUp(nn.Module):
 
     def __init__(
         self,
-        latent_dim:  int = 3,
-        style_dim:   int = 256,
-        in_channels: int = 6,
-        n_latent:    int = 512,
-        n_points:    int = 2048,
-        k:           int = 16,
+        latent_dim:     int   = 3,
+        style_dim:      int   = 256,
+        in_channels:    int   = 6,
+        n_latent:       int   = 512,
+        n_points:       int   = 2048,
+        k:              int   = 16,
+        zg_dropout_p:   float = 0.0,
     ):
         super().__init__()
-        self.style_dim  = style_dim
-        self.latent_dim = latent_dim
-        self.n_latent   = n_latent
-        self.n_points   = n_points
+        self.style_dim     = style_dim
+        self.latent_dim    = latent_dim
+        self.n_latent      = n_latent
+        self.n_points      = n_points
+        self.zg_dropout_p  = zg_dropout_p
 
         self.global_encoder = GlobalEncoder(in_channels, style_dim)
         self.local_encoder  = LocalEncoderUp(in_channels, latent_dim, style_dim, n_latent, k)
@@ -62,7 +64,15 @@ class VaeUp(nn.Module):
         logvar_l = logvar_l.clamp(-10.0, 10.0)
         z_l = mu_l + torch.randn_like(mu_l) * (0.5 * logvar_l).exp()
 
-        xyz_out, xyz_coarse = self.decoder(z_l, z_g, return_coarse=True)
+        # Randomly zero z_g seen by the decoder so z_l must carry structure.
+        # The encoder always sees the full z_g; only the decoder is blinded.
+        if self.training and self.zg_dropout_p > 0.0:
+            mask = (torch.rand(z_g.shape[0], 1, device=z_g.device) > self.zg_dropout_p).float()
+            z_g_dec = z_g * mask
+        else:
+            z_g_dec = z_g
+
+        xyz_out, xyz_coarse = self.decoder(z_l, z_g_dec, return_coarse=True)
         return xyz_out, xyz_coarse, mu_l, logvar_l, mu_g, logvar_g
 
     @torch.no_grad()

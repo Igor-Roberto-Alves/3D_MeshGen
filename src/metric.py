@@ -237,17 +237,25 @@ def kl_divergence(mu: Tensor, logvar: Tensor, free_bits: float = 0.5, reduce: st
     logvar = torch.clamp(logvar, -10.0, 10.0)
     mu     = torch.clamp(mu,     -10.0, 10.0)
 
-    # Element-wise KL: (B, ...) same shape as input
     kl_elem = -0.5 * (1.0 + logvar - mu.pow(2) - logvar.exp())  # (B, [N,] D)
 
-    # Free-bits: zero out dimensions where KL is already below threshold
-    kl_elem = torch.clamp(kl_elem, min=free_bits)
-
-    # Reduce over all latent dims — mean keeps scale invariant to D and N
-    if kl_elem.dim() == 3:          # (B, N, D)  — local latent cloud
-        kl_per_sample = kl_elem.mean(dim=(1, 2))   # (B,)
-    else:                           # (B, D)     — global style vector
-        kl_per_sample = kl_elem.mean(dim=1)        # (B,)
+    if free_bits > 0.0:
+        # Per-dimension free bits (Kingma et al. 2016):
+        # average KL across the batch for each latent dimension, then apply
+        # the floor. This prevents collapse without locking individual samples.
+        if kl_elem.dim() == 3:       # (B, N, D)
+            kl_per_dim = kl_elem.mean(dim=0)           # (N, D)
+            kl_per_dim = kl_per_dim.clamp(min=free_bits)
+            kl_per_sample = kl_per_dim.mean().unsqueeze(0).expand(kl_elem.shape[0])
+        else:                         # (B, D)
+            kl_per_dim = kl_elem.mean(dim=0)           # (D,)
+            kl_per_dim = kl_per_dim.clamp(min=free_bits)
+            kl_per_sample = kl_per_dim.mean().unsqueeze(0).expand(kl_elem.shape[0])
+    else:
+        if kl_elem.dim() == 3:
+            kl_per_sample = kl_elem.mean(dim=(1, 2))
+        else:
+            kl_per_sample = kl_elem.mean(dim=1)
 
     if reduce == "none":
         return kl_per_sample
