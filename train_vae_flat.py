@@ -1,14 +1,24 @@
 """
-train_vae_up.py
----------------
-Training loop for the Hierarchical Point-Cloud VAE with FPS-compressed local latent.
-Same as train_vae.py but uses VaeUp (FPS + k-NN grouping encoder, folding decoder).
+train_vae_flat.py
+------------------
+Training loop para o VaeFlat: latente UNICO e flat, sem split
+global/local, sem "pontos latentes". Decoder StyleGAN-like (canvas
+constante + AdaGN). Ver src/vae_flat.py e src/decoder_flat.py.
+
+Diferencas em relacao a train_vae_up.py:
+  - Sem coarse_weight (removido tambem do VaeUp — loss sem pressao de KL
+    que so incentivava memorizacao).
+  - Sem zg_dropout_p (nao ha mais z_g separado de z_l pra "vazar" info).
+  - KL unica (kl_divergence 2-D: piso de free-bits por canal, ja
+    implementado em src/metric.py).
+  - beta_hold_epochs: mantem beta=0 fixo por N epocas antes do ramp
+    comecar, pra dar tempo do decoder aprender a depender de z antes da
+    KL apertar (mitiga o colapso que aparecia ja na epoca 2 no VaeUp).
 """
 
 import argparse
 import json
 import logging
-import math
 import os
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -23,8 +33,8 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
 from src.dataset import Ds_point_sampled_already
-from src.metric import f_score, vae_loss
-from src.vae_up import VaeUp
+from src.metric import chamfer_distance_knn, emd_approx, kl_divergence, f_score
+from src.vae_flat import VaeFlat
 from src.Vae import normalize_pc
 
 
@@ -36,17 +46,22 @@ from src.Vae import normalize_pc
 class TrainConfig:
     # --- paths ---
     data_root:        str   = "point_clouds"
-    ckpt_dir:         str   = "checkpoints_up"
-    log_dir:          str   = "logs_up"
+    ckpt_dir:         str   = "checkpoints_flat"
+    log_dir:          str   = "logs_flat"
 
     # --- architecture ---
-    n_latent:         int   = 512    # coarse latent points (try 512, 256, 128)
-    n_points:         int   = 2048   # output points (must equal dataset point count)
-    latent_dim:       int   = 3
-    style_dim:        int   = 256
+    latent_dim:       int   = 512    # dimensao do vetor latente unico
+    n_latent:         int   = 512    # ancoras do canvas constante (antes do folding)
+    n_points:         int   = 2048   # pontos de saida (deve bater com o dataset)
+    seed_dim:         int   = 128    # largura do embedding por ancora do canvas
     in_channels:      int   = 6
-    k:                int   = 16     # k-NN neighbours for grouping in encoder
-    zg_dropout_p:     float = 0.15   # prob. de zerar z_g visto pelo decoder (força z_l a carregar estrutura)
+
+    # --- capacidade do decoder (escale so por flag, sem editar codigo) ---
+    decoder_hidden_dim:  int = 384   # largura inicial dos estagios PVConv
+    decoder_stages:      int = 4     # profundidade (numero de estagios PVConv)
+    decoder_fold_dim:    int = 64    # largura da feature que entra no fold_mlp
+    decoder_fold_hidden: int = 256   # largura interna do fold_mlp
+    decoder_resolution:  int = 16    # grade de voxelizacao de cada PVConv (custo ~quadratico nos canais)
 
     # --- training ---
     epochs:           int   = 200
@@ -59,12 +74,11 @@ class TrainConfig:
     # --- VAE beta scheduling (KL annealing) ---
     beta_start:       float = 0.0
     beta_end:         float = 1.0
-    beta_epochs:      int   = 60    # termina o ramp mais cedo: menos época sob KL fraco pra decorar
+    beta_hold_epochs: int   = 10    # beta=0 fixo por essas epocas antes do ramp comecar
+    beta_epochs:      int   = 60    # duracao do ramp APOS o hold
 
     # --- KL ---
-    # free_bits agora é aplicado por (ponto, canal) em vez de agregado — protege
-    # unidades individuais do latente espacial de colapsarem no prior (ver metric.kl_divergence).
-    free_bits:        float = 0.03
+    free_bits:        float = 0.03  # piso por canal do latente flat (ver metric.kl_divergence)
 
     # --- reconstruction loss ---
     recon_loss:       str   = "both"
@@ -153,13 +167,42 @@ def log_reconstructions(writer, model, loader, device, epoch, split="train", max
 
 
 # ============================================================
+# Loss (latente unico — nao usa src.metric.vae_loss, que assume 2 KLs)
+# ============================================================
+
+def flat_vae_loss(pred_xyz, target_xyz, mu, logvar, beta, free_bits,
+                   recon_loss="both", emd_weight=0.5, emd_iters=15, emd_n_subsample=0):
+    if recon_loss == "chamfer":
+        recon, cd_f, cd_b = chamfer_distance_knn(pred_xyz, target_xyz)
+        out = {"recon": recon, "cd_forward": cd_f, "cd_backward": cd_b}
+    elif recon_loss == "emd":
+        recon = emd_approx(pred_xyz, target_xyz, n_iters=emd_iters, n_subsample=emd_n_subsample)
+        out = {"recon": recon}
+    elif recon_loss == "both":
+        cd, cd_f, cd_b = chamfer_distance_knn(pred_xyz, target_xyz)
+        emd = emd_approx(pred_xyz, target_xyz, n_iters=emd_iters, n_subsample=emd_n_subsample)
+        recon = (1 - emd_weight) * cd + emd_weight * emd
+        out = {"recon": recon, "cd": cd, "emd": emd, "cd_forward": cd_f, "cd_backward": cd_b}
+    else:
+        raise ValueError(f"Unknown recon_loss: '{recon_loss}'.")
+
+    kl = kl_divergence(mu, logvar, free_bits=free_bits)
+    out["kl"] = kl
+    out["total"] = recon + beta * kl
+    return out
+
+
+# ============================================================
 # Utilities
 # ============================================================
 
 def beta_schedule(epoch, cfg):
-    if epoch >= cfg.beta_epochs:
+    if epoch < cfg.beta_hold_epochs:
+        return cfg.beta_start
+    t_epoch = epoch - cfg.beta_hold_epochs
+    if t_epoch >= cfg.beta_epochs:
         return cfg.beta_end
-    t = epoch / cfg.beta_epochs
+    t = t_epoch / cfg.beta_epochs
     return cfg.beta_start + t * (cfg.beta_end - cfg.beta_start)
 
 
@@ -171,7 +214,7 @@ def set_seed(seed):
 
 def get_logger(log_dir):
     Path(log_dir).mkdir(parents=True, exist_ok=True)
-    logger = logging.getLogger("vae_up_train")
+    logger = logging.getLogger("vae_flat_train")
     logger.setLevel(logging.INFO)
     if not logger.handlers:
         fh  = logging.FileHandler(os.path.join(log_dir, "train.log"))
@@ -204,14 +247,12 @@ def train_one_epoch(model, loader, optimiser, scaler, cfg, epoch, logger, device
         optimiser.zero_grad(set_to_none=True)
 
         with torch.autocast(device_type=device.type, enabled=cfg.amp):
-            xyz_out, xyz_coarse, mu_l, logvar_l, mu_g, logvar_g = model(points)
-            losses = vae_loss(
+            xyz_out, xyz_coarse, mu, logvar = model(points)
+            losses = flat_vae_loss(
                 pred_xyz=xyz_out,
                 target_xyz=target_xyz,
-                mu_points=mu_l,
-                logvar_points=logvar_l,
-                mu_style=mu_g,
-                logvar_style=logvar_g,
+                mu=mu,
+                logvar=logvar,
                 beta=beta,
                 free_bits=cfg.free_bits,
                 recon_loss=cfg.recon_loss,
@@ -233,7 +274,7 @@ def train_one_epoch(model, loader, optimiser, scaler, cfg, epoch, logger, device
         if (batch_idx + 1) % cfg.log_every == 0:
             avg = {k: v / n_batches for k, v in totals.items()}
             logger.info(
-                f"  Epoch {epoch:03d}  Batch {batch_idx+1}/{len(loader)}  β={beta:.4f}  "
+                f"  Epoch {epoch:03d}  Batch {batch_idx+1}/{len(loader)}  beta={beta:.4f}  "
                 + "  ".join(f"{k}={v:.5f}" for k, v in avg.items())
             )
 
@@ -242,24 +283,27 @@ def train_one_epoch(model, loader, optimiser, scaler, cfg, epoch, logger, device
 
 @torch.no_grad()
 def validate(model, loader, cfg, epoch, device):
+    """Retorna (metrics, kl_per_channel). kl_per_channel e (latent_dim,) —
+    KL medio por canal sobre todo o split de validacao, usado pro log de
+    'canais ativos' (ver log_latent_activity)."""
     model.eval()
     beta      = beta_schedule(epoch, cfg)
     totals    = {}
     n_batches = 0
+    kl_sum    = None
+    n_samples = 0
 
     for points, _ in loader:
         points     = points.to(device, non_blocking=True)
         target_xyz = normalize_pc(points)[..., :3]
 
         with torch.autocast(device_type=device.type, enabled=cfg.amp):
-            xyz_out, xyz_coarse, mu_l, logvar_l, mu_g, logvar_g = model(points)
-            losses = vae_loss(
+            xyz_out, xyz_coarse, mu, logvar = model(points)
+            losses = flat_vae_loss(
                 pred_xyz=xyz_out,
                 target_xyz=target_xyz,
-                mu_points=mu_l,
-                logvar_points=logvar_l,
-                mu_style=mu_g,
-                logvar_style=logvar_g,
+                mu=mu,
+                logvar=logvar,
                 beta=beta,
                 free_bits=cfg.free_bits,
                 recon_loss=cfg.recon_loss,
@@ -276,7 +320,31 @@ def validate(model, loader, cfg, epoch, device):
         totals["f10"] = totals.get("f10", 0.0) + fs10["f_score"].item()
         n_batches += 1
 
-    return {k: v / max(n_batches, 1) for k, v in totals.items()}
+        mu_c, logvar_c = mu.float().clamp(-10.0, 10.0), logvar.float().clamp(-10.0, 10.0)
+        kl_elem = -0.5 * (1.0 + logvar_c - mu_c.pow(2) - logvar_c.exp())  # (B, D)
+        batch_sum = kl_elem.sum(dim=0)
+        kl_sum    = batch_sum if kl_sum is None else kl_sum + batch_sum
+        n_samples += points.shape[0]
+
+    metrics = {k: v / max(n_batches, 1) for k, v in totals.items()}
+    kl_per_channel = (kl_sum / max(n_samples, 1)).cpu()
+    return metrics, kl_per_channel
+
+
+def log_latent_activity(writer, kl_per_channel, free_bits, epoch, log_hist):
+    """Canal 'ativo' = KL medio (sobre o split de val) estritamente acima do
+    piso de free-bits — canais parados exatamente no piso nao contam como
+    ativos (estao la so por causa do clamp, nao porque carregam informacao)."""
+    threshold = free_bits + 1e-3
+    active = (kl_per_channel > threshold).sum().item()
+    total  = kl_per_channel.numel()
+    writer.add_scalar("latent/active_units", active, epoch)
+    writer.add_scalar("latent/active_units_frac", active / total, epoch)
+    writer.add_scalar("latent/kl_per_channel_mean", kl_per_channel.mean().item(), epoch)
+    writer.add_scalar("latent/kl_per_channel_max",  kl_per_channel.max().item(), epoch)
+    if log_hist:
+        writer.add_histogram("latent/kl_per_channel", kl_per_channel, epoch)
+    return active, total
 
 
 # ============================================================
@@ -319,23 +387,36 @@ def main(cfg: TrainConfig) -> None:
     logger.info(f"Dataset: {len(train_idx)} train / {len(val_idx)} val samples")
 
     # ---- Model ----------------------------------------------------------
-    model = VaeUp(
+    model = VaeFlat(
         latent_dim=cfg.latent_dim,
-        style_dim=cfg.style_dim,
         in_channels=cfg.in_channels,
         n_latent=cfg.n_latent,
         n_points=cfg.n_points,
-        k=cfg.k,
-        zg_dropout_p=cfg.zg_dropout_p,
+        seed_dim=cfg.seed_dim,
+        hidden_dim=cfg.decoder_hidden_dim,
+        n_stages=cfg.decoder_stages,
+        fold_dim=cfg.decoder_fold_dim,
+        fold_hidden=cfg.decoder_fold_hidden,
+        resolution=cfg.decoder_resolution,
     ).to(device)
-    logger.info(f"VaeUp  |  params: {count_parameters(model):,}")
     logger.info(
-        f"  n_latent={cfg.n_latent}  ratio={cfg.n_points // cfg.n_latent}"
-        f"  latent_dim={cfg.latent_dim}  style_dim={cfg.style_dim}"
+        f"VaeFlat  |  params: {count_parameters(model):,}  "
+        f"(encoder: {count_parameters(model.encoder):,}  decoder: {count_parameters(model.decoder):,})"
     )
     logger.info(
-        f"  recon_loss={cfg.recon_loss}  emd_iters={cfg.emd_iters}"
-        f"  emd_n_subsample={cfg.emd_n_subsample}"
+        f"  latent_dim={cfg.latent_dim}  n_latent={cfg.n_latent}  "
+        f"ratio={cfg.n_points // cfg.n_latent}  seed_dim={cfg.seed_dim}"
+    )
+    logger.info(
+        f"  decoder_hidden_dim={cfg.decoder_hidden_dim}  decoder_stages={cfg.decoder_stages}  "
+        f"decoder_fold_dim={cfg.decoder_fold_dim}  decoder_fold_hidden={cfg.decoder_fold_hidden}  "
+        f"decoder_resolution={cfg.decoder_resolution}"
+    )
+    logger.info(
+        f"  recon_loss={cfg.recon_loss}  emd_iters={cfg.emd_iters}  "
+        f"emd_n_subsample={cfg.emd_n_subsample}  "
+        f"beta_hold_epochs={cfg.beta_hold_epochs}  beta_epochs={cfg.beta_epochs}  "
+        f"free_bits={cfg.free_bits}"
     )
 
     if cfg.compile_model and hasattr(torch, "compile"):
@@ -370,7 +451,7 @@ def main(cfg: TrainConfig) -> None:
     for epoch in range(start_epoch, cfg.epochs):
         t0          = time.time()
         trn_metrics = train_one_epoch(model, trn_loader, optimiser, scaler, cfg, epoch, logger, device)
-        val_metrics = validate(model, val_loader, cfg, epoch, device)
+        val_metrics, kl_per_channel = validate(model, val_loader, cfg, epoch, device)
         scheduler.step()
 
         elapsed = time.time() - t0
@@ -378,7 +459,7 @@ def main(cfg: TrainConfig) -> None:
         val_str = "  ".join(f"val_{k}={v:.5f}" for k, v in val_metrics.items())
         logger.info(
             f"Epoch {epoch:03d}/{cfg.epochs}  "
-            f"lr={scheduler.get_last_lr()[0]:.2e}  β={beta_schedule(epoch, cfg):.4f}  "
+            f"lr={scheduler.get_last_lr()[0]:.2e}  beta={beta_schedule(epoch, cfg):.4f}  "
             f"time={elapsed:.1f}s\n  {trn_str}\n  {val_str}"
         )
 
@@ -387,7 +468,13 @@ def main(cfg: TrainConfig) -> None:
         log_metrics_tensorboard(writer, trn_metrics, "train", epoch)
         log_metrics_tensorboard(writer, val_metrics, "val",   epoch)
 
-        if epoch >= cfg.beta_epochs:
+        active, total = log_latent_activity(
+            writer, kl_per_channel, cfg.free_bits, epoch,
+            log_hist=(epoch % cfg.grad_hist_every == 0),
+        )
+        logger.info(f"  canais ativos: {active}/{total}  ({100*active/total:.1f}%)")
+
+        if epoch >= cfg.beta_hold_epochs + cfg.beta_epochs:
             log_metrics_tensorboard(writer, trn_metrics, "post_beta/train", epoch)
             log_metrics_tensorboard(writer, val_metrics, "post_beta/val",   epoch)
 
@@ -400,7 +487,7 @@ def main(cfg: TrainConfig) -> None:
             log_grad_histograms(writer, model, epoch)
 
         val_f10 = val_metrics.get("f10", 0.0)
-        is_best = (epoch >= cfg.beta_epochs) and (val_f10 > best_val_f10)
+        is_best = (epoch >= cfg.beta_hold_epochs + cfg.beta_epochs) and (val_f10 > best_val_f10)
         if is_best:
             best_val_f10 = val_f10
             logger.info(f"  New best val F@0.10: {best_val_f10:.4f}")
@@ -437,7 +524,7 @@ def main(cfg: TrainConfig) -> None:
 
 def parse_args() -> TrainConfig:
     cfg = TrainConfig()
-    p   = argparse.ArgumentParser(description="Train Hierarchical Point-Cloud VAE (FPS + folding)")
+    p   = argparse.ArgumentParser(description="Train Flat-Latent Point-Cloud VAE (constant canvas + AdaGN)")
     for field_name, field_val in asdict(cfg).items():
         t = type(field_val)
         if t is bool:

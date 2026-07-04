@@ -233,6 +233,17 @@ def kl_divergence(mu: Tensor, logvar: Tensor, free_bits: float = 0.5, reduce: st
     term can dominate early in training and force the encoder to ignore
     the input (mean-field collapse), which manifests as the decoder
     having to reconstruct from pure noise → cuboid outputs.
+
+    FIX #3: for point-structured latents (B, N, D — e.g. one code per
+    FPS anchor), the floor is applied per (point, channel) unit, not
+    aggregated over all N points into a single per-channel average.
+    Aggregating over points lets the model kill most of the N anchors
+    (drive them to the prior) while dumping all the usable KL budget
+    into a handful of "hub" points/channels — the batch-average floor
+    is satisfied without any single point being protected. Flooring
+    every (point, channel) unit removes the KL penalty for that unit
+    specifically, so reconstruction pressure can actually use every
+    anchor's capacity instead of concentrating it in a few.
     """
     logvar = torch.clamp(logvar, -10.0, 10.0)
     mu     = torch.clamp(mu,     -10.0, 10.0)
@@ -240,15 +251,11 @@ def kl_divergence(mu: Tensor, logvar: Tensor, free_bits: float = 0.5, reduce: st
     kl_elem = -0.5 * (1.0 + logvar - mu.pow(2) - logvar.exp())  # (B, [N,] D)
 
     if free_bits > 0.0:
-        # Per-dimension free bits (Kingma et al. 2016):
-        # average KL across the batch (and, for point latents, across points
-        # too) for each latent dimension, then apply the floor. This prevents
-        # collapse without locking individual samples.
-        if kl_elem.dim() == 3:       # (B, N, D)
-            kl_per_dim = kl_elem.mean(dim=(0, 1))      # (D,) — one floor per channel
-            kl_per_dim = kl_per_dim.clamp(min=free_bits)
-            kl_per_sample = kl_per_dim.mean().unsqueeze(0).expand(kl_elem.shape[0])
-        else:                         # (B, D)
+        if kl_elem.dim() == 3:       # (B, N, D) — floor per (point, channel)
+            kl_per_unit = kl_elem.mean(dim=0)          # (N, D)
+            kl_per_unit = kl_per_unit.clamp(min=free_bits)
+            kl_per_sample = kl_per_unit.mean().unsqueeze(0).expand(kl_elem.shape[0])
+        else:                         # (B, D) — floor per channel
             kl_per_dim = kl_elem.mean(dim=0)           # (D,)
             kl_per_dim = kl_per_dim.clamp(min=free_bits)
             kl_per_sample = kl_per_dim.mean().unsqueeze(0).expand(kl_elem.shape[0])
