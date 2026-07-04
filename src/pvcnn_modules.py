@@ -161,7 +161,11 @@ class PVConv(nn.Module):
             Swish(),
         ]
         self.voxel_layers = nn.Sequential(*layers)
-        self.attention = Attention(half, num_heads=8, D=3) if attention else None
+        # Clamp num_heads so head_dim >= 8 (flash-attention requirement).
+        # Also skip 3-D attention for large voxel grids (R>16 -> L=R^3>4096),
+        # where even flash attention has prohibitive QKV memory.
+        _att_heads = max(1, min(8, half // 8))
+        self.attention = Attention(half, num_heads=_att_heads, D=3) if (attention and resolution <= 16) else None
         self.se = SE3d(half, relu=with_se_relu) if with_se else None
 
         self.point_features = SharedMLP(in_channels, out_channels - half, dim=1)
