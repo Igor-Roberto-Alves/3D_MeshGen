@@ -1,6 +1,33 @@
 import torch
 
-import torch
+
+def round_channels(x: float, base: int = 16, min_val: int = 16) -> int:
+    """
+    Arredonda pro multiplo de `base` mais proximo (minimo `min_val`).
+    Necessario porque VoxelBranch usa GroupNorm(num_groups=8, ...) em cada
+    estagio — precisa que o numero de canais (e a metade dele, usado
+    internamente) seja divisivel por 8. Multiplos de 16 garantem isso
+    sempre, independente da combinacao de hidden_dim/out_dim/n_stages
+    passada via flag.
+    """
+    return max(min_val, int(round(x / base)) * base)
+
+
+def channel_schedule(start_dim: int, end_dim: int, n_steps: int) -> list[int]:
+    """
+    Interpolacao geometrica de `start_dim` ate `end_dim` em `n_steps`
+    passos, com cada valor arredondado pra um multiplo de 16 (ver
+    `round_channels`). Retorna uma lista de `n_steps + 1` valores;
+    channels[i] -> channels[i+1] e o i-esimo estagio.
+    """
+    channels = []
+    for i in range(n_steps + 1):
+        r = i / n_steps
+        c = start_dim * ((end_dim / start_dim) ** r)
+        channels.append(round_channels(c))
+    channels[0]  = round_channels(start_dim)
+    channels[-1] = round_channels(end_dim)
+    return channels
 
 def farthest_point_sample(xyz: torch.Tensor, npoint: int) -> torch.Tensor:
     B, N, _ = xyz.shape

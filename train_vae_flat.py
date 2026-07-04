@@ -63,6 +63,12 @@ class TrainConfig:
     decoder_fold_hidden: int = 256   # largura interna do fold_mlp
     decoder_resolution:  int = 16    # grade de voxelizacao de cada PVConv (custo ~quadratico nos canais)
 
+    # --- capacidade do encoder (escale so por flag, sem editar codigo) ---
+    encoder_hidden_dim:  int = 64    # largura do 1o estagio PVConv
+    encoder_out_dim:     int = 256   # largura do ultimo estagio — gargalo real antes do max-pool/fc_mu/fc_logvar
+    encoder_stages:      int = 3     # profundidade (numero de estagios PVConv)
+    encoder_resolution:  int = 32    # grade de voxelizacao do 1o estagio (dobra a cada estagio seguinte)
+
     # --- training ---
     epochs:           int   = 200
     batch_size:       int   = 8
@@ -398,6 +404,10 @@ def main(cfg: TrainConfig) -> None:
         fold_dim=cfg.decoder_fold_dim,
         fold_hidden=cfg.decoder_fold_hidden,
         resolution=cfg.decoder_resolution,
+        encoder_hidden_dim=cfg.encoder_hidden_dim,
+        encoder_out_dim=cfg.encoder_out_dim,
+        encoder_stages=cfg.encoder_stages,
+        encoder_resolution=cfg.encoder_resolution,
     ).to(device)
     logger.info(
         f"VaeFlat  |  params: {count_parameters(model):,}  "
@@ -411,6 +421,10 @@ def main(cfg: TrainConfig) -> None:
         f"  decoder_hidden_dim={cfg.decoder_hidden_dim}  decoder_stages={cfg.decoder_stages}  "
         f"decoder_fold_dim={cfg.decoder_fold_dim}  decoder_fold_hidden={cfg.decoder_fold_hidden}  "
         f"decoder_resolution={cfg.decoder_resolution}"
+    )
+    logger.info(
+        f"  encoder_hidden_dim={cfg.encoder_hidden_dim}  encoder_out_dim={cfg.encoder_out_dim}  "
+        f"encoder_stages={cfg.encoder_stages}  encoder_resolution={cfg.encoder_resolution}"
     )
     logger.info(
         f"  recon_loss={cfg.recon_loss}  emd_iters={cfg.emd_iters}  "

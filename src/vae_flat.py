@@ -38,13 +38,21 @@ class VaeFlat(nn.Module):
         fold_dim:    int = 64,
         fold_hidden: int = 256,
         resolution:  int = 16,
+        encoder_hidden_dim: int = 64,
+        encoder_out_dim:    int = 256,
+        encoder_stages:     int = 3,
+        encoder_resolution: int = 32,
     ):
         super().__init__()
         self.latent_dim = latent_dim
         self.n_latent    = n_latent
         self.n_points    = n_points
 
-        self.encoder = GlobalEncoder(in_channels, latent_dim)
+        self.encoder = GlobalEncoder(
+            in_channels, latent_dim,
+            hidden_dim=encoder_hidden_dim, out_dim=encoder_out_dim,
+            n_stages=encoder_stages, resolution=encoder_resolution,
+        )
         self.decoder = FlatDecoder(
             latent_dim=latent_dim, n_latent=n_latent, n_points=n_points, seed_dim=seed_dim,
             hidden_dim=hidden_dim, n_stages=n_stages, fold_dim=fold_dim,

@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 
 from src.Decoder import PVConvBlockDecoder, SharedMLP
+from src.utils import channel_schedule
 
 
 def _make_seeds(ratio: int) -> torch.Tensor:
@@ -16,36 +17,6 @@ def _make_seeds(ratio: int) -> torch.Tensor:
     gy, gx = torch.meshgrid(t, t, indexing="ij")
     grid   = torch.stack([gx.flatten(), gy.flatten()], dim=-1)  # (side^2, 2)
     return grid[:ratio]                                          # (ratio, 2)
-
-
-def _round_channels(x: float, base: int = 16, min_val: int = 16) -> int:
-    """
-    Arredonda pro multiplo de `base` mais proximo (minimo `min_val`).
-    Necessario porque VoxelBranch usa GroupNorm(num_groups=8, ...) em cada
-    estagio — precisa que o numero de canais (e a metade dele, usado
-    internamente) seja divisivel por 8. Multiplos de 16 garantem isso
-    sempre, independente da combinacao de hidden_dim/fold_dim/n_stages
-    passada via flag.
-    """
-    return max(min_val, int(round(x / base)) * base)
-
-
-def _channel_schedule(hidden_dim: int, fold_dim: int, n_stages: int) -> list[int]:
-    """
-    Interpolacao geometrica de `hidden_dim` (entrada do stage 0) ate
-    `fold_dim` (saida do ultimo stage, o que entra no fold_mlp) em
-    `n_stages` passos, com cada valor arredondado pra um multiplo de 16
-    (ver `_round_channels`). channels[i] -> channels[i+1] e o i-esimo
-    estagio.
-    """
-    channels = []
-    for i in range(n_stages + 1):
-        r = i / n_stages
-        c = hidden_dim * ((fold_dim / hidden_dim) ** r)
-        channels.append(_round_channels(c))
-    channels[0]  = _round_channels(hidden_dim)
-    channels[-1] = _round_channels(fold_dim)
-    return channels
 
 
 class FlatDecoder(nn.Module):
@@ -98,10 +69,10 @@ class FlatDecoder(nn.Module):
         self.ratio    = n_points // n_latent
         self.seed_dim = seed_dim
 
-        # Canais reais (arredondados p/ multiplo de 16, ver _channel_schedule) —
+        # Canais reais (arredondados p/ multiplo de 16, ver src.utils.channel_schedule) —
         # usados em vez dos argumentos brutos em qualquer lugar cuja shape
         # precise bater com a saida de um estagio (feat_proj e fold_mlp).
-        channels = _channel_schedule(hidden_dim, fold_dim, n_stages)
+        channels = channel_schedule(hidden_dim, fold_dim, n_stages)
         hidden_dim_actual = channels[0]
         fold_dim_actual   = channels[-1]
 

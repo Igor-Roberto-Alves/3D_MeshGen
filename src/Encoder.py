@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from src.utils import AdaGN
+from src.utils import AdaGN, channel_schedule, round_channels
 
 
 class SharedMLP(nn.Sequential):
@@ -119,23 +119,41 @@ class GlobalEncoder(nn.Module):
     Architecture (LION Sec. 3):
         PVCNN backbone  →  global max-pool  →  fc_mu / fc_logvar
     Returns mu_g, logvar_g  each of shape (B, style_dim).
+
+    Capacidade controlada por `hidden_dim` (largura do 1o estagio), `out_dim`
+    (largura do ultimo estagio — o gargalo que alimenta o max-pool e depois
+    fc_mu/fc_logvar) e `n_stages` (profundidade). `style_dim` (o z de saida)
+    e so uma projecao LINEAR de `out_dim`, entao aumentar `style_dim` sozinho
+    nao da mais informacao real ao encoder — o teto de informacao e `out_dim`
+    (ver ARQUITETURA_VAE.md / discussao sobre posterior collapse).
     """
-    def __init__(self, in_channels=6, style_dim=256):
+    def __init__(self, in_channels=6, style_dim=256, hidden_dim=64, out_dim=256,
+                 n_stages=3, resolution=32):
         super().__init__()
-        self.stage0 = PVConvBlock(in_channels, 64,  resolution=32)
-        self.stage1 = PVConvBlock(64,          128, resolution=16)
-        self.stage2 = PVConvBlock(128,         256, resolution=8)
-        self.fc_mu     = nn.Linear(256, style_dim)
-        self.fc_logvar = nn.Linear(256, style_dim)
+        assert n_stages >= 1, "n_stages must be >= 1"
+
+        if n_stages == 1:
+            widths = [round_channels(out_dim)]
+        else:
+            widths = channel_schedule(hidden_dim, out_dim, n_stages - 1)
+
+        self.stages = nn.ModuleList()
+        prev = in_channels
+        for i, width in enumerate(widths):
+            res_i = max(resolution // (2 ** i), 4)
+            self.stages.append(PVConvBlock(prev, width, resolution=res_i))
+            prev = width
+
+        self.fc_mu     = nn.Linear(prev, style_dim)
+        self.fc_logvar = nn.Linear(prev, style_dim)
 
     def forward(self, x):
         # x: (B, N, in_channels) with xyz already in [-1, 1]
         xyz  = x[..., :3]
         feat = x
-        feat = self.stage0(xyz, feat)
-        feat = self.stage1(xyz, feat)
-        feat = self.stage2(xyz, feat)
-        g = feat.max(dim=1).values          # global max-pool → (B, 256)
+        for stage in self.stages:
+            feat = stage(xyz, feat)
+        g = feat.max(dim=1).values          # global max-pool → (B, out_dim)
         return self.fc_mu(g), self.fc_logvar(g)
 
 
