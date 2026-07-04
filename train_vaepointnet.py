@@ -35,6 +35,13 @@ Quick-start examples
   # Exp 6 — multi-category (airplanes + cars)
   python train_vaepointnet.py --exp_name exp6_all --category all
 
+  # Exp 7 — CD converges but shapes look wrong: blend in EMD
+  python train_vaepointnet.py --exp_name exp7_emd --recon_loss both --emd_weight 0.5
+
+  # Exp 8 — same symptom, more capacity (bigger latent + folding decoder)
+  python train_vaepointnet.py --exp_name exp8_cap --latent_dim 512 --global_dim 2048 \
+      --decoder_type folding
+
   # Resume from last checkpoint
   python train_vaepointnet.py --exp_name exp2_anneal --resume
 """
@@ -54,7 +61,7 @@ from torch.utils.tensorboard import SummaryWriter
 from EncoderPointnet import EncoderPointnet, tnet_regularization
 from DecoderPointnet  import DecoderMLP, DecoderFolding
 from Vaepointnet      import VaePointnet
-from src.metric       import chamfer_distance_knn, kl_divergence
+from src.metric       import chamfer_distance_knn, kl_divergence, emd_approx
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -240,11 +247,46 @@ def log_visuals(writer: SummaryWriter, model: VaePointnet,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Reconstruction loss (Chamfer, EMD, or a blend of both)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def compute_recon_loss(recon: torch.Tensor, xyz: torch.Tensor, recon_loss: str,
+                        emd_weight: float, emd_iters: int, emd_n_subsample: int):
+    """
+    Returns (loss_term, cd) where `loss_term` is what gets optimised and `cd`
+    is the plain Chamfer distance, always computed for logging / checkpoint
+    selection so runs stay comparable across --recon_loss settings.
+    """
+    cd, _, _ = chamfer_distance_knn(recon, xyz)
+
+    if recon_loss == "chamfer":
+        return cd, cd
+
+    # EMD requires a bijection, so pred and target must have equal point counts
+    # (the folding decoder can output slightly more points than requested).
+    target = xyz
+    if recon.shape[1] != xyz.shape[1]:
+        idx    = torch.randperm(xyz.shape[1], device=xyz.device)[:recon.shape[1]]
+        target = xyz[:, idx, :]
+
+    emd = emd_approx(recon, target, n_iters=emd_iters, n_subsample=emd_n_subsample)
+
+    if recon_loss == "emd":
+        return emd, cd
+    # "both": blend of Chamfer (global structure, cheap) and EMD (uniform
+    # coverage, sharper detail) — fixes the many-to-one matching that lets
+    # plain Chamfer settle on a locally-clumped, generically-shaped decode.
+    return (1 - emd_weight) * cd + emd_weight * emd, cd
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # One epoch
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_epoch(model, loader, optimizer, beta_cur, free_bits,
-              tnet_reg_weight, device, train: bool):
+              tnet_reg_weight, device, train: bool,
+              recon_loss: str = "chamfer", emd_weight: float = 0.5,
+              emd_iters: int = 15, emd_n_subsample: int = 512):
     model.train(train)
     ctx = torch.enable_grad() if train else torch.no_grad()
 
@@ -259,10 +301,12 @@ def run_epoch(model, loader, optimizer, beta_cur, free_bits,
 
             recon, mu, logvar, A_feat = model(x)
 
-            cd, _, _  = chamfer_distance_knn(recon, xyz)
+            recon_term, cd = compute_recon_loss(
+                recon, xyz, recon_loss, emd_weight, emd_iters, emd_n_subsample
+            )
             kl        = kl_divergence(mu, logvar, free_bits=free_bits)
             t_reg     = tnet_regularization(A_feat) if tnet_reg_weight > 0 else 0.0
-            loss      = cd + beta_cur * kl + tnet_reg_weight * t_reg
+            loss      = recon_term + beta_cur * kl + tnet_reg_weight * t_reg
 
             if train:
                 optimizer.zero_grad()
@@ -308,6 +352,16 @@ def main():
     p.add_argument("--kl_anneal_epochs", type=int,   default=0)
     p.add_argument("--free_bits",        type=float, default=0.5)
     p.add_argument("--tnet_reg",         type=float, default=0.001)
+    p.add_argument("--recon_loss",       default="chamfer", choices=["chamfer", "emd", "both"],
+                   help="'both' blends Chamfer + EMD (see --emd_weight); "
+                        "recommended when CD converges but shapes still look wrong")
+    p.add_argument("--emd_weight",       type=float, default=0.5,
+                   help="Weight of EMD in the blend when --recon_loss both (0=pure CD, 1=pure EMD)")
+    p.add_argument("--emd_iters",        type=int,   default=15,
+                   help="Sinkhorn iterations for the EMD approximation")
+    p.add_argument("--emd_n_subsample",  type=int,   default=512,
+                   help="Subsample points before EMD's O(N^2) Sinkhorn cost matrix "
+                        "(0 = use all num_points, slower and more memory)")
 
     # ── Output ────────────────────────────────────────────────────────────
     p.add_argument("--exp_name",  default="exp")
@@ -431,11 +485,15 @@ def main():
 
         tr_loss, tr_cd, tr_kl = run_epoch(
             model, train_loader, optimizer,
-            beta_cur, args.free_bits, args.tnet_reg, device, train=True
+            beta_cur, args.free_bits, args.tnet_reg, device, train=True,
+            recon_loss=args.recon_loss, emd_weight=args.emd_weight,
+            emd_iters=args.emd_iters, emd_n_subsample=args.emd_n_subsample,
         )
         vl_loss, vl_cd, vl_kl = run_epoch(
             model, val_loader, optimizer,
-            beta_cur, args.free_bits, args.tnet_reg, device, train=False
+            beta_cur, args.free_bits, args.tnet_reg, device, train=False,
+            recon_loss=args.recon_loss, emd_weight=args.emd_weight,
+            emd_iters=args.emd_iters, emd_n_subsample=args.emd_n_subsample,
         )
         scheduler.step()
 

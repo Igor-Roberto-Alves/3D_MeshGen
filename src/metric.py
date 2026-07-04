@@ -241,10 +241,11 @@ def kl_divergence(mu: Tensor, logvar: Tensor, free_bits: float = 0.5, reduce: st
 
     if free_bits > 0.0:
         # Per-dimension free bits (Kingma et al. 2016):
-        # average KL across the batch for each latent dimension, then apply
-        # the floor. This prevents collapse without locking individual samples.
+        # average KL across the batch (and, for point latents, across points
+        # too) for each latent dimension, then apply the floor. This prevents
+        # collapse without locking individual samples.
         if kl_elem.dim() == 3:       # (B, N, D)
-            kl_per_dim = kl_elem.mean(dim=0)           # (N, D)
+            kl_per_dim = kl_elem.mean(dim=(0, 1))      # (D,) — one floor per channel
             kl_per_dim = kl_per_dim.clamp(min=free_bits)
             kl_per_sample = kl_per_dim.mean().unsqueeze(0).expand(kl_elem.shape[0])
         else:                         # (B, D)

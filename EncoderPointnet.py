@@ -1,14 +1,4 @@
-"""
-EncoderPointnet.py
-------------------
-PointNet encoder for point cloud VAE.
 
-Input:  x [B, in_dim, N]   — in_dim=3 (xyz) or 6 (xyz + normals)
-Output: mu [B, latent_dim], logvar [B, latent_dim], A_feat [B, 64, 64]
-
-A_feat is the feature T-net matrix used for optional orthogonality
-regularisation (tnet_regularization). Pass it to the loss in train_vaepointnet.py.
-"""
 
 import torch
 import torch.nn as nn
@@ -16,7 +6,6 @@ import torch.nn.functional as F
 
 
 class _Tnet(nn.Module):
-    """Mini-PointNet that predicts a dim×dim alignment matrix."""
     def __init__(self, dim: int):
         super().__init__()
         self.dim = dim
@@ -35,13 +24,12 @@ class _Tnet(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B = x.size(0)
-        h = self.conv(x).max(dim=-1)[0]                      # [B, 1024]
+        h = self.conv(x).max(dim=-1)[0]                     
         mat = self.fc(h).view(B, self.dim, self.dim)
         return mat + torch.eye(self.dim, device=x.device, dtype=x.dtype)
 
 
 def tnet_regularization(A: torch.Tensor) -> torch.Tensor:
-    """||A @ Aᵀ − I||²_F  — penalises the feature T-net leaving orthogonality."""
     d = A.size(1)
     I = torch.eye(d, device=A.device, dtype=A.dtype).unsqueeze(0)
     diff = torch.bmm(A, A.transpose(1, 2)) - I
@@ -49,15 +37,7 @@ def tnet_regularization(A: torch.Tensor) -> torch.Tensor:
 
 
 class EncoderPointnet(nn.Module):
-    """
-    PointNet encoder → Gaussian latent (mu, logvar).
 
-    Parameters
-    ----------
-    latent_dim  : size of z
-    in_dim      : 3 (xyz only) or 6 (xyz + normals)
-    global_dim  : width of the global feature vector before projection (default 1024)
-    """
     def __init__(self, latent_dim: int = 256, in_dim: int = 3, global_dim: int = 1024):
         super().__init__()
         self.in_dim = in_dim
@@ -91,14 +71,7 @@ class EncoderPointnet(nn.Module):
         self.fc_logvar = nn.Linear(256, latent_dim)
 
     def forward(self, x: torch.Tensor):
-        """
-        x : [B, in_dim, N]
-        Returns
-        -------
-        mu     [B, latent_dim]
-        logvar [B, latent_dim]
-        A_feat [B, 64, 64]   — feature T-net matrix for optional regularisation
-        """
+
         # Align xyz with the input T-net; rotate normals by the same matrix
         T_in = self.tnet_in(x[:, :3])               # [B, 3, 3]
         xyz  = torch.bmm(T_in, x[:, :3])            # [B, 3, N]
