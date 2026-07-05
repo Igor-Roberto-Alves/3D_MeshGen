@@ -1,29 +1,12 @@
-"""
-src/Diffusion.py
-----------------
-Two DDPM denoisers for the LION two-stage diffusion:
-
-  Stage 1  StyleDenoiser        : class label → z_g  (global style, R^style_dim)
-  Stage 2  LatentPointDenoiser  : z_g         → z_local  (R^{N × point_dim})
-
-Both share the same CosineSchedule forward/reverse process.
-"""
-
 import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
-# ────────────────────────────────────────────────────────────────────────────
-# Noise schedule
-# ────────────────────────────────────────────────────────────────────────────
 
 class CosineSchedule(nn.Module):
-    """
-    Cosine variance schedule (Nichol & Dhariwal 2021).
-    All tensors are registered as buffers so they move with .to(device).
-    """
+
 
     def __init__(self, T: int = 1000, s: float = 0.008):
         super().__init__()
@@ -66,7 +49,6 @@ class CosineSchedule(nn.Module):
         guidance:  float = 1.0,
         device:    torch.device | None = None,
     ) -> torch.Tensor:
-        """Full DDPM reverse chain with optional classifier-free guidance."""
         B = condition.shape[0]
         if device is None:
             device = condition.device
@@ -107,9 +89,6 @@ class CosineSchedule(nn.Module):
         return mean + mask * var.clamp(min=1e-20).sqrt() * torch.randn_like(xt)
 
 
-# ────────────────────────────────────────────────────────────────────────────
-# Shared building blocks
-# ────────────────────────────────────────────────────────────────────────────
 
 def sinusoidal_emb(t: torch.Tensor, dim: int) -> torch.Tensor:
     half  = dim // 2
@@ -121,7 +100,6 @@ def sinusoidal_emb(t: torch.Tensor, dim: int) -> torch.Tensor:
 
 
 class MLPResBlock(nn.Module):
-    """Residual MLP block for flat vectors, conditioned via adaptive LayerNorm."""
     def __init__(self, dim: int, cond_dim: int):
         super().__init__()
         self.norm = nn.LayerNorm(dim)
@@ -139,29 +117,12 @@ class MLPResBlock(nn.Module):
 
 
 def modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-    """adaLN modulation. x: (B, N, C); shift/scale: (B, C) broadcast over N."""
+
     return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
 
 
 class DiTBlock(nn.Module):
-    """
-    Diffusion-transformer block with adaLN-Zero conditioning (Peebles & Xie 2023).
 
-    Each latent point is a token; full self-attention lets every point attend to
-    every other point directly (O(N²), trivial at N≈512). This replaces the old
-    per-point Conv1d + Perceiver-bottleneck design: since z_local carries no xyz
-    position (see Vae.LocalEncoder — z_l is a fully learned per-point code, not an
-    anchor offset), dense self-attention is the natural way to learn inter-point
-    structure without coordinates or kNN grouping.
-
-    NO positional encoding is added: the token set is permutation-equivariant and
-    the FPS ordering that produced z_l is not canonical across samples, so an
-    index-based PE would inject a spurious signal.
-
-    Conditioning (timestep + global style z_g) modulates each sub-block via
-    adaLN-Zero: the modulation MLP is zero-initialised so every block starts as
-    the identity (gates = 0), which keeps early training stable.
-    """
     def __init__(self, dim: int, cond_dim: int, n_heads: int, mlp_ratio: float = 4.0):
         super().__init__()
         self.norm1 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
@@ -171,13 +132,12 @@ class DiTBlock(nn.Module):
         self.mlp = nn.Sequential(
             nn.Linear(dim, hidden), nn.GELU(), nn.Linear(hidden, dim),
         )
-        # adaLN-Zero: 6 modulation vectors (shift/scale/gate × attn, mlp).
+
         self.ada = nn.Linear(cond_dim, 6 * dim)
         nn.init.zeros_(self.ada.weight)
         nn.init.zeros_(self.ada.bias)
 
     def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
-        # x: (B, N, C);  cond: (B, cond_dim)
         shift_sa, scale_sa, gate_sa, shift_mlp, scale_mlp, gate_mlp = \
             self.ada(cond).chunk(6, dim=-1)
         h = modulate(self.norm1(x), shift_sa, scale_sa)
@@ -188,7 +148,6 @@ class DiTBlock(nn.Module):
 
 
 class DiTFinalLayer(nn.Module):
-    """Final adaLN + linear projection back to point_dim, zero-initialised."""
     def __init__(self, dim: int, cond_dim: int, point_dim: int):
         super().__init__()
         self.norm = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
@@ -202,19 +161,8 @@ class DiTFinalLayer(nn.Module):
         return self.proj(modulate(self.norm(x), shift, scale))
 
 
-# ────────────────────────────────────────────────────────────────────────────
-# Stage 1  –  Style Denoiser   (class → z_g)
-# ────────────────────────────────────────────────────────────────────────────
 
 class StyleDenoiser(nn.Module):
-    """
-    ε-predictor for the global shape latent z_g ∈ ℝ^style_dim.
-    Condition: discrete class label with classifier-free guidance support.
-
-    During training, class labels are randomly dropped to the unconditional
-    token (index = num_classes) with probability cfg_dropout, enabling
-    guidance-scale control at inference.
-    """
 
     def __init__(
         self,
@@ -227,14 +175,14 @@ class StyleDenoiser(nn.Module):
     ):
         super().__init__()
         self.cfg_dropout = cfg_dropout
-        self.uncond_idx  = num_classes           # reserved unconditional token
+        self.uncond_idx  = num_classes 
         time_dim         = hidden
 
         self.time_mlp = nn.Sequential(
             nn.Linear(time_dim, time_dim * 2), nn.SiLU(),
             nn.Linear(time_dim * 2, time_dim),
         )
-        self.class_emb = nn.Embedding(num_classes + 1, time_dim)  # +1 for uncond
+        self.class_emb = nn.Embedding(num_classes + 1, time_dim)  
         self.cond_proj = nn.Linear(time_dim * 2, time_dim)
 
         self.input_proj  = nn.Linear(style_dim, hidden)
@@ -262,32 +210,11 @@ class StyleDenoiser(nn.Module):
         return self.output_proj(h)
 
     def uncond(self, B: int, device: torch.device) -> torch.Tensor:
-        """Return unconditional class tensor for CFG."""
         return torch.full((B,), self.uncond_idx, device=device, dtype=torch.long)
 
 
-# ────────────────────────────────────────────────────────────────────────────
-# Stage 2  –  Latent Point Denoiser   (z_g → z_local)
-# ────────────────────────────────────────────────────────────────────────────
-
 class LatentPointDenoiser(nn.Module):
-    """
-    ε-predictor for the local latent cloud z_l ∈ ℝ^{N × point_dim}, implemented
-    as a DiT (diffusion transformer) over the N latent points.
-    point_dim must equal Vae.latent_dim — no anchor prefix since the anchor
-    bypass was removed.
-
-    Each latent point is a token; a stack of DiTBlocks applies full self-attention
-    so every point attends to every other point directly. This replaces the old
-    per-point Conv1d + Perceiver-bottleneck design: because z_l has no xyz anchor,
-    dense self-attention is the natural way to model inter-point structure without
-    coordinates. Conditioning (timestep + global style z_g) is injected via
-    adaLN-Zero. The set is treated as permutation-equivariant — no positional
-    encoding, since the FPS ordering behind z_l is not canonical across samples.
-
-    Interface is unchanged: forward(zt, t, z_g) with zt (B, N, point_dim),
-    t (B,), z_g (B, style_dim) → (B, N, point_dim).
-    """
+ 
 
     def __init__(
         self,

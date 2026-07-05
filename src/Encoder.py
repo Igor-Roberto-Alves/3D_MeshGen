@@ -146,6 +146,14 @@ class GlobalEncoder(nn.Module):
 
         self.fc_mu     = nn.Linear(prev, style_dim)
         self.fc_logvar = nn.Linear(prev, style_dim)
+        # Comeca quase-deterministico: logvar == -6 p/ qualquer input
+        # (sigma = e^-3 ~ 0.05). Com o init default o logvar sai O(1) ->
+        # sigma ~ 1, i.e. z = mu + ruido na MESMA escala de mu (SNR ~ 1);
+        # o decoder entao aprende a ignorar z ja na fase beta=0 e o
+        # posterior colapsa antes de a KL sequer entrar. Mesmo racional
+        # (e mesmo valor) do LocalEncoder abaixo — aqui faltava.
+        nn.init.zeros_(self.fc_logvar.weight)
+        nn.init.constant_(self.fc_logvar.bias, -6.0)
 
     def forward(self, x):
         # x: (B, N, in_channels) with xyz already in [-1, 1]

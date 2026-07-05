@@ -6,11 +6,17 @@ from src.utils import AdaGN
 
 class SharedMLP(nn.Sequential):
     def __init__(self, channels, bn=True, act=True):
+        # GroupNorm instead of BatchNorm: this MLP runs directly on the
+        # sampled latent (feat_proj(z_l)) with batch_size as small as 8.
+        # BatchNorm mixes per-sample statistics across the batch right at
+        # the point where the per-instance signal from z is weakest, which
+        # washes out exactly the information the KL term is fighting to
+        # keep. GroupNorm normalises within each sample instead.
         layers = []
         for i in range(len(channels) - 1):
             layers.append(nn.Conv1d(channels[i], channels[i + 1], 1, bias=not bn))
             if bn:
-                layers.append(nn.BatchNorm1d(channels[i + 1]))
+                layers.append(nn.GroupNorm(min(8, channels[i + 1]), channels[i + 1]))
             if act:
                 layers.append(nn.GELU())
         super().__init__(*layers)

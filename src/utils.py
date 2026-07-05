@@ -92,10 +92,17 @@ class AdaGN(nn.Module):
         # GroupNorm padrão (filtros, canais, eps)
         self.gn = nn.GroupNorm(num_groups, num_channels, eps=1e-5)
         
-        # MLP que transforma o estilo global nos parâmetros lineares (gamma e beta)
-        # Inicializamos o peso da escala em zero para começar como uma identidade
+        # MLP que transforma o estilo global nos parâmetros lineares (gamma e beta).
+        # Peso com init PEQUENO mas nao-zero: com peso exatamente zero,
+        # d(saida)/d(style) == 0 no passo 0, entao NENHUM gradiente de
+        # reconstrucao chega ao encoder enquanto o decoder ja treina — num
+        # decoder de canvas constante (FlatDecoder) o AdaGN e o UNICO caminho
+        # de z ate a saida, e esse caminho morto no init fazia o decoder
+        # convergir pra "forma media" incondicional antes do encoder acordar
+        # (posterior collapse ja na fase beta=0). std=0.01 mantem gamma/beta
+        # ~N(0, 0.23^2) p/ style_dim=512: perto da identidade, mas vivo.
         self.fc = nn.Linear(style_dim, num_channels * 2)
-        nn.init.zeros_(self.fc.weight)
+        nn.init.normal_(self.fc.weight, std=0.01)
         nn.init.zeros_(self.fc.bias)
 
     def forward(self, x: torch.Tensor, style: torch.Tensor) -> torch.Tensor:
