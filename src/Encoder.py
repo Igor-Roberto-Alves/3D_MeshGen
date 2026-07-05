@@ -70,7 +70,6 @@ class PointBranch(nn.Module):
 
 
 class PVConvBlock(nn.Module):
-    """Plain PVCNN block — no style conditioning. Used in GlobalEncoder."""
     def __init__(self, feat_in, feat_out, resolution=16):
         super().__init__()
         half = feat_out // 2
@@ -108,9 +107,6 @@ class PVConvBlockConditioned(nn.Module):
         return self.conv(self.act(x)).permute(0, 2, 1)  # (B, N, feat_out)
 
 
-# ---------------------------------------------------------------------------
-# Global Encoder  (LION paper: "shape-level VAE encoder")
-# ---------------------------------------------------------------------------
 
 class GlobalEncoder(nn.Module):
     """
@@ -146,40 +142,21 @@ class GlobalEncoder(nn.Module):
 
         self.fc_mu     = nn.Linear(prev, style_dim)
         self.fc_logvar = nn.Linear(prev, style_dim)
-        # Comeca quase-deterministico: logvar == -6 p/ qualquer input
-        # (sigma = e^-3 ~ 0.05). Com o init default o logvar sai O(1) ->
-        # sigma ~ 1, i.e. z = mu + ruido na MESMA escala de mu (SNR ~ 1);
-        # o decoder entao aprende a ignorar z ja na fase beta=0 e o
-        # posterior colapsa antes de a KL sequer entrar. Mesmo racional
-        # (e mesmo valor) do LocalEncoder abaixo — aqui faltava.
         nn.init.zeros_(self.fc_logvar.weight)
         nn.init.constant_(self.fc_logvar.bias, -6.0)
 
     def forward(self, x):
-        # x: (B, N, in_channels) with xyz already in [-1, 1]
         xyz  = x[..., :3]
         feat = x
         for stage in self.stages:
             feat = stage(xyz, feat)
-        g = feat.max(dim=1).values          # global max-pool → (B, out_dim)
+        g = feat.max(dim=1).values          
         return self.fc_mu(g), self.fc_logvar(g)
 
 
-# ---------------------------------------------------------------------------
-# Local Encoder  (LION paper: "point-level VAE encoder")
-# ---------------------------------------------------------------------------
 
 class LocalEncoder(nn.Module):
-    """
-    Encodes per-point latent features conditioned on the global shape z_g.
 
-    Architecture (LION Sec. 3):
-        PVCNN backbone + AdaGN conditioning  →  fc_mu / fc_logvar per point
-    Returns mu_l, logvar_l  each of shape (B, N, latent_dim).
-
-    The xyz anchors are NOT part of the stochastic latent — they are passed
-    separately from the input and concatenated in Vae.forward before decoding.
-    """
     def __init__(self, in_channels=6, latent_dim=3, style_dim=256):
         super().__init__()
         self.latent_dim = latent_dim
@@ -188,12 +165,11 @@ class LocalEncoder(nn.Module):
         self.stage2 = PVConvBlockConditioned(128,         256, style_dim, resolution=8)
         self.fc_mu     = nn.Conv1d(256, latent_dim, 1)
         self.fc_logvar = nn.Conv1d(256, latent_dim, 1)
-        # Bias the logvar head low so the encoder starts near-deterministic.
-        # The KL term will gradually open up the variance during training.
+
         nn.init.constant_(self.fc_logvar.bias, -6.0)
 
     def forward(self, x, style):
-        # x: (B, N, in_channels);  style: (B, style_dim)
+
         xyz  = x[..., :3]
         feat = x
         feat = self.stage0(xyz, feat, style)

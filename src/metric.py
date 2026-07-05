@@ -1,33 +1,17 @@
-"""
-metrics.py
-----------
-Differentiable and evaluation metrics for point-cloud VAE.
-"""
-
 import torch
 import torch.nn.functional as F
 from torch import Tensor
 
 
-# ============================================================
-# Internal helpers
-# ============================================================
 
 def _pairwise_sq_dist(a: Tensor, b: Tensor) -> Tensor:
-    """
-    a : (B, M, 3)
-    b : (B, N, 3)
-    returns: (B, M, N)  squared Euclidean distances
-    """
+
     a2 = (a ** 2).sum(dim=2, keepdim=True)
     b2 = (b ** 2).sum(dim=2, keepdim=True)
     ab = torch.bmm(a, b.transpose(1, 2))
     return (a2 + b2.transpose(1, 2) - 2 * ab).clamp(min=0.0)
 
 
-# ============================================================
-# Chamfer Distance
-# ============================================================
 
 def chamfer_distance(pred: Tensor, target: Tensor, reduce: str = "mean"):
     sq = _pairwise_sq_dist(pred, target)
@@ -55,16 +39,13 @@ def chamfer_distance_knn(pred: Tensor, target: Tensor, k: int = 1, reduce: str =
     return agg(cd_pred) + agg(cd_tgt), agg(cd_pred), agg(cd_tgt)
 
 
-# ============================================================
-# Approximate EMD (Sinkhorn)
-# ============================================================
+
 
 def emd_approx(pred: Tensor, target: Tensor, n_iters: int = 30, eps: float = 0.05,
                reduce: str = "mean", n_subsample: int = 0) -> Tensor:
     B, N, _ = pred.shape
     assert pred.shape == target.shape
 
-    # Subsample for speed: O(N^2) cost matrix → O(n_subsample^2)
     if 0 < n_subsample < N:
         idx    = torch.randperm(N, device=pred.device)[:n_subsample]
         pred   = pred[:, idx]
@@ -90,9 +71,7 @@ def emd_approx(pred: Tensor, target: Tensor, n_iters: int = 30, eps: float = 0.0
     return emd.mean() if reduce == "mean" else emd.sum()
 
 
-# ============================================================
-# F-Score
-# ============================================================
+
 
 def f_score(pred: Tensor, target: Tensor, threshold: float = 0.01, reduce: str = "mean") -> dict[str, Tensor]:
     dist = torch.cdist(pred.float(), target.float())
@@ -105,9 +84,7 @@ def f_score(pred: Tensor, target: Tensor, threshold: float = 0.01, reduce: str =
     return {"precision": prec.mean(), "recall": rec.mean(), "f_score": fs.mean()}
 
 
-# ============================================================
-# Normal Consistency
-# ============================================================
+
 
 def normal_consistency(pred_pts: Tensor, pred_nrm: Tensor, tgt_pts: Tensor, tgt_nrm: Tensor, reduce: str = "mean") -> Tensor:
     pred_nrm = F.normalize(pred_nrm, dim=2)
@@ -124,26 +101,10 @@ def normal_consistency(pred_pts: Tensor, pred_nrm: Tensor, tgt_pts: Tensor, tgt_
     return cos_sim.mean() if reduce == "mean" else cos_sim.sum()
 
 
-# ============================================================
-# Generative-model set metrics (MMD-CD / COV-CD / 1-NNA-CD)
-# ============================================================
-#
-# Unlike the losses above (which score a single prediction against its own
-# target), these score a *set* of generated point clouds against a held-out
-# *set* of real ones — i.e. whether the generator's output distribution
-# matches the real one, not just whether individual samples denoise well.
-# A model can have a great denoising loss and still mode-collapse or produce
-# off-distribution shapes; these are the standard metrics (PointFlow, used by
-# LION) for catching that when picking a checkpoint.
+
 
 def _pairwise_cd_cross(a: Tensor, b: Tensor, chunk: int = 4) -> Tensor:
-    """
-    a: (Ma, N, 3)   b: (Mb, N, 3)   →   (Ma, Mb) Chamfer-distance matrix.
 
-    Computed in row chunks (`chunk` clouds of `a` against all of `b` per
-    step) instead of building the full Ma*Mb x N x N tensor at once, to
-    bound GPU memory regardless of how many samples are requested.
-    """
     Ma, Mb = a.shape[0], b.shape[0]
     D = a.new_zeros(Ma, Mb)
     for start in range(0, Ma, chunk):
@@ -158,46 +119,19 @@ def _pairwise_cd_cross(a: Tensor, b: Tensor, chunk: int = 4) -> Tensor:
 
 
 def mmd_cov(gen: Tensor, ref: Tensor, chunk: int = 4) -> dict[str, Tensor]:
-    """
-    MMD-CD and COV-CD (Yang et al., PointFlow 2019 — Sec 5.1; also used by LION).
 
-    gen: (Ng, N, 3)  generated point clouds
-    ref: (Nr, N, 3)  held-out real point clouds, SAME normalised coordinate
-                      space as gen (see Vae.normalize_pc — apply it to real
-                      clouds before calling this, since the decoder's output
-                      already lives in that space).
-
-    MMD — for each real sample, distance to its closest generated sample,
-          averaged over the real set. Lower = generated samples are on
-          average closer to real ones (fidelity).
-    COV  — fraction of real samples that are *someone's* nearest neighbour
-          among the generated set. Lower = many real modes are never
-          produced by any generated sample (mode collapse / low diversity).
-    """
-    D = _pairwise_cd_cross(gen, ref, chunk=chunk)          # D[i, j] = CD(gen_i, ref_j)
-    mmd = D.min(dim=0).values.mean()                        # per ref: closest gen, avg over ref
-    cov = D.min(dim=1).indices.unique().numel() / ref.shape[0]  # frac of ref hit as NN by some gen
+    D = _pairwise_cd_cross(gen, ref, chunk=chunk)        
+    mmd = D.min(dim=0).values.mean()                    
+    cov = D.min(dim=1).indices.unique().numel() / ref.shape[0] 
     return {"mmd": mmd, "cov": gen.new_tensor(cov)}
 
 
 def nna_1nn(gen: Tensor, ref: Tensor, chunk: int = 4) -> Tensor:
-    """
-    1-NNA-CD (Lopez-Paz & Oquab 2017, adapted by PointFlow for point clouds).
-
-    Pools gen and ref into one set; for every sample, finds its nearest
-    neighbour (leave-one-out) in the pooled set and checks whether that
-    neighbour comes from the same set (gen or ref). Returns the resulting
-    classification accuracy.
-
-    0.5 == ideal: gen and ref are statistically indistinguishable by 1-NN.
-    1.0 == gen and ref are trivially separable (bad — either the generator
-           is off-distribution, or it's producing near-duplicates that
-           cluster tightly instead of matching the real spread).
-    """
+ 
     Ng, Nr = gen.shape[0], ref.shape[0]
     all_pts = torch.cat([gen, ref], dim=0)
     D = _pairwise_cd_cross(all_pts, all_pts, chunk=chunk)
-    D.fill_diagonal_(float("inf"))                          # exclude self as its own neighbour
+    D.fill_diagonal_(float("inf"))                         
 
     labels  = torch.cat([gen.new_zeros(Ng), gen.new_ones(Nr)])
     nn_idx  = D.argmin(dim=1)
@@ -206,45 +140,14 @@ def nna_1nn(gen: Tensor, ref: Tensor, chunk: int = 4) -> Tensor:
 
 
 def generative_metrics(gen: Tensor, ref: Tensor, chunk: int = 4) -> dict[str, Tensor]:
-    """MMD-CD, COV-CD and 1-NNA-CD in one call. See mmd_cov / nna_1nn for definitions."""
     out = mmd_cov(gen, ref, chunk=chunk)
     out["nna_1nn"] = nna_1nn(gen, ref, chunk=chunk)
     return out
 
 
-# ============================================================
-# KL Divergence
-# ============================================================
 
 def kl_divergence(mu: Tensor, logvar: Tensor, free_bits: float = 0.5, reduce: str = "mean") -> Tensor:
-    """
-    KL[q(z|x) || p(z)] with free-bits per dimension to prevent posterior collapse.
 
-    FIX #1: the original code used .sum(dim=(1,2)) / shape[1] which
-    heavily under-weights the KL for the point cloud (B, N, D) case —
-    dividing by N instead of N*D makes the KL ~D times too small,
-    meaning beta effectively acts as beta/D.  We now use .mean() over
-    all latent dimensions so the KL is dimensionally consistent with
-    the reconstruction loss regardless of whether z is (B,D) or (B,N,D).
-
-    FIX #2: free_bits threshold prevents posterior collapse.  Any
-    dimension with KL < free_bits is treated as zero — the encoder is
-    not penalised for using those dimensions.  Without this, the KL
-    term can dominate early in training and force the encoder to ignore
-    the input (mean-field collapse), which manifests as the decoder
-    having to reconstruct from pure noise → cuboid outputs.
-
-    FIX #3: for point-structured latents (B, N, D — e.g. one code per
-    FPS anchor), the floor is applied per (point, channel) unit, not
-    aggregated over all N points into a single per-channel average.
-    Aggregating over points lets the model kill most of the N anchors
-    (drive them to the prior) while dumping all the usable KL budget
-    into a handful of "hub" points/channels — the batch-average floor
-    is satisfied without any single point being protected. Flooring
-    every (point, channel) unit removes the KL penalty for that unit
-    specifically, so reconstruction pressure can actually use every
-    anchor's capacity instead of concentrating it in a few.
-    """
     logvar = torch.clamp(logvar, -10.0, 10.0)
     mu     = torch.clamp(mu,     -10.0, 10.0)
 
@@ -270,10 +173,6 @@ def kl_divergence(mu: Tensor, logvar: Tensor, free_bits: float = 0.5, reduce: st
     return kl_per_sample.mean() if reduce == "mean" else kl_per_sample.sum()
 
 
-# ============================================================
-# Full VAE ELBO loss
-# ============================================================
-
 def vae_loss(
     pred_xyz:        Tensor,
     target_xyz:      Tensor,
@@ -294,7 +193,7 @@ def vae_loss(
     normal_weight:   float          = 0.0,
 ) -> dict[str, Tensor]:
 
-    # --- 1. Reconstruction loss ----------------------------------------
+
     if recon_loss == "chamfer":
         recon, cd_f, cd_b = chamfer_distance_knn(pred_xyz, target_xyz)
         out = {"recon": recon, "cd_forward": cd_f, "cd_backward": cd_b}
@@ -322,7 +221,6 @@ def vae_loss(
     else:
         raise ValueError(f"Unknown recon_loss: '{recon_loss}'.")
 
-    # --- 2. Normal loss (optional) -------------------------------------
     if normal_weight > 0.0 and normals_pred is not None and normal_target is not None:
         n_consistency = normal_consistency(pred_xyz, normals_pred, target_xyz, normal_target)
         n_loss = (1.0 - n_consistency).clamp(min=0.0, max=1.0)
@@ -331,15 +229,13 @@ def vae_loss(
         n_loss = pred_xyz.new_zeros(1)
         out["normal_loss"] = n_loss
 
-    # --- 3. KL losses --------------------------------------------------
-    # mu_points / logvar_points are (B, N, latent_dim) — full local latent,
-    # no xyz prefix, so we use the full tensor here.
+
     kl_pts = kl_divergence(mu_points, logvar_points, free_bits=free_bits)
     kl_sty = kl_divergence(mu_style,  logvar_style,  free_bits=free_bits)
     out["kl_points"] = kl_pts
     out["kl_style"]  = kl_sty
 
-    # --- 4. Total ELBO -------------------------------------------------
+
     total = (
         recon
         + normal_weight * n_loss

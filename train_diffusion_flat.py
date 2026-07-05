@@ -47,6 +47,10 @@ from EncoderPointnet import EncoderPointnet
 from DecoderPointnet import DecoderMLP, DecoderFolding
 from Vaepointnet import VaePointnet
 from train_vaepointnet import _load_ply, CATEGORY_IDS
+from train_vae_flat import _side_by_side
+from src.dataset import Ds_point_sampled_already
+from src.vae_flat import VaeFlat
+from src.Vae import normalize_pc
 from src.Diffusion import CosineSchedule
 from src.UnetDiffusion import UNet1D, ddim_sample
 from src.metric import generative_metrics
@@ -83,6 +87,24 @@ def make_split(n: int, seed: int, val_frac: float):
     return all_idx[: n - n_val], all_idx[n - n_val:]
 
 
+def list_files_flat(data_root: str):
+    """PLY list in the SAME (os.walk) order as Ds_point_sampled_already, so
+    index-based splits match the ones used in train_vae_flat.main()."""
+    ds = Ds_point_sampled_already(root=data_root, augment=False)
+    files  = [Path(f) for f in ds.files]
+    labels = [CLASS_IDS[f.name.split("_")[0]] for f in files]
+    return files, labels
+
+
+def make_split_flat(n: int, seed: int, val_frac: float):
+    """Exact replica of the split in train_vae_flat.main() (val = FIRST slice
+    of the permutation, unlike make_split above which takes the last)."""
+    g = torch.Generator().manual_seed(seed)
+    n_val = max(1, int(n * val_frac))
+    all_idx = torch.randperm(n, generator=g).tolist()
+    return all_idx[n_val:], all_idx[:n_val]
+
+
 def load_clouds(files, in_dim: int = 3) -> torch.Tensor:
     """Load + normalise (unit sphere) all clouds → [M, N, in_dim] float32."""
     return torch.stack([_load_ply(f, in_dim) for f in files])
@@ -100,12 +122,50 @@ def build_vae(vae_args: dict, device) -> VaePointnet:
     return VaePointnet(encoder, decoder).to(device)
 
 
+def build_vae_flat(cfg: dict, decoder_norm: str, device) -> VaeFlat:
+    return VaeFlat(
+        latent_dim=cfg["latent_dim"], in_channels=cfg["in_channels"],
+        n_latent=cfg["n_latent"], n_points=cfg["n_points"],
+        seed_dim=cfg["seed_dim"],
+        hidden_dim=cfg["decoder_hidden_dim"], n_stages=cfg["decoder_stages"],
+        fold_dim=cfg["decoder_fold_dim"], fold_hidden=cfg["decoder_fold_hidden"],
+        resolution=cfg["decoder_resolution"],
+        encoder_hidden_dim=cfg["encoder_hidden_dim"],
+        encoder_out_dim=cfg["encoder_out_dim"],
+        encoder_stages=cfg["encoder_stages"],
+        encoder_resolution=cfg["encoder_resolution"],
+        decoder_norm=decoder_norm,
+    ).to(device)
+
+
 def load_vae(ckpt_path: str, device):
-    """Load frozen VaePointnet + its training args from a best.pt/last.pt."""
+    """Load a frozen VAE + normalised training args from a best.pt/last.pt.
+
+    Supports both checkpoint layouts:
+      {"args": ...}   — VaePointnet, saved by train_vaepointnet.py
+      {"config": ...} — VaeFlat,     saved by train_vae_flat.py
+    """
     ck = torch.load(ckpt_path, map_location=device, weights_only=False)
-    vae_args = ck["args"]
-    vae = build_vae(vae_args, device)
-    vae.load_state_dict(ck["model"])
+    if "config" in ck:                                     # VaeFlat
+        cfg, state = ck["config"], ck["model"]
+        # Checkpoints trained before the BatchNorm→GroupNorm switch in
+        # src.Decoder.SharedMLP carry BN running stats; rebuild accordingly.
+        norm = "batch" if "decoder.feat_proj.1.running_mean" in state else "group"
+        vae = build_vae_flat(cfg, norm, device)
+        vae.load_state_dict(state)
+        vae_args = {
+            "arch":       "flat",
+            "latent_dim": cfg["latent_dim"],
+            "in_dim":     cfg["in_channels"],
+            "data_root":  cfg["data_root"],
+            "category":   "all",          # Ds_point_sampled_already uses every PLY
+            "seed":       cfg["seed"],
+            "val_frac":   cfg["val_split"],
+        }
+    else:                                                  # VaePointnet
+        vae_args = dict(ck["args"], arch="pointnet")
+        vae = build_vae(vae_args, device)
+        vae.load_state_dict(ck["model"])
     vae.eval()
     for p in vae.parameters():
         p.requires_grad_(False)
@@ -113,14 +173,17 @@ def load_vae(ckpt_path: str, device):
 
 
 @torch.no_grad()
-def encode_latents(vae: VaePointnet, clouds: torch.Tensor, device,
-                   batch: int = 64):
+def encode_latents(vae, clouds: torch.Tensor, device, batch: int = 64):
     """Frozen-encoder pass → posterior (mu, std), both [M, latent_dim] on CPU."""
     vae.eval()
+    flat = isinstance(vae, VaeFlat)
     mus, stds = [], []
     for s in range(0, clouds.shape[0], batch):
-        x = clouds[s:s + batch].to(device).permute(0, 2, 1)   # [b, in_dim, N]
-        mu, logvar, _ = vae.encoder(x)
+        x = clouds[s:s + batch].to(device)
+        if flat:
+            mu, logvar = vae.encoder(x)                       # [b, N, C], já normalize_pc
+        else:
+            mu, logvar, _ = vae.encoder(x.permute(0, 2, 1))   # [b, in_dim, N]
         mus.append(mu.cpu())
         stds.append((0.5 * logvar.clamp(-10, 10)).exp().cpu())
     return torch.cat(mus), torch.cat(stds)
@@ -195,7 +258,8 @@ class EMA:
 @torch.no_grad()
 def gen_eval(model, schedule, vae, latent_mean, latent_std,
              val_clouds, val_labels, device, n_gen=64, guidance=2.0,
-             ddim_steps=200, metric_points=1024, metric_chunk=2):
+             ddim_steps=200, metric_points=1024, metric_chunk=2,
+             writer=None, epoch=None, n_vis=4):
     results = {}
     for c in range(NUM_CLASSES):
         refs = val_clouds[val_labels == c][..., :3]
@@ -203,12 +267,25 @@ def gen_eval(model, schedule, vae, latent_mean, latent_std,
         ridx = torch.randperm(refs.shape[0])[:n]
         ref  = subsample_points(refs[ridx].to(device), metric_points)
 
-        z   = sample_latents(model, schedule, n, c, latent_mean, latent_std,
-                             device, guidance=guidance, ddim_steps=ddim_steps)
-        gen = subsample_points(decode_latents(vae, z), metric_points)
+        z        = sample_latents(model, schedule, n, c, latent_mean, latent_std,
+                                  device, guidance=guidance, ddim_steps=ddim_steps)
+        gen_full = decode_latents(vae, z)                       # [n, N, 3]
+        gen      = subsample_points(gen_full, metric_points)
 
         m = generative_metrics(gen, ref, chunk=metric_chunk)
         results[CLASS_NAMES[c]] = {k: float(v) for k, v in m.items()}
+
+        # Amostras geradas no TensorBoard (real verde | gerada azul) —
+        # mesmo padrao visual do log_reconstructions do train_vae_flat.
+        if writer is not None:
+            for i in range(min(n_vis, gen_full.shape[0])):
+                ref_v = refs[ridx[i]].float().cpu()
+                gen_v = gen_full[i].float().cpu()
+                ref_c = torch.tensor([[0, 220, 0]],  dtype=torch.uint8).expand(ref_v.shape[0], -1)
+                gen_c = torch.tensor([[0, 80, 220]], dtype=torch.uint8).expand(gen_v.shape[0], -1)
+                verts, clrs = _side_by_side([ref_v, gen_v], [ref_c, gen_c])
+                writer.add_mesh(f"gen_{CLASS_NAMES[c]}/sample_{i}",
+                                vertices=verts, colors=clrs, global_step=epoch)
     return results
 
 
@@ -286,13 +363,24 @@ def main():
     print(f"VAE: {args.vae_ckpt}  |  latent_dim={latent_dim}  "
           f"|  category={vae_args['category']}")
 
-    files, labels = list_files_with_labels(data_root, vae_args["category"])
-    train_idx, val_idx = make_split(len(files), vae_args["seed"], vae_args["val_frac"])
+    if vae_args["arch"] == "flat":
+        files, labels = list_files_flat(data_root)
+        train_idx, val_idx = make_split_flat(len(files), vae_args["seed"],
+                                             vae_args["val_frac"])
+    else:
+        files, labels = list_files_with_labels(data_root, vae_args["category"])
+        train_idx, val_idx = make_split(len(files), vae_args["seed"],
+                                        vae_args["val_frac"])
     labels_t = torch.tensor(labels, dtype=torch.long)
     print(f"Files: {len(files)}  |  train={len(train_idx)}  val={len(val_idx)}")
 
     print("Loading clouds into RAM ...", flush=True)
-    clouds = load_clouds(files, vae_args["in_dim"])            # [M, N, 3]
+    clouds = load_clouds(files, vae_args["in_dim"])            # [M, N, in_dim]
+    if vae_args["arch"] == "flat":
+        # VaeFlat normalises inside forward(); apply it once here so the
+        # encoder input AND the metric reference clouds live in the same
+        # space as the decoder output.
+        clouds = normalize_pc(clouds)
 
     print("Encoding latents with the frozen VAE encoder ...", flush=True)
     mu, std = encode_latents(vae, clouds, device)              # [M, D] each
@@ -465,7 +553,8 @@ def main():
                            n_gen=args.n_gen, guidance=args.guidance,
                            ddim_steps=args.ddim_steps,
                            metric_points=args.metric_points,
-                           metric_chunk=args.metric_chunk)
+                           metric_chunk=args.metric_chunk,
+                           writer=writer, epoch=epoch)
             gen_row = []
             for c, name in CLASS_NAMES.items():
                 m = res[name]

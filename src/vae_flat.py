@@ -7,24 +7,7 @@ from src.Vae import normalize_pc
 
 
 class VaeFlat(nn.Module):
-    """
-    VAE com latente UNICO e flat — sem split global/local, sem "pontos
-    latentes" por ancora.
 
-    A forma inteira e resumida por um unico vetor gaussiano
-    z ~ N(mu, sigma), mu/logvar de shape (B, latent_dim). O decoder
-    (`FlatDecoder`) e StyleGAN-like: um canvas de ancoras constante e
-    aprendido, modulado inteiramente por `z` via AdaGN em cada estagio.
-
-    Comparado ao VaeUp (z_g + z_l por ancora), este design elimina:
-      - a assimetria KL entre um latente "global" e um "local por ponto"
-        (fonte de parte da memorizacao discutida: hubs de ancoras vivas
-        vs. mortas);
-      - o problema de correspondencia de indice entre amostras diferentes
-        (nao ha mais "slot i" por amostra pra interpolar/comparar).
-    Em troca, todo o trabalho de diferenciar formas passa por um unico
-    vetor — por isso o decoder precisa ser mais potente (ver FlatDecoder).
-    """
 
     def __init__(
         self,
@@ -42,6 +25,7 @@ class VaeFlat(nn.Module):
         encoder_out_dim:    int = 256,
         encoder_stages:     int = 3,
         encoder_resolution: int = 32,
+        decoder_norm:       str = "group", 
     ):
         super().__init__()
         self.latent_dim = latent_dim
@@ -56,37 +40,29 @@ class VaeFlat(nn.Module):
         self.decoder = FlatDecoder(
             latent_dim=latent_dim, n_latent=n_latent, n_points=n_points, seed_dim=seed_dim,
             hidden_dim=hidden_dim, n_stages=n_stages, fold_dim=fold_dim,
-            fold_hidden=fold_hidden, resolution=resolution,
+            fold_hidden=fold_hidden, resolution=resolution, norm=decoder_norm,
         )
 
     def forward(self, x: torch.Tensor):
-        """
-        x: (B, N, in_channels)
 
-        Returns
-        -------
-        xyz_out    (B, N, 3)
-        xyz_coarse (B, n_latent, 3)   — posicoes das ancoras antes do folding
-        mu         (B, latent_dim)
-        logvar     (B, latent_dim)
-        """
         x = normalize_pc(x)
 
         mu, logvar = self.encoder(x)
         logvar = logvar.clamp(-10.0, 10.0)
         z = mu + torch.randn_like(mu) * (0.5 * logvar).exp()
 
-        xyz_out, xyz_coarse = self.decoder(z, return_coarse=True)
-        return xyz_out, xyz_coarse, mu, logvar
+        xyz_out= self.decoder(z)
+        
+        return xyz_out, xyz_out, mu, logvar
 
     @torch.no_grad()
     def generate(
         self,
         num_samples: int,
-        num_points:  int = 2048,   # mantido por compat. de API; saida e sempre n_latent x ratio
+        num_points:  int = 2048,   
         device:      torch.device | None = None,
     ) -> torch.Tensor:
-        """Sample from the prior N(0,I) and decode."""
+
         if device is None:
             device = next(self.parameters()).device
         self.eval()

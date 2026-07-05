@@ -5,18 +5,16 @@ from src.utils import AdaGN
 
 
 class SharedMLP(nn.Sequential):
-    def __init__(self, channels, bn=True, act=True):
-        # GroupNorm instead of BatchNorm: this MLP runs directly on the
-        # sampled latent (feat_proj(z_l)) with batch_size as small as 8.
-        # BatchNorm mixes per-sample statistics across the batch right at
-        # the point where the per-instance signal from z is weakest, which
-        # washes out exactly the information the KL term is fighting to
-        # keep. GroupNorm normalises within each sample instead.
+    def __init__(self, channels, bn=True, act=True, norm="group"):
+
         layers = []
         for i in range(len(channels) - 1):
             layers.append(nn.Conv1d(channels[i], channels[i + 1], 1, bias=not bn))
             if bn:
-                layers.append(nn.GroupNorm(min(8, channels[i + 1]), channels[i + 1]))
+                if norm == "batch":
+                    layers.append(nn.BatchNorm1d(channels[i + 1]))
+                else:
+                    layers.append(nn.GroupNorm(min(8, channels[i + 1]), channels[i + 1]))
             if act:
                 layers.append(nn.GELU())
         super().__init__(*layers)
@@ -66,21 +64,21 @@ class VoxelBranch(nn.Module):
 
 
 class PointBranch(nn.Module):
-    def __init__(self, feat_channels, out_channels):
+    def __init__(self, feat_channels, out_channels, norm="group"):
         super().__init__()
-        self.mlp = SharedMLP([feat_channels, out_channels * 2, out_channels])
+        self.mlp = SharedMLP([feat_channels, out_channels * 2, out_channels], norm=norm)
 
     def forward(self, xyz, feat):
         return self.mlp(feat.permute(0, 2, 1)).permute(0, 2, 1)
 
 
 class PVConvBlockDecoder(nn.Module):
-    """PVCNN block with AdaGN conditioning — used inside the decoder."""
-    def __init__(self, feat_in, feat_out, style_dim, resolution=16):
+
+    def __init__(self, feat_in, feat_out, style_dim, resolution=16, norm="group"):
         super().__init__()
         half = feat_out // 2
         self.voxel = VoxelBranch(feat_in, half, resolution)
-        self.point = PointBranch(feat_in, half)
+        self.point = PointBranch(feat_in, half, norm=norm)
         self.adagn = AdaGN(num_channels=feat_out, style_dim=style_dim, num_groups=8)
         self.act   = nn.GELU()
         self.conv  = nn.Conv1d(feat_out, feat_out, 1)
@@ -93,21 +91,9 @@ class PVConvBlockDecoder(nn.Module):
         return self.conv(self.act(x)).permute(0, 2, 1)  # (B, N, feat_out)
 
 
-# ---------------------------------------------------------------------------
-# LION Decoder
-# ---------------------------------------------------------------------------
 
 class LIONDecoder(nn.Module):
-    """
-    Point-cloud decoder conditioned on global shape latent z_g.
 
-    Input:  z_l      (B, N, latent_dim)  — purely stochastic per-point latent
-            z_global (B, style_dim)      — global shape context
-    Output: xyz_out  (B, N, 3)          — decoded point positions
-
-    No anchor bypass: positions are decoded entirely from the stochastic
-    latent so the VAE latent space is a proper generative prior.
-    """
     def __init__(self, latent_dim=3, style_dim=256):
         super().__init__()
         # Derives initial xyz estimate from z_l — used for voxelisation AND as residual base.
