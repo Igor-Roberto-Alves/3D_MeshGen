@@ -6,16 +6,12 @@ from src.Decoder import LIONDecoder
 
 
 def normalize_pc(x: torch.Tensor) -> torch.Tensor:
-    """
-    Normalise xyz to roughly [-1, 1] per sample (uniform scale, centred).
-    Normal channels (if present) are left untouched.
-    x: (B, N, C) where C >= 3
-    """
+
     xyz  = x[..., :3]
     rest = x[..., 3:]
     centre = xyz.mean(dim=1, keepdim=True)                                 # (B, 1, 3)
     xyz_c  = xyz - centre
-    # Largest absolute coordinate value → scale so max coord ≈ 1
+
     scale  = (xyz_c.abs()
                .max(dim=-1, keepdim=True).values   # per-point max over xyz
                .max(dim=1,  keepdim=True).values    # global max over points
@@ -24,17 +20,7 @@ def normalize_pc(x: torch.Tensor) -> torch.Tensor:
 
 
 class Vae(nn.Module):
-    """
-    Hierarchical Point-Cloud VAE following the LION paper (NeurIPS 2022).
 
-    Two-level latent space
-    ----------------------
-    z_g  (B, style_dim)         – global shape prior, N(0,I)
-    z_l  (B, N, latent_dim)     – local per-point prior, N(0,I)
-
-    The decoder reconstructs positions purely from (z_l, z_g) — no anchor
-    bypass — so the latent space is a proper generative prior for diffusion.
-    """
 
     def __init__(
         self,
@@ -50,19 +36,9 @@ class Vae(nn.Module):
         self.local_encoder  = LocalEncoder(in_channels, latent_dim, style_dim)
         self.decoder        = LIONDecoder(latent_dim, style_dim)
 
-    # ------------------------------------------------------------------
-    def forward(self, x: torch.Tensor):
-        """
-        x: (B, N, 6)  — raw point cloud [xyz | normals]
 
-        Returns
-        -------
-        xyz_out   (B, N, 3)           reconstructed positions (normalised scale)
-        mu_l      (B, N, latent_dim)  local encoder mean
-        logvar_l  (B, N, latent_dim)  local encoder log-variance
-        mu_g      (B, style_dim)      global encoder mean
-        logvar_g  (B, style_dim)      global encoder log-variance
-        """
+    def forward(self, x: torch.Tensor):
+ 
         x = normalize_pc(x)
 
         # --- Global level ---
@@ -70,17 +46,15 @@ class Vae(nn.Module):
         logvar_g = logvar_g.clamp(-10.0, 10.0)
         z_g = mu_g + torch.randn_like(mu_g) * (0.5 * logvar_g).exp()
 
-        # --- Local level (conditioned on z_g) ---
+        # --- Local lev ---
         mu_l, logvar_l = self.local_encoder(x, z_g)
         logvar_l = logvar_l.clamp(-10.0, 10.0)
         z_l = mu_l + torch.randn_like(mu_l) * (0.5 * logvar_l).exp()
 
-        # No anchor bypass: z_l is the sole input to the decoder.
-        # Positions are reconstructed entirely from the stochastic latent.
         xyz_out = self.decoder(z_l, z_g)
         return xyz_out, mu_l, logvar_l, mu_g, logvar_g
 
-    # ------------------------------------------------------------------
+
     @torch.no_grad()
     def generate(
         self,
@@ -88,7 +62,7 @@ class Vae(nn.Module):
         num_points:  int = 2048,
         device:      torch.device | None = None,
     ) -> torch.Tensor:
-        """Sample from the prior N(0,I) and decode."""
+
         if device is None:
             device = next(self.parameters()).device
         self.eval()

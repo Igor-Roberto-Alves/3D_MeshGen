@@ -96,7 +96,6 @@ class LIONDecoder(nn.Module):
 
     def __init__(self, latent_dim=3, style_dim=256):
         super().__init__()
-        # Derives initial xyz estimate from z_l — used for voxelisation AND as residual base.
         self.pos_head = nn.Sequential(
             nn.Conv1d(latent_dim, 64, 1),
             nn.GELU(),
@@ -109,11 +108,9 @@ class LIONDecoder(nn.Module):
         self.stage1 = PVConvBlockDecoder(256, 128, style_dim, resolution=32)
         self.stage2 = PVConvBlockDecoder(128, 64,  style_dim, resolution=32)
 
-        # Intermediate position refinement heads (progressive spatial update per stage)
         self.refine0 = nn.Conv1d(256, 3, 1)
         self.refine1 = nn.Conv1d(128, 3, 1)
 
-        # Predicts a residual correction on top of the refined position
         self.output_head = nn.Sequential(
             nn.Conv1d(64, 64, 1),
             nn.GELU(),
@@ -121,24 +118,21 @@ class LIONDecoder(nn.Module):
         )
 
     def forward(self, z_l, z_global):
-        # z_l:      (B, N, latent_dim)  — stochastic latent only, no anchors
-        # z_global: (B, style_dim)
-        z = z_l.permute(0, 2, 1)                                  # (B, latent_dim, N)
+        z = z_l.permute(0, 2, 1)                                
 
-        # Initial position estimate from z_l — serves as voxelisation seed AND residual base
-        xyz_cur = torch.tanh(self.pos_head(z)).permute(0, 2, 1)   # (B, N, 3)
+        xyz_cur = torch.tanh(self.pos_head(z)).permute(0, 2, 1)  
 
-        feat = self.feat_proj(z).permute(0, 2, 1)                 # (B, N, 256)
+        feat = self.feat_proj(z).permute(0, 2, 1)       
 
-        # Stage 0 → refine xyz_cur so stage1 voxelises at a better spatial grid
+        
         feat    = self.stage0(xyz_cur, feat, z_global)
         xyz_cur = torch.tanh(xyz_cur + self.refine0(feat.permute(0, 2, 1)).permute(0, 2, 1))
 
-        # Stage 1 → refine again
+
         feat    = self.stage1(xyz_cur, feat, z_global)
         xyz_cur = torch.tanh(xyz_cur + self.refine1(feat.permute(0, 2, 1)).permute(0, 2, 1))
 
-        # Stage 2 → final residual correction on top of refined position
+
         feat    = self.stage2(xyz_cur, feat, z_global)
         delta   = self.output_head(feat.permute(0, 2, 1)).permute(0, 2, 1)
         return torch.tanh(xyz_cur + delta)

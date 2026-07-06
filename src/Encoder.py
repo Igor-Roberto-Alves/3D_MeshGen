@@ -109,20 +109,7 @@ class PVConvBlockConditioned(nn.Module):
 
 
 class GlobalEncoder(nn.Module):
-    """
-    Encodes the full point cloud into a single global shape latent z_g.
 
-    Architecture (LION Sec. 3):
-        PVCNN backbone  →  global max-pool  →  fc_mu / fc_logvar
-    Returns mu_g, logvar_g  each of shape (B, style_dim).
-
-    Capacidade controlada por `hidden_dim` (largura do 1o estagio), `out_dim`
-    (largura do ultimo estagio — o gargalo que alimenta o max-pool e depois
-    fc_mu/fc_logvar) e `n_stages` (profundidade). `style_dim` (o z de saida)
-    e so uma projecao LINEAR de `out_dim`, entao aumentar `style_dim` sozinho
-    nao da mais informacao real ao encoder — o teto de informacao e `out_dim`
-    (ver ARQUITETURA_VAE.md / discussao sobre posterior collapse).
-    """
     def __init__(self, in_channels=6, style_dim=256, hidden_dim=64, out_dim=256,
                  n_stages=3, resolution=32):
         super().__init__()

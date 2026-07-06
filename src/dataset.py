@@ -6,27 +6,22 @@ import tqdm
 from torchvision.transforms import transforms
 
 
-# ----------------------------
-# Joint Augmentation (Jitters XYZ, rotates both XYZ and Normals consistently)
-# ----------------------------
+
 class JointAugment(object):
     def __init__(self, jitter_sigma=0.01, jitter_clip=0.05):
         self.jitter_sigma = jitter_sigma
         self.jitter_clip = jitter_clip
 
     def __call__(self, features):
-        """
-        features: (N, 6) tensor — [xyz | normals]
-        """
+
         xyz = features[:, :3]
         nrm = features[:, 3:]
 
-        # 1. Jitter coordinates only
+
         noise = torch.randn_like(xyz) * self.jitter_sigma
         noise = noise.clamp(-self.jitter_clip, self.jitter_clip)
         xyz_jittered = xyz + noise
 
-        # 2. Rotate both XYZ and normals by same random Y-rotation
         theta = torch.rand(1, device=features.device) * 2 * torch.pi
         c = torch.cos(theta)
         s = torch.sin(theta)
@@ -193,7 +188,6 @@ class Ds_point_sampled_already:
                 if file.endswith(".ply"):
                     all_files.append(os.path.join(rt, file))
 
-        # Drop files that don't exist or are empty (avoids zero-point tensors in collate)
         self.files = [f for f in all_files if os.path.exists(f) and os.path.getsize(f) > 0]
         skipped = len(all_files) - len(self.files)
         if skipped:
@@ -237,14 +231,7 @@ class Ds_point_sampled_already:
 
 
 def generate_subset(shapenet_root: str, out_dir: str, classes: list[str], n_points: int = 2048):
-    """
-    Sample point clouds from ShapeNet OBJ meshes and save as PLY files.
-    Only processes the class IDs listed in `classes`.
 
-    Usage:
-        python src/dataset.py --shapenet_root /path/to/ShapeNet --out_dir point_clouds
-    """
-    import argparse
 
     os.makedirs(out_dir, exist_ok=True)
 
@@ -274,7 +261,7 @@ def generate_subset(shapenet_root: str, out_dir: str, classes: list[str], n_poin
 if __name__ == "__main__":
     import argparse
 
-    CLASSES = ["02691156", "02958343"]  # airplane, car
+    CLASSES = ["02691156", "02958343"]
 
     p = argparse.ArgumentParser(description="Generate PLY point clouds from ShapeNet OBJ meshes.")
     p.add_argument("--shapenet_root", type=str, required=True,
