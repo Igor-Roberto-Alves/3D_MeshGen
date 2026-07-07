@@ -1,16 +1,12 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="pt-BR">
 
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Diffuse-VAE Cloud Points Generator</title>
+    <title>Latent Diffusion — Deployee</title>
     <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
 
         :root {
             --bg-primary: #ffffff;
@@ -20,7 +16,6 @@
             --accent: #2563eb;
             --accent-light: #dbeafe;
             --border: #e5e5e5;
-            --shadow: rgba(0, 0, 0, 0.1);
         }
 
         html.dark-mode {
@@ -31,658 +26,571 @@
             --accent: #3b82f6;
             --accent-light: #1e3a8a;
             --border: #333333;
-            --shadow: rgba(255, 255, 255, 0.1);
         }
 
         body {
             font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
             background: var(--bg-primary);
             color: var(--text-primary);
-            transition: background 0.3s ease, color 0.3s ease;
-            overflow-x: hidden;
+            transition: background .3s, color .3s;
         }
 
-        /* Header & Theme Toggle */
         header {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            padding: 1.5rem 2rem;
-            border-bottom: 1px solid var(--border);
+            display: flex; justify-content: space-between; align-items: center;
+            padding: 1rem 2rem; border-bottom: 1px solid var(--border);
             background: var(--bg-secondary);
         }
-
         .logo {
-            font-size: 1.5rem;
-            font-weight: 700;
+            font-size: 1.3rem; font-weight: 700;
             background: linear-gradient(135deg, var(--accent), #ec4899);
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-            background-clip: text;
+            -webkit-background-clip: text; -webkit-text-fill-color: transparent;
         }
-
         .theme-toggle {
-            background: var(--accent);
-            border: none;
-            padding: 0.5rem 1rem;
-            border-radius: 8px;
-            cursor: pointer;
-            color: white;
-            font-weight: 600;
-            transition: transform 0.2s ease;
-        }
-
-        .theme-toggle:hover {
-            transform: scale(1.05);
-        }
-
-        /* Pages */
-        .page {
-            display: none;
-            animation: fadeIn 0.5s ease;
-        }
-
-        .page.active {
-            display: flex;
-        }
-
-        @keyframes fadeIn {
-            from {
-                opacity: 0;
-                transform: translateY(10px);
-            }
-
-            to {
-                opacity: 1;
-                transform: translateY(0);
-            }
-        }
-
-        /* Introduction Page */
-        .intro-page {
-            flex-direction: column;
-            justify-content: center;
-            align-items: center;
-            min-height: calc(100vh - 80px);
-            padding: 2rem;
-            text-align: center;
-        }
-
-        .intro-hero {
-            max-width: 600px;
-            animation: slideUp 0.8s ease 0.2s both;
-        }
-
-        @keyframes slideUp {
-            from {
-                opacity: 0;
-                transform: translateY(30px);
-            }
-
-            to {
-                opacity: 1;
-                transform: translateY(0);
-            }
-        }
-
-        .intro-hero h1 {
-            font-size: 3.5rem;
-            font-weight: 800;
-            margin-bottom: 1rem;
-            line-height: 1.2;
-            background: linear-gradient(135deg, var(--accent), #ec4899);
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-            background-clip: text;
-        }
-
-        .intro-hero p {
-            font-size: 1.1rem;
-            color: var(--text-secondary);
-            margin-bottom: 2rem;
-            line-height: 1.6;
-        }
-
-        .feature-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
-            gap: 1.5rem;
-            margin: 2rem 0;
-            animation: slideUp 0.8s ease 0.4s both;
-        }
-
-        .feature-item {
-            padding: 1.5rem;
-            background: var(--bg-secondary);
-            border-radius: 12px;
-            border: 1px solid var(--border);
-        }
-
-        .feature-item .icon {
-            font-size: 2rem;
-            margin-bottom: 0.5rem;
-        }
-
-        .feature-item p {
-            font-size: 0.9rem;
-            color: var(--text-secondary);
-        }
-
-        .cta-button {
-            display: inline-block;
-            padding: 1rem 2.5rem;
-            background: linear-gradient(135deg, var(--accent), #ec4899);
-            color: white;
-            border: none;
-            border-radius: 50px;
-            font-size: 1.1rem;
-            font-weight: 700;
-            cursor: pointer;
-            transition: transform 0.2s ease, box-shadow 0.2s ease;
-            animation: slideUp 0.8s ease 0.6s both;
-            margin-top: 1rem;
-        }
-
-        .cta-button:hover {
-            transform: translateY(-3px);
-            box-shadow: 0 10px 30px rgba(37, 99, 235, 0.3);
-        }
-
-        /* Generator Page */
-        .generator-page {
-            flex-direction: row;
-            min-height: calc(100vh - 80px);
-        }
-
-        .generator-container {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 2rem;
-            padding: 2rem;
-            max-width: 1400px;
-            margin: 0 auto;
-            width: 100%;
-        }
-
-        .controls-panel {
-            display: flex;
-            flex-direction: column;
-            gap: 1.5rem;
-        }
-
-        .control-group {
-            padding: 1.5rem;
-            background: var(--bg-secondary);
-            border-radius: 12px;
-            border: 1px solid var(--border);
-        }
-
-        .control-group h3 {
-            margin-bottom: 1rem;
-            font-size: 1.1rem;
-            color: var(--accent);
-        }
-
-        .class-selector {
-            display: grid;
-            grid-template-columns: repeat(2, 1fr);
-            gap: 0.8rem;
-        }
-
-        .class-button {
-            padding: 0.8rem;
-            background: var(--bg-primary);
-            border: 2px solid var(--border);
-            border-radius: 8px;
-            cursor: pointer;
-            transition: all 0.2s ease;
-            font-weight: 600;
-            color: var(--text-primary);
-        }
-
-        .class-button:hover {
-            border-color: var(--accent);
-            background: var(--accent-light);
-        }
-
-        .class-button.active {
-            background: var(--accent);
-            color: white;
-            border-color: var(--accent);
-        }
-
-        .latent-section {
-            display: flex;
-            flex-direction: column;
-            gap: 1rem;
-        }
-
-        .slider-group {
-            display: flex;
-            flex-direction: column;
-            gap: 0.5rem;
-        }
-
-        .slider-label {
-            display: flex;
-            justify-content: space-between;
-            font-size: 0.9rem;
-            color: var(--text-secondary);
-        }
-
-        input[type="range"] {
-            width: 100%;
-            height: 6px;
-            border-radius: 3px;
-            background: var(--border);
-            outline: none;
-            -webkit-appearance: none;
-        }
-
-        input[type="range"]::-webkit-slider-thumb {
-            -webkit-appearance: none;
-            appearance: none;
-            width: 18px;
-            height: 18px;
-            border-radius: 50%;
-            background: var(--accent);
-            cursor: pointer;
-            transition: background 0.2s ease;
-        }
-
-        input[type="range"]::-moz-range-thumb {
-            width: 18px;
-            height: 18px;
-            border-radius: 50%;
-            background: var(--accent);
-            cursor: pointer;
-            border: none;
-        }
-
-        input[type="range"]::-webkit-slider-thumb:hover {
-            background: #ec4899;
-        }
-
-        .generate-button {
-            padding: 1rem;
-            background: linear-gradient(135deg, var(--accent), #ec4899);
-            color: white;
-            border: none;
-            border-radius: 8px;
+            background: none; border: 1px solid var(--border); border-radius: 8px;
+            padding: .4rem .8rem; cursor: pointer; color: var(--text-primary);
             font-size: 1rem;
-            font-weight: 700;
+        }
+
+        main {
+            display: grid; grid-template-columns: 360px 1fr; gap: 1.25rem;
+            padding: 1.25rem 2rem; max-width: 1400px; margin: 0 auto;
+        }
+        @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+
+        .panel {
+            background: var(--bg-secondary); border: 1px solid var(--border);
+            border-radius: 12px; padding: 1.1rem;
+        }
+        .panel h2 {
+            font-size: .8rem; text-transform: uppercase; letter-spacing: .08em;
+            color: var(--text-secondary); margin-bottom: .7rem;
+        }
+
+        /* criterio */
+        .crit {
+            display: block; border: 1px solid var(--border); border-radius: 10px;
+            padding: .55rem .7rem; margin-bottom: .5rem; cursor: pointer;
+            transition: border-color .15s, background .15s;
+        }
+        .crit input { display: none; }
+        .crit.sel { border-color: var(--accent); background: var(--accent-light); }
+        .crit .name { font-weight: 600; font-size: .9rem; }
+        .crit .meta { font-size: .74rem; color: var(--text-secondary); margin-top: .15rem; }
+
+        /* controles */
+        .row { display: flex; gap: .6rem; margin: .6rem 0; }
+        .row label { font-size: .78rem; color: var(--text-secondary); display: block; margin-bottom: .2rem; }
+        .row input[type=number] {
+            width: 100%; padding: .4rem .5rem; border: 1px solid var(--border);
+            border-radius: 8px; background: var(--bg-primary); color: var(--text-primary);
+        }
+        .btn {
+            width: 100%; padding: .7rem; border: none; border-radius: 10px;
+            background: var(--accent); color: #fff; font-size: 1rem; font-weight: 600;
+            cursor: pointer; transition: opacity .15s;
+        }
+        .btn:disabled { opacity: .5; cursor: wait; }
+        .btn.ghost {
+            background: none; border: 1px solid var(--border);
+            color: var(--text-primary); font-weight: 500; font-size: .85rem;
+            padding: .45rem; margin-top: .5rem;
+        }
+
+        /* sliders */
+        .slider-row { display: grid; grid-template-columns: 3.6rem 1fr 2.8rem; gap: .5rem; align-items: center; margin-bottom: .35rem; }
+        .slider-row .dim { font-size: .78rem; font-family: monospace; color: var(--text-secondary); }
+        .slider-row .val { font-size: .78rem; font-family: monospace; text-align: right; }
+        input[type=range] { width: 100%; accent-color: var(--accent); }
+        #shiftHint { font-size: .75rem; color: var(--text-secondary); }
+
+        /* viewer */
+        #viewerWrap { position: relative; min-height: 560px; }
+        #viewer {
+            width: 100%; height: 100%; min-height: 560px; border-radius: 12px;
+            background: var(--bg-secondary);
+            cursor: grab; display: block; touch-action: none;
+        }
+        #viewer:active { cursor: grabbing; }
+        #status {
+            position: absolute; left: .8rem; bottom: .8rem; font-size: .75rem;
+            color: var(--text-secondary); font-family: monospace;
+            background: var(--bg-primary); border: 1px solid var(--border);
+            border-radius: 8px; padding: .3rem .6rem; max-width: 90%;
+        }
+        #status a { color: var(--accent); }
+
+        /* toggle pontos/malha */
+        #viewCtl {
+            position: absolute; left: .8rem; top: .8rem; display: flex;
+            gap: .4rem; align-items: center;
+            background: var(--bg-primary); border: 1px solid var(--border);
+            border-radius: 8px; padding: .25rem;
+        }
+        #viewCtl button {
+            border: none; background: none; color: var(--text-primary);
+            font-size: .78rem; padding: .3rem .6rem; border-radius: 6px;
             cursor: pointer;
-            transition: transform 0.2s ease, box-shadow 0.2s ease;
-            margin-top: 1rem;
         }
-
-        .generate-button:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 8px 20px rgba(37, 99, 235, 0.3);
-        }
-
-        .generate-button:active {
-            transform: translateY(0);
-        }
-
-        /* Preview Panel */
-        .preview-panel {
-            display: flex;
-            flex-direction: column;
-            gap: 1rem;
-        }
-
-        .preview-container {
-            flex: 1;
-            background: var(--bg-secondary);
-            border-radius: 12px;
-            border: 2px dashed var(--border);
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            min-height: 400px;
-            overflow: hidden;
-            position: relative;
-        }
-
-        .preview-image {
-            width: 100%;
-            height: 100%;
-            object-fit: contain;
-            padding: 2rem;
-        }
-
-        .preview-info {
-            padding: 1.5rem;
-            background: var(--bg-secondary);
-            border-radius: 12px;
-            border: 1px solid var(--border);
-        }
-
-        .preview-info h4 {
-            margin-bottom: 0.5rem;
-            color: var(--accent);
-        }
-
-        .preview-info p {
-            font-size: 0.9rem;
-            color: var(--text-secondary);
-        }
-
-        .latent-values {
-            display: grid;
-            grid-template-columns: repeat(2, 1fr);
-            gap: 0.8rem;
-            margin-top: 1rem;
-        }
-
-        .latent-value {
-            padding: 0.8rem;
-            background: var(--bg-primary);
-            border-radius: 6px;
-            border: 1px solid var(--border);
-        }
-
-        .latent-value small {
-            display: block;
-            color: var(--text-secondary);
-            font-size: 0.8rem;
-            margin-bottom: 0.3rem;
-        }
-
-        .latent-value strong {
-            color: var(--accent);
-            font-family: 'Courier New', monospace;
-        }
-
-        /* Responsive */
-        @media (max-width: 1024px) {
-            .generator-container {
-                grid-template-columns: 1fr;
-            }
-
-            .intro-hero h1 {
-                font-size: 2.5rem;
-            }
-        }
-
-        @media (max-width: 768px) {
-            header {
-                padding: 1rem;
-            }
-
-            .logo {
-                font-size: 1.2rem;
-            }
-
-            .class-selector {
-                grid-template-columns: repeat(2, 1fr);
-            }
-
-            .latent-values {
-                grid-template-columns: 1fr;
-            }
-        }
-
-        .loading {
-            display: inline-block;
-            width: 20px;
-            height: 20px;
-            border: 3px solid var(--border);
-            border-top-color: var(--accent);
-            border-radius: 50%;
-            animation: spin 0.6s linear infinite;
-        }
-
-        @keyframes spin {
-            to {
-                transform: rotate(360deg);
-            }
+        #viewCtl button.on { background: var(--accent); color: #fff; }
+        #viewCtl .depth { display: none; align-items: center; gap: .3rem;
+            font-size: .72rem; color: var(--text-secondary); padding-right: .3rem; }
+        #viewCtl.mesh .depth { display: flex; }
+        #viewCtl .depth input {
+            width: 3rem; padding: .15rem .3rem; border: 1px solid var(--border);
+            border-radius: 6px; background: var(--bg-primary); color: var(--text-primary);
         }
     </style>
 </head>
 
 <body>
     <header>
-        <div class="logo">✨ Cloud Points VAE</div>
-        <button class="theme-toggle" onclick="toggleTheme()">🌙 Dark Mode</button>
+        <div class="logo">Latent Diffusion — noclass · Deployee</div>
+        <button class="theme-toggle" id="themeBtn">🌙</button>
     </header>
 
-    <!-- Introduction Page -->
-    <div id="introPage" class="page intro-page active">
-        <div class="intro-hero">
-            <h1>Diffuse-VAE Cloud Points</h1>
-            <p>Generate 3D point clouds with latent space control. Create, explore, and visualize geometric structures
-                using variational autoencoders.</p>
+    <main>
+        <div>
+            <div class="panel">
+                <h2>Modelo</h2>
+                <div id="models">carregando…</div>
 
-            <div class="feature-grid">
-                <div class="feature-item">
-                    <div class="icon">🎯</div>
-                    <p><strong>Class-based</strong> Generation</p>
+                <div class="row">
+                    <div style="flex:1">
+                        <label for="seed">Seed (vazio = aleatória)</label>
+                        <input type="number" id="seed" placeholder="aleatória">
+                    </div>
+                    <div style="width:7.5rem">
+                        <label for="steps">Passos DDIM</label>
+                        <input type="number" id="steps" value="200" min="10" max="1000">
+                    </div>
                 </div>
-                <div class="feature-item">
-                    <div class="icon">🎨</div>
-                    <p><strong>Latent</strong> Space Control</p>
-                </div>
-                <div class="feature-item">
-                    <div class="icon">☁️</div>
-                    <p><strong>3D</strong> Point Clouds</p>
-                </div>
-                <div class="feature-item">
-                    <div class="icon">🔗</div>
-                    <p><strong>Triangle</strong> Meshes</p>
-                </div>
+                <button class="btn" id="genBtn">Generate</button>
             </div>
 
-            <button class="cta-button" onclick="goToGenerator()">Start Generating →</button>
-        </div>
-    </div>
-
-    <!-- Generator Page -->
-    <div id="generatorPage" class="page generator-page">
-        <div class="generator-container">
-            <!-- Controls Panel -->
-            <div class="controls-panel">
-                <!-- Class Selection -->
-                <div class="control-group">
-                    <h3>📦 Select Class</h3>
-                    <div class="class-selector">
-                        <button class="class-button active" onclick="selectClass(this, 'chair')">Chair</button>
-                        <button class="class-button" onclick="selectClass(this, 'table')">Table</button>
-                        <button class="class-button" onclick="selectClass(this, 'lamp')">Lamp</button>
-                        <button class="class-button" onclick="selectClass(this, 'sofa')">Sofa</button>
-                    </div>
-                </div>
-
-                <!-- Latent Vector Controls -->
-                <div class="control-group">
-                    <h3>🎛️ Latent Vector</h3>
-                    <div class="latent-section">
-                        <div class="slider-group">
-                            <div class="slider-label">
-                                <span>Z₁ (Shape)</span>
-                                <span id="z1Value">0.00</span>
-                            </div>
-                            <input type="range" id="z1" min="-1" max="1" step="0.01" value="0"
-                                oninput="updateLatent('z1')">
-                        </div>
-
-                        <div class="slider-group">
-                            <div class="slider-label">
-                                <span>Z₂ (Size)</span>
-                                <span id="z2Value">0.00</span>
-                            </div>
-                            <input type="range" id="z2" min="-1" max="1" step="0.01" value="0"
-                                oninput="updateLatent('z2')">
-                        </div>
-
-                        <div class="slider-group">
-                            <div class="slider-label">
-                                <span>Z₃ (Complexity)</span>
-                                <span id="z3Value">0.00</span>
-                            </div>
-                            <input type="range" id="z3" min="-1" max="1" step="0.01" value="0"
-                                oninput="updateLatent('z3')">
-                        </div>
-
-                        <div class="slider-group">
-                            <div class="slider-label">
-                                <span>Z₄ (Orientation)</span>
-                                <span id="z4Value">0.00</span>
-                            </div>
-                            <input type="range" id="z4" min="-1" max="1" step="0.01" value="0"
-                                oninput="updateLatent('z4')">
-                        </div>
-                    </div>
-                </div>
-
-                <!-- Generate Button -->
-                <button class="generate-button" onclick="generateCloud()">
-                    ✨ Generate Cloud
-                </button>
-
-                <!-- Back Button -->
-                <button class="generate-button" style="background: linear-gradient(135deg, #666, #888);"
-                    onclick="goToIntro()">
-                    ← Back to Home
-                </button>
-            </div>
-
-            <!-- Preview Panel -->
-            <div class="preview-panel">
-                <div class="preview-container" id="previewContainer">
-                    <img src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 400 400'%3E%3Crect fill='%23f5f5f5' width='400' height='400'/%3E%3Ctext x='50%25' y='50%25' font-size='24' fill='%23999' text-anchor='middle' dominant-baseline='middle'%3E☁️ Point Cloud Preview%3C/text%3E%3C/svg%3E"
-                        alt="Point cloud preview" class="preview-image">
-                </div>
-
-                <div class="preview-info">
-                    <h4>📊 Generation Info</h4>
-                    <p id="infoText">Select a class and adjust latent vectors to generate a point cloud.</p>
-
-                    <div class="latent-values" id="latentValuesDisplay">
-                        <div class="latent-value">
-                            <small>Z₁ (Shape)</small>
-                            <strong>0.00</strong>
-                        </div>
-                        <div class="latent-value">
-                            <small>Z₂ (Size)</small>
-                            <strong>0.00</strong>
-                        </div>
-                        <div class="latent-value">
-                            <small>Z₃ (Complexity)</small>
-                            <strong>0.00</strong>
-                        </div>
-                        <div class="latent-value">
-                            <small>Z₄ (Orientation)</small>
-                            <strong>0.00</strong>
-                        </div>
-                    </div>
-                </div>
+            <div class="panel" style="margin-top:1.25rem">
+                <h2>Shifts no latente (unidades de σ)</h2>
+                <div id="sliders"><span id="shiftHint">Gere uma amostra para liberar os sliders — eles deslocam as 8 dimensões mais ativas do vetor latente.</span></div>
+                <button class="btn ghost" id="resetBtn" disabled>Reset shifts</button>
             </div>
         </div>
-    </div>
+
+        <div id="viewerWrap" class="panel" style="padding:0">
+            <canvas id="viewer"></canvas>
+            <div id="viewCtl">
+                <button id="modePoints" class="on">Pontos</button>
+                <button id="modeMesh">Malha (Poisson)</button>
+                <span class="depth">
+                    <label for="depth">depth</label>
+                    <input type="number" id="depth" value="8" min="5" max="10">
+                </span>
+            </div>
+            <div id="status">aguardando geração…</div>
+        </div>
+    </main>
 
     <script>
-        let selectedClass = 'chair';
-        let latentVectors = { z1: 0, z2: 0, z3: 0, z4: 0 };
-        const API_BASE = 'http://localhost:5000';
+        // ── estado ──────────────────────────────────────────────────────
+        let models = [];
+        let selected = null;
+        let baseZ = null;          // latente normalizado da última geração
+        let topDims = [];
+        let shifts = {};           // dim -> delta
+        let points = [];           // [[x,y,z], ...]
+        let lastInfo = '';
+        let viewMode = 'points';   // 'points' | 'mesh'
+        let meshData = null;       // {vertices, triangles} da reconstrução Poisson
+        let meshStale = true, pointsStale = false;
 
-        // Theme Toggle
-        function toggleTheme() {
-            const html = document.documentElement;
-            html.classList.toggle('dark-mode');
-            const isDark = html.classList.contains('dark-mode');
-            localStorage.setItem('theme', isDark ? 'dark' : 'light');
+        // ── tema ────────────────────────────────────────────────────────
+        const themeBtn = document.getElementById('themeBtn');
+        themeBtn.onclick = () => {
+            document.documentElement.classList.toggle('dark-mode');
+            themeBtn.textContent =
+                document.documentElement.classList.contains('dark-mode') ? '☀️' : '🌙';
+            draw();
+        };
 
-            const btn = document.querySelector('.theme-toggle');
-            btn.textContent = isDark ? '☀️ Light Mode' : '🌙 Dark Mode';
+        // ── modelos ─────────────────────────────────────────────────────
+        const fmt = (v, d = 4) => Number(v).toFixed(d);
+
+        async function loadModels() {
+            const r = await fetch('/models');
+            const j = await r.json();
+            models = j.models;
+            if (!selected && models.length) selected = models[0].id;
+            const box = document.getElementById('models');
+            box.innerHTML = '';
+            for (const c of models) {
+                const el = document.createElement('label');
+                el.className = 'crit' + (c.id === selected ? ' sel' : '');
+                el.innerHTML = `
+                    <input type="radio" name="model" value="${c.id}">
+                    <div class="name">${c.label}</div>
+                    <div class="meta">→ ${c.checkpoint} · época ${c.epoch}</div>
+                    <div class="meta">val loss ${fmt(c.metrics.val_loss, 5)}</div>`;
+                el.onclick = () => {
+                    selected = c.id;
+                    document.querySelectorAll('.crit').forEach(e => e.classList.remove('sel'));
+                    el.classList.add('sel');
+                };
+                box.appendChild(el);
+            }
         }
 
-        // Initialize theme from localStorage
-        if (localStorage.getItem('theme') === 'dark') {
-            toggleTheme();
-        }
-
-        // Page Navigation
-        function goToGenerator() {
-            document.getElementById('introPage').classList.remove('active');
-            document.getElementById('generatorPage').classList.add('active');
-        }
-
-        function goToIntro() {
-            document.getElementById('generatorPage').classList.remove('active');
-            document.getElementById('introPage').classList.add('active');
-        }
-
-        // Class Selection
-        function selectClass(button, className) {
-            document.querySelectorAll('.class-button').forEach(btn => {
-                btn.classList.remove('active');
-            });
-            button.classList.add('active');
-            selectedClass = className;
-            updateInfo();
-        }
-
-        // Latent Vector Control
-        function updateLatent(param) {
-            const value = parseFloat(document.getElementById(param).value);
-            latentVectors[param] = value;
-            document.getElementById(param + 'Value').textContent = value.toFixed(2);
-            updateLatentDisplay();
-        }
-
-        function updateLatentDisplay() {
-            const values = document.querySelectorAll('.latent-value strong');
-            values[0].textContent = latentVectors.z1.toFixed(2);
-            values[1].textContent = latentVectors.z2.toFixed(2);
-            values[2].textContent = latentVectors.z3.toFixed(2);
-            values[3].textContent = latentVectors.z4.toFixed(2);
-        }
-
-        // Generate Cloud
-        async function generateCloud() {
-            const btn = document.querySelector('.generate-button');
-            const originalText = btn.textContent;
-            btn.textContent = '⏳ Generating...';
-            btn.disabled = true;
-
+        // ── generate ────────────────────────────────────────────────────
+        const genBtn = document.getElementById('genBtn');
+        genBtn.onclick = async () => {
+            genBtn.disabled = true;
+            setStatus('amostrando latente via DDIM…');
             try {
-                const response = await fetch(`${API_BASE}/generate`, {
+                const seed = document.getElementById('seed').value;
+                const steps = document.getElementById('steps').value;
+                const r = await fetch('/generate', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        class: selectedClass,
-                        latent: latentVectors
-                    })
+                    body: JSON.stringify({ model: selected, seed, steps })
                 });
-
-                if (response.ok) {
-                    const data = await response.json();
-                    // For now, keep the static image
-                    // In future: document.querySelector('.preview-image').src = data.image_url;
-                    updateInfo(data);
-                    alert('Generation successful! (Static image for now)');
-                } else {
-                    alert('Generation failed. Check server connection.');
-                }
-            } catch (error) {
-                console.error('Error:', error);
-                alert('Error connecting to server. Make sure Python backend is running.');
+                const j = await r.json();
+                if (!j.success) throw new Error(j.error);
+                baseZ = j.z;
+                topDims = j.top_dims;
+                shifts = {};
+                points = j.points;
+                lastInfo = `${j.checkpoint} · seed ${j.seed} · ${j.points.length} pts` +
+                    ` · <a href="/download/${j.filename}">.npy</a>`;
+                buildSliders();
+                fitView();
+                pointsStale = false;
+                meshData = null; meshStale = true;
+                draw();
+                setStatus(lastInfo);
+                if (viewMode === 'mesh') runRefresh();
+            } catch (e) {
+                setStatus('erro: ' + e.message);
             } finally {
-                btn.textContent = originalText;
-                btn.disabled = false;
+                genBtn.disabled = false;
+            }
+        };
+
+        // ── sliders de shift ────────────────────────────────────────────
+        const slidersBox = document.getElementById('sliders');
+        const resetBtn = document.getElementById('resetBtn');
+
+        function buildSliders() {
+            slidersBox.innerHTML = '';
+            resetBtn.disabled = false;
+            for (const dim of topDims) {
+                const row = document.createElement('div');
+                row.className = 'slider-row';
+                row.innerHTML = `
+                    <span class="dim">z[${dim}]</span>
+                    <input type="range" min="-3" max="3" step="0.05" value="0" data-dim="${dim}">
+                    <span class="val" id="val-${dim}">0.00</span>`;
+                const range = row.querySelector('input');
+                range.oninput = () => {
+                    const v = parseFloat(range.value);
+                    document.getElementById(`val-${dim}`).textContent = v.toFixed(2);
+                    if (v === 0) delete shifts[dim]; else shifts[dim] = v;
+                    pointsStale = true; meshStale = true;
+                    scheduleDecode();
+                };
+                slidersBox.appendChild(row);
             }
         }
 
-        function updateInfo(data = null) {
-            const infoText = document.getElementById('infoText');
-            if (data) {
-                infoText.textContent = `Generated: ${selectedClass.toUpperCase()} | Points: ${data.points_count || '5000'} | Mesh: Ready for triangulation`;
-            } else {
-                infoText.textContent = `Class: ${selectedClass.toUpperCase()} | Adjust vectors and click Generate`;
+        resetBtn.onclick = () => {
+            shifts = {};
+            slidersBox.querySelectorAll('input[type=range]').forEach(r => {
+                r.value = 0;
+                document.getElementById(`val-${r.dataset.dim}`).textContent = '0.00';
+            });
+            pointsStale = true; meshStale = true;
+            scheduleDecode();
+        };
+
+        // ── modo de visualização (pontos / malha Poisson) ───────────────
+        const viewCtl = document.getElementById('viewCtl');
+        const modePointsBtn = document.getElementById('modePoints');
+        const modeMeshBtn = document.getElementById('modeMesh');
+
+        function setMode(m) {
+            viewMode = m;
+            modePointsBtn.classList.toggle('on', m === 'points');
+            modeMeshBtn.classList.toggle('on', m === 'mesh');
+            viewCtl.classList.toggle('mesh', m === 'mesh');
+            if (!baseZ) { draw(); return; }
+            if (m === 'mesh' ? (meshStale || !meshData) : pointsStale) runRefresh();
+            else draw();
+        }
+        modePointsBtn.onclick = () => setMode('points');
+        modeMeshBtn.onclick = () => setMode('mesh');
+        document.getElementById('depth').onchange = () => {
+            meshStale = true;
+            if (viewMode === 'mesh' && baseZ) runRefresh();
+        };
+
+        // atualização com debounce — um request por "pausa" do slider;
+        // busca /decode ou /mesh conforme o modo ativo
+        let refreshTimer = null, refreshPending = false, refreshInFlight = false;
+        function scheduleDecode() {
+            clearTimeout(refreshTimer);
+            refreshTimer = setTimeout(runRefresh, 130);
+        }
+        async function runRefresh() {
+            if (!baseZ) return;
+            if (refreshInFlight) { refreshPending = true; return; }
+            refreshInFlight = true;
+            try {
+                if (viewMode === 'mesh') await fetchMesh();
+                else await fetchPoints();
+            } catch (e) {
+                setStatus('erro: ' + e.message);
+            } finally {
+                refreshInFlight = false;
+                if (refreshPending) { refreshPending = false; runRefresh(); }
             }
         }
+
+        function shiftSuffix() {
+            const n = Object.keys(shifts).length;
+            return n ? ` · ${n} shift(s)` : '';
+        }
+
+        async function fetchPoints() {
+            const r = await fetch('/decode', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ model: selected, z: baseZ, shifts })
+            });
+            const j = await r.json();
+            if (!j.success) throw new Error(j.error);
+            points = j.points;
+            pointsStale = false;
+            draw();
+            setStatus(lastInfo + shiftSuffix());
+        }
+
+        async function fetchMesh() {
+            setStatus('reconstruindo malha (normais PCA + Poisson)…');
+            const depth = document.getElementById('depth').value;
+            const r = await fetch('/mesh', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ model: selected, z: baseZ, shifts, depth })
+            });
+            const j = await r.json();
+            if (!j.success) throw new Error(j.error);
+            meshData = j;
+            meshStale = false;
+            draw();
+            setStatus(lastInfo + shiftSuffix() +
+                ` · malha ${j.triangles.length} tris (depth ${j.depth})`);
+        }
+
+        // ── viewer 3D (canvas puro) ─────────────────────────────────────
+        const canvas = document.getElementById('viewer');
+        const ctx = canvas.getContext('2d');
+        let yaw = 0.6, pitch = -0.35, zoom = 1.0, center = [0, 0, 0], radius = 1;
+
+        function fitView() {
+            if (!points.length) return;
+            const lo = [1e9, 1e9, 1e9], hi = [-1e9, -1e9, -1e9];
+            for (const p of points) for (let i = 0; i < 3; i++) {
+                if (p[i] < lo[i]) lo[i] = p[i];
+                if (p[i] > hi[i]) hi[i] = p[i];
+            }
+            center = [(lo[0] + hi[0]) / 2, (lo[1] + hi[1]) / 2, (lo[2] + hi[2]) / 2];
+            radius = Math.max(hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]) / 2 || 1;
+        }
+
+        function draw() {
+            const wrap = document.getElementById('viewerWrap');
+            const w = wrap.clientWidth, h = Math.max(wrap.clientHeight, 560);
+            const dpr = window.devicePixelRatio || 1;
+            canvas.width = w * dpr; canvas.height = h * dpr;
+            canvas.style.width = w + 'px'; canvas.style.height = h + 'px';
+            ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+            const dark = document.documentElement.classList.contains('dark-mode');
+            ctx.fillStyle = dark ? '#1a1a1a' : '#f5f5f5';
+            ctx.fillRect(0, 0, w, h);
+            if (!points.length) {
+                ctx.fillStyle = dark ? '#a0a0a0' : '#666';
+                ctx.font = '14px sans-serif'; ctx.textAlign = 'center';
+                ctx.fillText('clique em Generate para amostrar uma nuvem', w / 2, h / 2);
+                return;
+            }
+
+            if (viewMode === 'mesh' && meshData) { drawMesh(w, h); return; }
+
+            const cy = Math.cos(yaw), sy = Math.sin(yaw);
+            const cp = Math.cos(pitch), sp = Math.sin(pitch);
+            const scale = (Math.min(w, h) / 2.6) * zoom / radius;
+
+            // projeta e ordena por profundidade (pontos de trás primeiro)
+            const proj = new Array(points.length);
+            for (let i = 0; i < points.length; i++) {
+                const x = points[i][0] - center[0];
+                const y = points[i][1] - center[1];
+                const z = points[i][2] - center[2];
+                const x1 = cy * x + sy * z;
+                const z1 = -sy * x + cy * z;
+                const y2 = cp * y - sp * z1;
+                const z2 = sp * y + cp * z1;
+                proj[i] = [w / 2 + x1 * scale, h / 2 - y2 * scale, z2];
+            }
+            proj.sort((a, b) => a[2] - b[2]);
+
+            const zmin = proj[0][2], zmax = proj[proj.length - 1][2];
+            const zr = (zmax - zmin) || 1;
+            for (const [px, py, pz] of proj) {
+                const t = (pz - zmin) / zr;               // 0 = fundo, 1 = frente
+                const r = Math.round(37 + t * (96 - 37));
+                const g = Math.round(99 + t * (165 - 99));
+                const b = Math.round(235 + t * (250 - 235));
+                ctx.fillStyle = `rgba(${r},${g},${b},${0.35 + 0.65 * t})`;
+                const s = 1.6 + 1.6 * t;
+                ctx.fillRect(px - s / 2, py - s / 2, s, s);
+            }
+        }
+
+        function drawMesh(w, h) {
+            const cy = Math.cos(yaw), sy = Math.sin(yaw);
+            const cp = Math.cos(pitch), sp = Math.sin(pitch);
+            const scale = (Math.min(w, h) / 2.6) * zoom / radius;
+
+            const V = meshData.vertices, T = meshData.triangles;
+            const X = new Float32Array(V.length);   // tela
+            const Y = new Float32Array(V.length);
+            const VX = new Float32Array(V.length);  // espaço da câmera (p/ shading)
+            const VY = new Float32Array(V.length);
+            const VZ = new Float32Array(V.length);
+            for (let i = 0; i < V.length; i++) {
+                const x = V[i][0] - center[0];
+                const y = V[i][1] - center[1];
+                const z = V[i][2] - center[2];
+                const x1 = cy * x + sy * z;
+                const z1 = -sy * x + cy * z;
+                const y2 = cp * y - sp * z1;
+                const z2 = sp * y + cp * z1;
+                VX[i] = x1; VY[i] = y2; VZ[i] = z2;
+                X[i] = w / 2 + x1 * scale;
+                Y[i] = h / 2 - y2 * scale;
+            }
+
+            // painter's algorithm: triângulos de trás para frente
+            const order = new Array(T.length);
+            for (let i = 0; i < T.length; i++) {
+                const t = T[i];
+                order[i] = [(VZ[t[0]] + VZ[t[1]] + VZ[t[2]]) / 3, i];
+            }
+            order.sort((a, b) => a[0] - b[0]);
+
+            // shading suave (Gouraud): intensidade |normal · luz| por
+            // vértice, com as normais por vértice vindas do servidor
+            // (média das normais dos triângulos adjacentes), interpolada
+            // linearmente dentro do triângulo via gradiente do canvas
+            const L = [0.32, 0.42, 0.85];
+            const N = meshData.normals || null;
+            const I = N ? new Float32Array(V.length) : null;
+            if (N) for (let i = 0; i < V.length; i++) {
+                const nx = N[i][0], ny = N[i][1], nz = N[i][2];
+                const nx1 = cy * nx + sy * nz;
+                const nz1 = -sy * nx + cy * nz;
+                const ny2 = cp * ny - sp * nz1;
+                const nz2 = sp * ny + cp * nz1;
+                I[i] = Math.abs(nx1 * L[0] + ny2 * L[1] + nz2 * L[2]);
+            }
+            const shade = it => {
+                const i2 = 0.2 + 0.8 * it;
+                return `rgb(${Math.round(28 + 82 * i2)},` +
+                       `${Math.round(66 + 114 * i2)},` +
+                       `${Math.round(140 + 115 * i2)})`;
+            };
+
+            ctx.lineWidth = 0.6;
+            for (let k = 0; k < order.length; k++) {
+                const t = T[order[k][1]];
+                const a = t[0], b = t[1], c = t[2];
+                let col;
+                if (!I) {
+                    // fallback flat (payload sem normais): normal única
+                    // do triângulo via produto vetorial
+                    const ux = VX[b] - VX[a], uy = VY[b] - VY[a], uz = VZ[b] - VZ[a];
+                    const vx = VX[c] - VX[a], vy = VY[c] - VY[a], vz = VZ[c] - VZ[a];
+                    const nx = uy * vz - uz * vy;
+                    const ny = uz * vx - ux * vz;
+                    const nz = ux * vy - uy * vx;
+                    const len = Math.hypot(nx, ny, nz) || 1;
+                    col = shade(Math.abs((nx * L[0] + ny * L[1] + nz * L[2]) / len));
+                } else {
+                    // a intensidade interpolada é um plano ia + α·dx + β·dy
+                    // na tela; um gradiente linear na direção (α, β)
+                    // reproduz esse plano exatamente
+                    const ia = I[a], ib = I[b], ic = I[c];
+                    const imin = Math.min(ia, ib, ic), imax = Math.max(ia, ib, ic);
+                    const x1 = X[b] - X[a], y1 = Y[b] - Y[a];
+                    const x2 = X[c] - X[a], y2 = Y[c] - Y[a];
+                    const det = x1 * y2 - x2 * y1;
+                    if (imax - imin < 1e-3 || Math.abs(det) < 1e-6) {
+                        col = shade((ia + ib + ic) / 3);
+                    } else {
+                        const al = ((ib - ia) * y2 - (ic - ia) * y1) / det;
+                        const be = ((ic - ia) * x1 - (ib - ia) * x2) / det;
+                        const g2 = al * al + be * be;
+                        if (g2 < 1e-12) {
+                            col = shade((ia + ib + ic) / 3);
+                        } else {
+                            const p0x = X[a] + (imin - ia) / g2 * al;
+                            const p0y = Y[a] + (imin - ia) / g2 * be;
+                            const p1x = X[a] + (imax - ia) / g2 * al;
+                            const p1y = Y[a] + (imax - ia) / g2 * be;
+                            col = ctx.createLinearGradient(p0x, p0y, p1x, p1y);
+                            col.addColorStop(0, shade(imin));
+                            col.addColorStop(1, shade(imax));
+                        }
+                    }
+                }
+                ctx.fillStyle = col;
+                ctx.strokeStyle = col;   // fecha frestas do antialiasing
+                ctx.beginPath();
+                ctx.moveTo(X[a], Y[a]);
+                ctx.lineTo(X[b], Y[b]);
+                ctx.lineTo(X[c], Y[c]);
+                ctx.closePath();
+                ctx.fill();
+                ctx.stroke();
+            }
+        }
+
+        // interação: arrastar gira, roda dá zoom
+        let dragging = false, lastX = 0, lastY = 0;
+        canvas.addEventListener('pointerdown', e => {
+            dragging = true; lastX = e.clientX; lastY = e.clientY;
+            canvas.setPointerCapture(e.pointerId);
+        });
+        canvas.addEventListener('pointermove', e => {
+            if (!dragging) return;
+            yaw += (e.clientX - lastX) * 0.008;
+            pitch += (e.clientY - lastY) * 0.008;
+            pitch = Math.max(-1.5, Math.min(1.5, pitch));
+            lastX = e.clientX; lastY = e.clientY;
+            draw();
+        });
+        canvas.addEventListener('pointerup', () => dragging = false);
+        canvas.addEventListener('wheel', e => {
+            e.preventDefault();
+            zoom *= e.deltaY < 0 ? 1.1 : 0.9;
+            zoom = Math.max(0.2, Math.min(8, zoom));
+            draw();
+        }, { passive: false });
+        window.addEventListener('resize', draw);
+
+        function setStatus(html) {
+            document.getElementById('status').innerHTML = html;
+        }
+
+        loadModels().then(draw);
     </script>
 </body>
 

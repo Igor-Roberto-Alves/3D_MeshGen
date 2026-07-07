@@ -1,143 +1,61 @@
-"""
-metrics.py
-----------
-Differentiable and evaluation metrics for point-cloud VAE.
-
-Metrics
--------
-chamfer_distance     – bidirectional Chamfer Distance (differentiable, O(N²))
-chamfer_distance_knn – fast Chamfer via kNN (differentiable for large N)
-emd_approx           – Sinkhorn-based approximate Earth Mover's Distance
-f_score              – precision / recall / F-score at threshold τ
-normal_consistency   – mean cosine similarity between nearest-neighbour normals
-kl_divergence        – closed-form KL for Gaussian VAE prior
-vae_loss             – full ELBO = recon_loss + β·KL
-"""
-
 import torch
 import torch.nn.functional as F
 from torch import Tensor
 
 
-# ============================================================
-# Internal helpers
-# ============================================================
 
 def _pairwise_sq_dist(a: Tensor, b: Tensor) -> Tensor:
-    """
-    Compute squared pairwise Euclidean distances.
 
-    a : (B, M, 3)
-    b : (B, N, 3)
-    returns: (B, M, N)
-    """
-    # ||a - b||² = ||a||² + ||b||² - 2 a·b
-    a2 = (a ** 2).sum(dim=2, keepdim=True)   # (B, M, 1)
-    b2 = (b ** 2).sum(dim=2, keepdim=True)   # (B, N, 1)
-    ab = torch.bmm(a, b.transpose(1, 2))     # (B, M, N)
+    a2 = (a ** 2).sum(dim=2, keepdim=True)
+    b2 = (b ** 2).sum(dim=2, keepdim=True)
+    ab = torch.bmm(a, b.transpose(1, 2))
     return (a2 + b2.transpose(1, 2) - 2 * ab).clamp(min=0.0)
 
 
-# ============================================================
-# Chamfer Distance
-# ============================================================
 
-def chamfer_distance(
-    pred: Tensor,
-    target: Tensor,
-    reduce: str = "mean",
-) -> tuple[Tensor, Tensor, Tensor]:
-    """
-    Bidirectional Chamfer Distance (O(BNM) – suitable for N ≤ 2048).
-
-    Parameters
-    ----------
-    pred, target : (B, N, 3)
-    reduce       : "mean" | "sum" | "none"
-
-    Returns
-    -------
-    cd_total : scalar (or (B,) if reduce="none")
-    cd_pred  : pred → target (forward)
-    cd_tgt   : target → pred (backward)
-    """
-    sq = _pairwise_sq_dist(pred, target)              # (B, N, N)
-
-    # each pred point → nearest target
-    cd_pred = sq.min(dim=2).values                    # (B, N)
-    # each target point → nearest pred
-    cd_tgt  = sq.min(dim=1).values                    # (B, N)
+def chamfer_distance(pred: Tensor, target: Tensor, reduce: str = "mean"):
+    sq = _pairwise_sq_dist(pred, target)
+    cd_pred = sq.min(dim=2).values
+    cd_tgt  = sq.min(dim=1).values
 
     if reduce == "none":
         return cd_pred.mean(1) + cd_tgt.mean(1), cd_pred.mean(1), cd_tgt.mean(1)
 
     agg = torch.mean if reduce == "mean" else torch.sum
-    cd_pred_s = agg(cd_pred)
-    cd_tgt_s  = agg(cd_tgt)
-    return cd_pred_s + cd_tgt_s, cd_pred_s, cd_tgt_s
+    return agg(cd_pred) + agg(cd_tgt), agg(cd_pred), agg(cd_tgt)
 
 
-# ============================================================
-# Fast Chamfer via kNN  (memory-friendly for large point clouds)
-# ============================================================
-
-def chamfer_distance_knn(
-    pred: Tensor,
-    target: Tensor,
-    k: int = 1,
-    reduce: str = "mean",
-) -> tuple[Tensor, Tensor, Tensor]:
-    """
-    Chamfer Distance using torch.cdist (uses less peak memory).
-
-    Parameters are identical to chamfer_distance.
-    """
+def chamfer_distance_knn(pred: Tensor, target: Tensor, k: int = 1, reduce: str = "mean"):
     with torch.autocast(device_type=pred.device.type, enabled=False):
         dist = torch.cdist(pred.float(), target.float())
 
-    cd_pred = dist.topk(k, dim=2, largest=False).values.mean(dim=2)  # (B, N)
-    cd_tgt  = dist.topk(k, dim=1, largest=False).values.mean(dim=1)  # (B, M)
+    cd_pred = dist.topk(k, dim=2, largest=False).values.mean(dim=2)
+    cd_tgt  = dist.topk(k, dim=1, largest=False).values.mean(dim=1)
 
     if reduce == "none":
         return cd_pred.mean(1) + cd_tgt.mean(1), cd_pred.mean(1), cd_tgt.mean(1)
 
     agg = torch.mean if reduce == "mean" else torch.sum
-    cd_pred_s = agg(cd_pred)
-    cd_tgt_s  = agg(cd_tgt)
-    return cd_pred_s + cd_tgt_s, cd_pred_s, cd_tgt_s
+    return agg(cd_pred) + agg(cd_tgt), agg(cd_pred), agg(cd_tgt)
 
 
-# ============================================================
-# Approximate Earth Mover's Distance  (Sinkhorn)
-# ============================================================
 
-def emd_approx(
-    pred: Tensor,
-    target: Tensor,
-    n_iters: int = 50,
-    eps: float = 0.05,
-    reduce: str = "mean",
-) -> Tensor:
-    """
-    Approximate EMD via Sinkhorn iterations (differentiable).
 
-    pred, target : (B, N, 3)   – must have the same N
-    n_iters      : Sinkhorn iterations
-    eps          : entropy regularisation
-
-    Returns scalar loss.
-    """
+def emd_approx(pred: Tensor, target: Tensor, n_iters: int = 30, eps: float = 0.05,
+               reduce: str = "mean", n_subsample: int = 0) -> Tensor:
     B, N, _ = pred.shape
-    assert pred.shape == target.shape, "pred and target must have the same shape."
+    assert pred.shape == target.shape
 
-    cost = torch.cdist(pred.float(), target.float())                  # (B, N, N)
+    if 0 < n_subsample < N:
+        idx    = torch.randperm(N, device=pred.device)[:n_subsample]
+        pred   = pred[:, idx]
+        target = target[:, idx]
+        N      = n_subsample
 
-    # uniform marginals
-    log_a = torch.full((B, N), -torch.log(torch.tensor(float(N))),
-                       device=pred.device)
+    cost = torch.cdist(pred.float(), target.float())
+
+    log_a = torch.full((B, N), -torch.log(torch.tensor(float(N))), device=pred.device)
     log_b = log_a.clone()
-
-    # log-domain Sinkhorn
     log_u = torch.zeros_like(log_a)
     log_K = -cost / eps
 
@@ -145,174 +63,184 @@ def emd_approx(
         log_v = log_b - torch.logsumexp(log_K + log_u.unsqueeze(2), dim=1)
         log_u = log_a - torch.logsumexp(log_K + log_v.unsqueeze(1), dim=2)
 
-    # transport plan
-    log_T = log_K + log_u.unsqueeze(2) + log_v.unsqueeze(1)   # (B, N, N)
-    T = log_T.exp()
-
-    emd = (T * cost).sum(dim=(1, 2))                          # (B,)
+    log_T = log_K + log_u.unsqueeze(2) + log_v.unsqueeze(1)
+    emd = (log_T.exp() * cost).sum(dim=(1, 2))
 
     if reduce == "none":
         return emd
     return emd.mean() if reduce == "mean" else emd.sum()
 
 
-# ============================================================
-# F-Score
-# ============================================================
 
-def f_score(
-    pred: Tensor,
-    target: Tensor,
-    threshold: float = 0.01,
-    reduce: str = "mean",
-) -> dict[str, Tensor]:
-    """
-    F-Score at distance threshold τ.
 
-    Parameters
-    ----------
-    pred, target : (B, N, 3)
-    threshold    : τ in the same unit as the point coordinates
-    reduce       : "mean" | "none"
-
-    Returns
-    -------
-    dict with keys "precision", "recall", "f_score"
-    """
-    dist = torch.cdist(pred.float(), target.float())                   # (B, N, M)
-
-    # precision: fraction of pred points with a match within τ
-    prec = (dist.min(dim=2).values < threshold).float().mean(dim=1)   # (B,)
-    # recall: fraction of target points covered
-    rec  = (dist.min(dim=1).values < threshold).float().mean(dim=1)   # (B,)
-
-    denom = (prec + rec).clamp(min=1e-8)
-    fs    = 2 * prec * rec / denom                                     # (B,)
+def f_score(pred: Tensor, target: Tensor, threshold: float = 0.01, reduce: str = "mean") -> dict[str, Tensor]:
+    dist = torch.cdist(pred.float(), target.float())
+    prec = (dist.min(dim=2).values < threshold).float().mean(dim=1)
+    rec  = (dist.min(dim=1).values < threshold).float().mean(dim=1)
+    fs   = 2 * prec * rec / (prec + rec).clamp(min=1e-8)
 
     if reduce == "none":
         return {"precision": prec, "recall": rec, "f_score": fs}
-
-    return {
-        "precision": prec.mean(),
-        "recall":    rec.mean(),
-        "f_score":   fs.mean(),
-    }
+    return {"precision": prec.mean(), "recall": rec.mean(), "f_score": fs.mean()}
 
 
-# ============================================================
-# Normal Consistency
-# ============================================================
 
-def normal_consistency(
-    pred_pts:  Tensor,
-    pred_nrm:  Tensor,
-    tgt_pts:   Tensor,
-    tgt_nrm:   Tensor,
-    reduce:    str = "mean",
-) -> Tensor:
-    """
-    Mean absolute cosine similarity between each predicted point's normal and
-    its nearest neighbour's normal in the target cloud.
 
-    pred_pts, tgt_pts : (B, N, 3)
-    pred_nrm, tgt_nrm : (B, N, 3)  – not necessarily unit-length
-    """
+def normal_consistency(pred_pts: Tensor, pred_nrm: Tensor, tgt_pts: Tensor, tgt_nrm: Tensor, reduce: str = "mean") -> Tensor:
     pred_nrm = F.normalize(pred_nrm, dim=2)
     tgt_nrm  = F.normalize(tgt_nrm,  dim=2)
 
-    dist = torch.cdist(pred_pts.float(), tgt_pts.float())             # (B, N, M)
-    nn_idx = dist.min(dim=2).indices                  # (B, N)
+    dist   = torch.cdist(pred_pts.float(), tgt_pts.float())
+    nn_idx = dist.min(dim=2).indices
+    nn_nrm = tgt_nrm.gather(1, nn_idx.unsqueeze(2).expand(-1, -1, 3))
 
-    # gather nearest target normals
-    nn_idx_exp  = nn_idx.unsqueeze(2).expand(-1, -1, 3)
-    nn_nrm      = tgt_nrm.gather(1, nn_idx_exp)      # (B, N, 3)
-
-    cos_sim = (pred_nrm * nn_nrm).sum(dim=2).abs()   # (B, N)
+    cos_sim = (pred_nrm * nn_nrm).sum(dim=2).abs()
 
     if reduce == "none":
         return cos_sim.mean(dim=1)
     return cos_sim.mean() if reduce == "mean" else cos_sim.sum()
 
 
-# ============================================================
-# KL Divergence  (Gaussian VAE)
-# ============================================================
 
-def kl_divergence(mu: Tensor, logvar: Tensor, reduce: str = "mean") -> Tensor:
-    """
-    KL[q(z|x) || p(z)] para formatos (B, D) ou (B, N, D), com prevenção de NaNs.
-    """
-    # Clamp para evitar overflow em exp
+
+def _pairwise_cd_cross(a: Tensor, b: Tensor, chunk: int = 4) -> Tensor:
+
+    Ma, Mb = a.shape[0], b.shape[0]
+    D = a.new_zeros(Ma, Mb)
+    for start in range(0, Ma, chunk):
+        end  = min(start + chunk, Ma)
+        rows = a[start:end]
+        c    = rows.shape[0]
+        rows_exp = rows.unsqueeze(1).expand(c, Mb, -1, -1).reshape(c * Mb, *a.shape[1:])
+        cols_exp = b.unsqueeze(0).expand(c, Mb, -1, -1).reshape(c * Mb, *b.shape[1:])
+        cd, _, _ = chamfer_distance_knn(rows_exp, cols_exp, reduce="none")
+        D[start:end] = cd.view(c, Mb)
+    return D
+
+
+def mmd_cov(gen: Tensor, ref: Tensor, chunk: int = 4) -> dict[str, Tensor]:
+
+    D = _pairwise_cd_cross(gen, ref, chunk=chunk)        
+    mmd = D.min(dim=0).values.mean()                    
+    cov = D.min(dim=1).indices.unique().numel() / ref.shape[0] 
+    return {"mmd": mmd, "cov": gen.new_tensor(cov)}
+
+
+def nna_1nn(gen: Tensor, ref: Tensor, chunk: int = 4) -> Tensor:
+ 
+    Ng, Nr = gen.shape[0], ref.shape[0]
+    all_pts = torch.cat([gen, ref], dim=0)
+    D = _pairwise_cd_cross(all_pts, all_pts, chunk=chunk)
+    D.fill_diagonal_(float("inf"))                         
+
+    labels  = torch.cat([gen.new_zeros(Ng), gen.new_ones(Nr)])
+    nn_idx  = D.argmin(dim=1)
+    correct = (labels[nn_idx] == labels).float().mean()
+    return correct
+
+
+def generative_metrics(gen: Tensor, ref: Tensor, chunk: int = 4) -> dict[str, Tensor]:
+    out = mmd_cov(gen, ref, chunk=chunk)
+    out["nna_1nn"] = nna_1nn(gen, ref, chunk=chunk)
+    return out
+
+
+
+def kl_divergence(mu: Tensor, logvar: Tensor, free_bits: float = 0.5, reduce: str = "mean") -> Tensor:
+
     logvar = torch.clamp(logvar, -10.0, 10.0)
-    mu     = torch.clamp(mu, -10.0, 10.0)
+    mu     = torch.clamp(mu,     -10.0, 10.0)
 
-    # KL element-wise
-    kl = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp())
+    kl_elem = -0.5 * (1.0 + logvar - mu.pow(2) - logvar.exp())  # (B, [N,] D)
 
-    if kl.dim() == 3:
-        # Normaliza somando e dividindo pelo número de pontos
-        kl = kl.sum(dim=(1, 2)) / kl.shape[1]  # ou use kl.mean(dim=(1,2))
+    if free_bits > 0.0:
+        if kl_elem.dim() == 3:       # (B, N, D) — floor per (point, channel)
+            kl_per_unit = kl_elem.mean(dim=0)          # (N, D)
+            kl_per_unit = kl_per_unit.clamp(min=free_bits)
+            kl_per_sample = kl_per_unit.mean().unsqueeze(0).expand(kl_elem.shape[0])
+        else:                         # (B, D) — floor per channel
+            kl_per_dim = kl_elem.mean(dim=0)           # (D,)
+            kl_per_dim = kl_per_dim.clamp(min=free_bits)
+            kl_per_sample = kl_per_dim.mean().unsqueeze(0).expand(kl_elem.shape[0])
     else:
-        kl = kl.sum(dim=1)
+        if kl_elem.dim() == 3:
+            kl_per_sample = kl_elem.mean(dim=(1, 2))
+        else:
+            kl_per_sample = kl_elem.mean(dim=1)
 
     if reduce == "none":
-        return kl
-    return kl.mean() if reduce == "mean" else kl.sum()
+        return kl_per_sample
+    return kl_per_sample.mean() if reduce == "mean" else kl_per_sample.sum()
 
-
-# ============================================================
-# Full VAE ELBO loss
-# ============================================================
 
 def vae_loss(
-    pred_xyz:   Tensor,
-    target_xyz: Tensor,
-    mu:         Tensor,
-    logvar:     Tensor,
-    beta:       float  = 1.0,
-    recon_loss: str    = "chamfer",
-    # optional – used only when recon_loss == "both"
-    emd_weight: float  = 0.5,
-    emd_iters:  int    = 30,
+    pred_xyz:        Tensor,
+    target_xyz:      Tensor,
+    mu_points:       Tensor,
+    logvar_points:   Tensor,
+    mu_style:        Tensor,
+    logvar_style:    Tensor,
+    beta:            float          = 1.0,
+    beta_points:     float          = 1.0,
+    beta_style:      float          = 1.0,
+    free_bits:       float          = 0.0,
+    recon_loss:      str            = "chamfer",
+    emd_weight:      float          = 0.5,
+    emd_iters:       int            = 15,
+    emd_n_subsample: int            = 0,
+    normals_pred:    Tensor | None  = None,
+    normal_target:   Tensor | None  = None,
+    normal_weight:   float          = 0.0,
 ) -> dict[str, Tensor]:
-    """
-    ELBO = reconstruction_loss + β · KL
 
-    Parameters
-    ----------
-    pred_xyz    : (B, N, 3)  – reconstructed coordinates
-    target_xyz  : (B, N, 3)  – ground-truth coordinates
-    mu, logvar  : (B, latent_dim)
-    beta        : KL weight  (β-VAE)
-    recon_loss  : "chamfer" | "emd" | "both"
-    emd_weight  : weight of EMD when recon_loss == "both"
 
-    Returns
-    -------
-    dict with keys "total", "recon", "kl"  (and optionally "cd", "emd")
-    """
-    # --- reconstruction -----------------------------------------------
     if recon_loss == "chamfer":
         recon, cd_f, cd_b = chamfer_distance_knn(pred_xyz, target_xyz)
         out = {"recon": recon, "cd_forward": cd_f, "cd_backward": cd_b}
 
     elif recon_loss == "emd":
-        recon = emd_approx(pred_xyz, target_xyz, n_iters=emd_iters)
+        if pred_xyz.shape[1] != target_xyz.shape[1]:
+            B, N_pred, _ = pred_xyz.shape
+            idx = torch.randperm(target_xyz.shape[1], device=target_xyz.device)[:N_pred]
+            target_emd = target_xyz[:, idx, :]
+        else:
+            target_emd = target_xyz
+        recon = emd_approx(pred_xyz, target_emd, n_iters=emd_iters, n_subsample=emd_n_subsample)
         out   = {"recon": recon}
 
     elif recon_loss == "both":
         cd, cd_f, cd_b = chamfer_distance_knn(pred_xyz, target_xyz)
-        emd            = emd_approx(pred_xyz, target_xyz, n_iters=emd_iters)
+        if pred_xyz.shape[1] != target_xyz.shape[1]:
+            idx = torch.randperm(target_xyz.shape[1], device=target_xyz.device)[:pred_xyz.shape[1]]
+            target_emd = target_xyz[:, idx, :]
+        else:
+            target_emd = target_xyz
+        emd   = emd_approx(pred_xyz, target_emd, n_iters=emd_iters, n_subsample=emd_n_subsample)
         recon = (1 - emd_weight) * cd + emd_weight * emd
-        out   = {"recon": recon, "cd": cd, "emd": emd,
-                 "cd_forward": cd_f, "cd_backward": cd_b}
+        out   = {"recon": recon, "cd": cd, "emd": emd, "cd_forward": cd_f, "cd_backward": cd_b}
     else:
-        raise ValueError(f"Unknown recon_loss: '{recon_loss}'. "
-                         f"Choose from 'chamfer', 'emd', 'both'.")
+        raise ValueError(f"Unknown recon_loss: '{recon_loss}'.")
 
-    # --- KL ------------------------------------------------------------
-    kl = kl_divergence(mu, logvar)
+    if normal_weight > 0.0 and normals_pred is not None and normal_target is not None:
+        n_consistency = normal_consistency(pred_xyz, normals_pred, target_xyz, normal_target)
+        n_loss = (1.0 - n_consistency).clamp(min=0.0, max=1.0)
+        out["normal_loss"] = n_loss
+    else:
+        n_loss = pred_xyz.new_zeros(1)
+        out["normal_loss"] = n_loss
 
-    total = recon + beta * kl
-    out.update({"total": total, "kl": kl})
+
+    kl_pts = kl_divergence(mu_points, logvar_points, free_bits=free_bits)
+    kl_sty = kl_divergence(mu_style,  logvar_style,  free_bits=free_bits)
+    out["kl_points"] = kl_pts
+    out["kl_style"]  = kl_sty
+
+
+    total = (
+        recon
+        + normal_weight * n_loss
+        + beta * beta_points * kl_pts
+        + beta * beta_style  * kl_sty
+    )
+    out["total"] = total
     return out

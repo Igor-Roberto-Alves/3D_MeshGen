@@ -5,15 +5,17 @@ A Diffuse Latent Model in Shapenet dataset
 
 ## Current State [main]
 
-<img src= "imgs/thirdmodel.png">
+<img src= "imgs/fourth.png">
 
 ## I need To
+
+0 - COMPARE RESULTS AND STUDY MORE ABOUT THE LATENT OVERFLOW (blue clouds)
 
 1 - Solve Loss Stagnation (Normals) (EMD)
 
 2 - Take care with KL collapse
 
-3 - Init Gan structure (I need?)
+3 - Init Gan structure (Need I?)
 
 4 - Init Diffuse Latent (Estudy Diffuse for latent_point LION)
 
@@ -54,4 +56,11 @@ The model is the same as the first one, but with a more robust MLP decoder. The 
 A Implementation of LION Nvidia Model
 
 <img src= "imgs/thirdmodel.png">
+
+### Fourth: [The model can be finded in branch pvcnn_entiredata]
+
+Entire ShapeNetCore incorporation
+
+<img src= "imgs/fourth.png" ></img>
+
 

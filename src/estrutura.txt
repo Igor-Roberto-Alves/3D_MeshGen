@@ -1,0 +1,77 @@
+Relatório Projeto Final machine learning 2
+
+
+Problema que busquei trabalhar:
+
+Fazer um modelo generativo para nuvens de pontos. A minha expectativa era fazer algo como um stable diffusion, fazer uma boa VAE e dentro do latente da VAE treinar uma difusão.
+
+Paper em que me inspirei: 
+
+Lion: LION: Latent Point Diffusion Models for 3D Shape Generation (NVIDIA)
+
+espaço estrutura lion  espaço estrutura pvcnn
+
+
+
+
+
+
+
+
+
+
+
+Se trata de um VAE com uma estrutura diferente ele passa para o decoder um shape latent de dimensão (shape_latent x 1) e cria latent points que carrega uma estrutura (N x (3 + D_h)) onde N é o número de pontos que a núvem de pontos carrega e D_h hiperparâmetro
+
+Dataset Utilizado:
+
+shapenet: classes avião e carro
+
+ espaço foto dataset 
+
+Problemas da implementação
+
+Ao implementar pela primeira vez do jeito que eles fizeram o meu encoder e decoder só copiava as coordenadas então optei por parar de passar as âncoras de posição, dessa maneira tive que mudar a maneira que o decoder funciona
+
+Versão 1:
+
+Primeiro mudei para uma versão onde mantinha a estrutura de latent points, porém tudo penalizado pela loss kl (antes as posições não tinham peso kl associado no artigo). Ao fazer isso obtive um modelo muito bom para reconstruções, até na validação. Porém o espaço era completamente esparso e não tinha estrutura para amostragem (arquivo Vae.py) Decoder era baseado em prever as coordenadas a partir das vetor latente para cada ponto.
+
+espaço fotos Resultados| Amostragem com PCA
+
+Versão 2:
+
+Como a estrutura estava pesada demais decide diminuir o n porém ao diminuir o n muito a reconstrução ficava péssima pelo jeito que a estrutura funcionava e deixar um n bom para a reconstrução mantinha ainda dimensões ignoradas
+ 
+espaço foto Resultados/ Amostragem com PCA
+
+Modelo Final
+
+Pipeline final do VAE
+manter só o vetor global e montar um decoder que saiba prever a partir de um vetor flat
+
+Loss utilizada nas 3 versões:
+
+chamfer distance + emd + kl
+
+Versão 1
+Encoder 10M 
+Decoder 6M
+beta_hold 40
+beta_epochs 100
+free_bits 0.15
+beta_end 0.2
+latent_dim 512
+log_real_flat
+
+
+manter só o vetor global e montar um decoder que saiba prever a partir de um vetor flat
+
+Estrutura inspirado em Sparsenet + Foldernet
+espaço foto amostragem do vae
+
+Difusao
+
+explicar codigo difusao que esta sendo treinado em train_diffusion_flat_noclass.py
+
+

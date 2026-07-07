@@ -1,142 +1,138 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from src.Encoder import *
+from src.utils import AdaGN
 
-# ---------------------------------------------------------------------------
-# Módulo de Modulação de Estilo (AdaGN / MLP Modulation)
-# ---------------------------------------------------------------------------
-class StyleModulation(nn.Module):
-    def __init__(self, style_dim: int, feat_channels: int):
+
+class SharedMLP(nn.Sequential):
+    def __init__(self, channels, bn=True, act=True, norm="group"):
+
+        layers = []
+        for i in range(len(channels) - 1):
+            layers.append(nn.Conv1d(channels[i], channels[i + 1], 1, bias=not bn))
+            if bn:
+                if norm == "batch":
+                    layers.append(nn.BatchNorm1d(channels[i + 1]))
+                else:
+                    layers.append(nn.GroupNorm(min(8, channels[i + 1]), channels[i + 1]))
+            if act:
+                layers.append(nn.GELU())
+        super().__init__(*layers)
+
+
+class VoxelBranch(nn.Module):
+    def __init__(self, feat_channels, out_channels, resolution=16):
         super().__init__()
-        self.to_scale = nn.Linear(style_dim, feat_channels)
-        self.to_shift = nn.Linear(style_dim, feat_channels)
-
-    def forward(self, x: torch.Tensor, style: torch.Tensor) -> torch.Tensor:
-        scale = torch.tanh(self.to_scale(style)).unsqueeze(1)
-        shift = 0.1 * torch.tanh(self.to_shift(style)).unsqueeze(1)
-        return x * (1 + scale) + shift
-
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
-
-class PointUpsampleBlock(nn.Module):
-    """
-    Upsampling learned: N → kN
-    cada ponto gera k offsets
-    """
-    def __init__(self, in_channels: int, k: int = 4):
-        super().__init__()
-        self.k = k
-
-        self.mlp = nn.Sequential(
-            nn.Conv1d(in_channels, in_channels, 1),
+        self.resolution = resolution
+        mid = max(out_channels * 2, 8)
+        self.voxel_net = nn.Sequential(
+            nn.Conv3d(feat_channels, mid, 3, padding=1, bias=False),
+            nn.GroupNorm(min(8, mid), mid),
             nn.GELU(),
-            nn.Conv1d(in_channels, 3 * k, 1)  # offsets XYZ
+            nn.Conv3d(mid, out_channels, 3, padding=1, bias=False),
+            nn.GroupNorm(min(8, out_channels), out_channels),
+            nn.GELU(),
         )
 
-    def forward(self, xyz: torch.Tensor, feat: torch.Tensor):
-        """
-        xyz:  (B, N, 3)
-        feat: (B, N, C)
-        return (B, N*k, 3)
-        """
+    def _voxelise(self, coords, features, R):
+        B, C, N = features.shape
+        device = features.device
+        idx = coords.long().clamp(0, R - 1)
+        flat_idx = idx[:, 0] * R * R + idx[:, 1] * R + idx[:, 2]
+        voxels = torch.zeros(B, C, R * R * R, device=device, dtype=features.dtype)
+        count  = torch.zeros(B, 1, R * R * R, device=device, dtype=features.dtype)
+        voxels.scatter_add_(2, flat_idx.unsqueeze(1).expand_as(features), features)
+        count.scatter_add_(2, flat_idx.unsqueeze(1),
+                           torch.ones(B, 1, N, device=device, dtype=features.dtype))
+        return (voxels / count.clamp(min=1.0)).view(B, C, R, R, R)
 
+    def forward(self, xyz, feat):
         B, N, _ = xyz.shape
+        R = self.resolution
+        coords = xyz.permute(0, 2, 1)
+        feats  = feat.permute(0, 2, 1)
+        norm_coords = (coords + 1.0) * 0.5 * (R - 1)
+        norm_coords = norm_coords.clamp(0.0, float(R - 1))
+        voxel_grid  = self._voxelise(norm_coords, feats, R)
+        voxel_feats = self.voxel_net(voxel_grid)
+        sample_grid = (norm_coords / (R - 1) * 2 - 1).clamp(-1.0, 1.0)
+        sample_grid = sample_grid.permute(0, 2, 1).unsqueeze(1).unsqueeze(1)
+        sample_grid = sample_grid.expand(-1, 1, 1, N, 3)
+        sampled = F.grid_sample(voxel_feats, sample_grid,
+                                mode='bilinear', align_corners=True, padding_mode='border')
+        return sampled.squeeze(2).squeeze(2).permute(0, 2, 1)
 
-        x = feat.permute(0, 2, 1)          # (B, C, N)
-        offsets = self.mlp(x)              # (B, 3k, N)
 
-        offsets = offsets.view(B, self.k, 3, N)
-        offsets = offsets.permute(0, 3, 1, 2)   # (B, N, k, 3)
-
-        xyz = xyz.unsqueeze(2)             # (B, N, 1, 3)
-
-        new_xyz = xyz + offsets            # (B, N, k, 3)
-
-        return new_xyz.reshape(B, N * self.k, 3)
-    
-# ---------------------------------------------------------------------------
-# LION Decoder Core - CORRIGIDO SEGUNDO O PADRÃO NVIDIA LION
-# ---------------------------------------------------------------------------
-class LIONDecoder(nn.Module):
-    def __init__(
-        self,
-        latent_dim: int = 256,   # Dimensão das características abstratas (mochila)
-        style_dim: int = 512,    # Dimensão do vetor de estilo global (z0)
-        input_dim: int = 3,       # Coordenadas físicas da entrada (XYZ = 3 ou XYZ+Normais = 6)
-        out_channels: int = 0,
-        up_factor: int = 4
-    ):
+class PointBranch(nn.Module):
+    def __init__(self, feat_channels, out_channels, norm="group"):
         super().__init__()
-        self.input_dim = input_dim
+        self.mlp = SharedMLP([feat_channels, out_channels * 2, out_channels], norm=norm)
 
-        # MUDANÇA 1: A entrada real que vem do espaço latente unificado da NVIDIA
-        # contém as coordenadas espaciais + as feições grudadas. Total = 3 + 256 = 259 canais.
-        total_in_channels = latent_dim + input_dim
-        
-        # Projetamos essa mistura de canais para o tamanho inicial do bloco PVCNN (256)
-        self.input_projection = SharedMLP([total_in_channels, 256])
+    def forward(self, xyz, feat):
+        return self.mlp(feat.permute(0, 2, 1)).permute(0, 2, 1)
 
-        # Módulos de Modulação Adaptativa de Estilo
-        self.mod0 = StyleModulation(style_dim, 256)
-        self.mod1 = StyleModulation(style_dim, 128)
 
-        # Blocos PVCNN Reversos
-        self.stage0 = PVConvBlock(256, 128, resolution=8)
-        self.stage1 = PVConvBlock(128, 64,  resolution=16)
-        self.stage2 = PVConvBlock(64,  32,  resolution=32)
-        self.upsample = PointUpsampleBlock(32, k=up_factor)
-        # Cabeçalho de saída ponto a ponto
-        # Fornecerá os deltas de deslocamento e as novas normais
-        self.output_head = nn.Sequential(
-            nn.Conv1d(32, 16, 1, bias=False),
-            nn.BatchNorm1d(16),
+class PVConvBlockDecoder(nn.Module):
+
+    def __init__(self, feat_in, feat_out, style_dim, resolution=16, norm="group"):
+        super().__init__()
+        half = feat_out // 2
+        self.voxel = VoxelBranch(feat_in, half, resolution)
+        self.point = PointBranch(feat_in, half, norm=norm)
+        self.adagn = AdaGN(num_channels=feat_out, style_dim=style_dim, num_groups=8)
+        self.act   = nn.GELU()
+        self.conv  = nn.Conv1d(feat_out, feat_out, 1)
+
+    def forward(self, xyz, feat, style):
+        v = self.voxel(xyz, feat)
+        p = self.point(xyz, feat)
+        x = torch.cat([v, p], dim=2).permute(0, 2, 1)  # (B, feat_out, N)
+        x = self.adagn(x, style)
+        return self.conv(self.act(x)).permute(0, 2, 1)  # (B, N, feat_out)
+
+
+
+class LIONDecoder(nn.Module):
+
+    def __init__(self, latent_dim=3, style_dim=256):
+        super().__init__()
+        self.pos_head = nn.Sequential(
+            nn.Conv1d(latent_dim, 64, 1),
             nn.GELU(),
-            nn.Conv1d(16, 6, 1) # Cospe 6 canais: 3 para delta XYZ + 3 para Normais
+            nn.Conv1d(64, 3, 1),
         )
 
-    def forward(self, latent_points: torch.Tensor, style: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        latent_points : (B, N, latent_dim + input_dim) -> Ex: (B, 512, 259)
-        style         : (B, style_dim)
-        """
-        # --- BASE FÍSICA ---
-        base_coords = latent_points[:, :, :self.input_dim]  # (B, N, 3)
+        self.feat_proj = SharedMLP([latent_dim, 128, 256])
 
-        # --- PROJEÇÃO INICIAL ---
-        x = latent_points.permute(0, 2, 1)
-        x = self.input_projection(x).permute(0, 2, 1)      # (B, N, 256)
+        self.stage0 = PVConvBlockDecoder(256, 256, style_dim, resolution=16)
+        self.stage1 = PVConvBlockDecoder(256, 128, style_dim, resolution=32)
+        self.stage2 = PVConvBlockDecoder(128, 64,  style_dim, resolution=32)
 
-        # --- MODULAÇÃO + PVCNN ---
-        x = self.mod0(x, style)
-        x = self.stage0(x)
+        self.refine0 = nn.Conv1d(256, 3, 1)
+        self.refine1 = nn.Conv1d(128, 3, 1)
 
-        x = self.mod1(x, style)
-        x = self.stage1(x)
+        self.output_head = nn.Sequential(
+            nn.Conv1d(64, 64, 1),
+            nn.GELU(),
+            nn.Conv1d(64, 3, 1),
+        )
 
-        x = self.stage2(x)  # (B, N, 32)
+    def forward(self, z_l, z_global):
+        z = z_l.permute(0, 2, 1)                                
 
-        # --- UPSAMPLING 512 -> 2048 ---
-        coords_up = self.upsample(base_coords, x)  # (B, N*4, 3)
+        xyz_cur = torch.tanh(self.pos_head(z)).permute(0, 2, 1)  
+
+        feat = self.feat_proj(z).permute(0, 2, 1)       
+
         
-        # Expand features para cada ponto novo
-        B, N, C = x.shape
-        x_up = x.unsqueeze(2).repeat(1, 1, 4, 1)      # (B, N, 4, 32)
-        x_up = x_up.reshape(B, N*4, C)                # (B, N*4, 32)
+        feat    = self.stage0(xyz_cur, feat, z_global)
+        xyz_cur = torch.tanh(xyz_cur + self.refine0(feat.permute(0, 2, 1)).permute(0, 2, 1))
 
-        # --- HEAD FINAL ---
-        feat_out = self.output_head(x_up.permute(0, 2, 1))  # (B, 6, N*4)
-        feat_out = feat_out.permute(0, 2, 1)                # (B, N*4, 6)
 
-        # --- DELTA + NORMAL ---
-        delta_coords = 0.5 * torch.tanh(feat_out[:, :, :3])
-        coords = coords_up + delta_coords
-        coords = torch.tanh(coords)
+        feat    = self.stage1(xyz_cur, feat, z_global)
+        xyz_cur = torch.tanh(xyz_cur + self.refine1(feat.permute(0, 2, 1)).permute(0, 2, 1))
 
-        normals = F.normalize(feat_out[:, :, 3:], p=2, dim=-1)
-        coords = torch.clamp(coords, -1, 1)
-        return coords, normals
+
+        feat    = self.stage2(xyz_cur, feat, z_global)
+        delta   = self.output_head(feat.permute(0, 2, 1)).permute(0, 2, 1)
+        return torch.tanh(xyz_cur + delta)

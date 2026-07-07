@@ -6,29 +6,23 @@ import tqdm
 from torchvision.transforms import transforms
 
 
-# ----------------------------
-class Jitter(object):
-    def __init__(self, sigma=0.01, clip=0.05):
-        self.sigma = sigma
-        self.clip = clip
 
-    def __call__(self, points):
-        noise = torch.randn_like(points) * self.sigma
-        noise = noise.clamp(-self.clip, self.clip)
-        return points + noise
+class JointAugment(object):
+    def __init__(self, jitter_sigma=0.01, jitter_clip=0.05):
+        self.jitter_sigma = jitter_sigma
+        self.jitter_clip = jitter_clip
+
+    def __call__(self, features):
+
+        xyz = features[:, :3]
+        nrm = features[:, 3:]
 
 
-# ----------------------------
-# ROTATION (eixo Y)
-# ----------------------------
-class RandomRotateY(object):
-    def __call__(self, points):
-        """
-        points: (N, 3)
-        """
-        device = points.device
-        theta = torch.rand(1, device=device) * 2 * torch.pi
+        noise = torch.randn_like(xyz) * self.jitter_sigma
+        noise = noise.clamp(-self.jitter_clip, self.jitter_clip)
+        xyz_jittered = xyz + noise
 
+        theta = torch.rand(1, device=features.device) * 2 * torch.pi
         c = torch.cos(theta)
         s = torch.sin(theta)
 
@@ -36,18 +30,14 @@ class RandomRotateY(object):
             [ c, 0, s],
             [ 0, 1, 0],
             [-s, 0, c]
-        ], device=device)
+        ], dtype=features.dtype, device=features.device)
 
-        return points @ rot.T
+        xyz_rotated = xyz_jittered @ rot.T
+        nrm_rotated = nrm @ rot.T
 
+        return torch.cat([xyz_rotated, nrm_rotated], dim=1)
 
-# ----------------------------
-# COMPOSE
-# ----------------------------
-data_augs = transforms.Compose([
-    Jitter(sigma=0.01, clip=0.05),
-    RandomRotateY(),
-])
+data_augs = JointAugment()
 
 
 class Ds_point_model:
@@ -190,43 +180,101 @@ class Ds_point_sampled:
 
 
 class Ds_point_sampled_already:
-
-    def __init__(self, root="point_clouds", augment = data_augs):
+    def __init__(self, root="point_clouds", augment=True):
         self.root = root
-        self.files = []
+        all_files = []
         for rt, dirs, files in os.walk(root):
             for file in files:
                 if file.endswith(".ply"):
-                    self.files.append(os.path.join(rt, file))
-        self.augment = data_augs
+                    all_files.append(os.path.join(rt, file))
+
+        self.files = [f for f in all_files if os.path.exists(f) and os.path.getsize(f) > 0]
+        skipped = len(all_files) - len(self.files)
+        if skipped:
+            print(f"[dataset] Skipped {skipped} missing/empty PLY files.")
+
+        self.augment = augment
+        self.transform = data_augs
+
+        present_classes = sorted({
+            os.path.basename(f).replace(".ply", "").split("_")[0] for f in self.files
+        })
+        self.class_to_idx = {cls_id: idx for idx, cls_id in enumerate(present_classes)}
+
     def __len__(self):
         return len(self.files)
 
     def __getitem__(self, idx):
+        filename = os.path.basename(self.files[idx])
+        class_name, _ = filename.replace(".ply", "").split("_")
 
-        class_name, file_path = self.model[idx]
-        file_path = "point_clouds/" + f"{class_name}_{idx}.ply"
+        class_idx = self.class_to_idx.get(class_name, 0)
+        cls_tensor = torch.tensor(class_idx, dtype=torch.long)
+    
+        file_path = self.files[idx]
         pcd = o3d.io.read_point_cloud(file_path)
 
         points = np.asarray(pcd.points, dtype=np.float32)
         normals = np.asarray(pcd.normals, dtype=np.float32)
 
+        # Fallback: corrupt/unreadable file returns 0 points — pick a random valid sample
+        if points.shape[0] == 0:
+            return self.__getitem__(int(torch.randint(len(self), (1,)).item()))
+
         features = np.concatenate([points, normals], axis=1)
         features = torch.from_numpy(features).float()
 
-    
-        if self.augment:
-    
-            xyz = features[:, :3]
-            nrm = features[:, 3:]
+        if self.augment and self.transform:
+            features = self.transform(features)
 
-            xyz = data_augs(xyz)
+        return features, cls_tensor
 
-            features = torch.cat([xyz, nrm], dim=1)
 
-        return class_name, features
+def generate_subset(shapenet_root: str, out_dir: str, classes: list[str], n_points: int = 2048):
+
+
+    os.makedirs(out_dir, exist_ok=True)
+
+    model = Ds_point_model(root=shapenet_root)
+    subset = [(cls, path) for cls, path in model.all_files if cls in classes]
+
+    print(f"Found {len(subset)} meshes across classes {classes}")
+    skipped = 0
+    saved = 0
+    for i, (cls, file_path) in enumerate(tqdm.tqdm(subset, desc="Sampling")):
+        save_path = os.path.join(out_dir, f"{cls}_{i}.ply")
+        if os.path.exists(save_path):
+            saved += 1
+            continue
+        mesh = o3d.io.read_triangle_mesh(file_path)
+        if not mesh.has_vertices():
+            skipped += 1
+            continue
+        mesh.compute_vertex_normals()
+        pcd = mesh.sample_points_uniformly(number_of_points=n_points)
+        o3d.io.write_point_cloud(save_path, pcd)
+        saved += 1
+
+    print(f"Done. {saved} saved, {skipped} skipped (unreadable meshes).")
+
 
 if __name__ == "__main__":
+    import argparse
 
-    ds = Ds_point_sampled(Ds_point_model())
-    print(len(ds))
+    CLASSES = ["02691156", "02958343"]
+
+    p = argparse.ArgumentParser(description="Generate PLY point clouds from ShapeNet OBJ meshes.")
+    p.add_argument("--shapenet_root", type=str, required=True,
+                   help="Path to ShapeNet root directory (contains class-id subdirs)")
+    p.add_argument("--out_dir", type=str, default="point_clouds",
+                   help="Output directory for PLY files (default: point_clouds)")
+    p.add_argument("--n_points", type=int, default=2048,
+                   help="Number of points to sample per mesh (default: 2048)")
+    args = p.parse_args()
+
+    generate_subset(
+        shapenet_root=args.shapenet_root,
+        out_dir=args.out_dir,
+        classes=CLASSES,
+        n_points=args.n_points,
+    )
