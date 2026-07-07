@@ -488,24 +488,71 @@
             }
             order.sort((a, b) => a[0] - b[0]);
 
-            // shading flat: |normal · luz| no espaço da câmera (luz fixa
-            // de cima/frente; abs() ignora a orientação do triângulo)
+            // shading suave (Gouraud): intensidade |normal · luz| por
+            // vértice, com as normais por vértice vindas do servidor
+            // (média das normais dos triângulos adjacentes), interpolada
+            // linearmente dentro do triângulo via gradiente do canvas
             const L = [0.32, 0.42, 0.85];
+            const N = meshData.normals || null;
+            const I = N ? new Float32Array(V.length) : null;
+            if (N) for (let i = 0; i < V.length; i++) {
+                const nx = N[i][0], ny = N[i][1], nz = N[i][2];
+                const nx1 = cy * nx + sy * nz;
+                const nz1 = -sy * nx + cy * nz;
+                const ny2 = cp * ny - sp * nz1;
+                const nz2 = sp * ny + cp * nz1;
+                I[i] = Math.abs(nx1 * L[0] + ny2 * L[1] + nz2 * L[2]);
+            }
+            const shade = it => {
+                const i2 = 0.2 + 0.8 * it;
+                return `rgb(${Math.round(28 + 82 * i2)},` +
+                       `${Math.round(66 + 114 * i2)},` +
+                       `${Math.round(140 + 115 * i2)})`;
+            };
+
             ctx.lineWidth = 0.6;
             for (let k = 0; k < order.length; k++) {
                 const t = T[order[k][1]];
                 const a = t[0], b = t[1], c = t[2];
-                const ux = VX[b] - VX[a], uy = VY[b] - VY[a], uz = VZ[b] - VZ[a];
-                const vx = VX[c] - VX[a], vy = VY[c] - VY[a], vz = VZ[c] - VZ[a];
-                let nx = uy * vz - uz * vy;
-                let ny = uz * vx - ux * vz;
-                let nz = ux * vy - uy * vx;
-                const len = Math.hypot(nx, ny, nz) || 1;
-                const it = Math.abs((nx * L[0] + ny * L[1] + nz * L[2]) / len);
-                const i2 = 0.2 + 0.8 * it;
-                const col = `rgb(${Math.round(28 + 82 * i2)},` +
-                            `${Math.round(66 + 114 * i2)},` +
-                            `${Math.round(140 + 115 * i2)})`;
+                let col;
+                if (!I) {
+                    // fallback flat (payload sem normais): normal única
+                    // do triângulo via produto vetorial
+                    const ux = VX[b] - VX[a], uy = VY[b] - VY[a], uz = VZ[b] - VZ[a];
+                    const vx = VX[c] - VX[a], vy = VY[c] - VY[a], vz = VZ[c] - VZ[a];
+                    const nx = uy * vz - uz * vy;
+                    const ny = uz * vx - ux * vz;
+                    const nz = ux * vy - uy * vx;
+                    const len = Math.hypot(nx, ny, nz) || 1;
+                    col = shade(Math.abs((nx * L[0] + ny * L[1] + nz * L[2]) / len));
+                } else {
+                    // a intensidade interpolada é um plano ia + α·dx + β·dy
+                    // na tela; um gradiente linear na direção (α, β)
+                    // reproduz esse plano exatamente
+                    const ia = I[a], ib = I[b], ic = I[c];
+                    const imin = Math.min(ia, ib, ic), imax = Math.max(ia, ib, ic);
+                    const x1 = X[b] - X[a], y1 = Y[b] - Y[a];
+                    const x2 = X[c] - X[a], y2 = Y[c] - Y[a];
+                    const det = x1 * y2 - x2 * y1;
+                    if (imax - imin < 1e-3 || Math.abs(det) < 1e-6) {
+                        col = shade((ia + ib + ic) / 3);
+                    } else {
+                        const al = ((ib - ia) * y2 - (ic - ia) * y1) / det;
+                        const be = ((ic - ia) * x1 - (ib - ia) * x2) / det;
+                        const g2 = al * al + be * be;
+                        if (g2 < 1e-12) {
+                            col = shade((ia + ib + ic) / 3);
+                        } else {
+                            const p0x = X[a] + (imin - ia) / g2 * al;
+                            const p0y = Y[a] + (imin - ia) / g2 * be;
+                            const p1x = X[a] + (imax - ia) / g2 * al;
+                            const p1y = Y[a] + (imax - ia) / g2 * be;
+                            col = ctx.createLinearGradient(p0x, p0y, p1x, p1y);
+                            col.addColorStop(0, shade(imin));
+                            col.addColorStop(1, shade(imax));
+                        }
+                    }
+                }
                 ctx.fillStyle = col;
                 ctx.strokeStyle = col;   // fecha frestas do antialiasing
                 ctx.beginPath();

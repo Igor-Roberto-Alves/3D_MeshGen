@@ -1,17 +1,3 @@
-"""
-train_diffusion_flat_noclass.py
------------------------
-Unconditional latent diffusion (1-D U-Net) on top of the frozen flat
-VAE. This is a modified version of train_diffusion_flat.py that removes
-class conditioning and fixes overfitting without underfitting.
-
-Key changes to fix overfitting:
-1. Increased weight decay (L2 regularization) to 1e-3.
-2. Enabled posterior sampling by default (trains on z = mu + std*eps), 
-   which acts as strong data augmentation in the latent space and prevents 
-   the DDPM from memorizing deterministic VAE means.
-"""
-
 import argparse
 import copy
 import csv
@@ -347,7 +333,7 @@ def main():
     )
     val_clouds = clouds[vl]
 
-    # ── Model / schedule / optimiser ──────────────────────────────────────
+  
     model_kwargs = dict(
         latent_dim=latent_dim,
         num_classes=1,             # Single dummy class for unconditional
@@ -425,7 +411,7 @@ def main():
     mean_d = latent_mean.to(device)
     std_d  = latent_std.to(device)
 
-    # ── Training loop ─────────────────────────────────────────────────────
+
     for epoch in range(start_epoch, args.epochs + 1):
 
         model.train()
@@ -441,7 +427,7 @@ def main():
             t = torch.randint(0, args.T, (z.shape[0],), device=device)
             zt, noise = schedule.q_sample(z, t)
             
-            # Unconditional: all indices are 0
+
             cond = torch.zeros(z.shape[0], device=device, dtype=torch.long)
             eps = model(zt, t, cond)
 

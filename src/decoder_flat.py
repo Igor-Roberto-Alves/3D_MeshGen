@@ -69,7 +69,7 @@ class FlatDecoder(nn.Module):
             nn.Linear(fold_dim_actual, 3),
         )
 
-        seeds = _make_seeds(self.ratio)          # (ratio, 2) — fixo, nao-treinavel
+        seeds = _make_seeds(self.ratio)          
         self.register_buffer("seeds", seeds)
 
     def forward(self, z: torch.Tensor, return_coarse: bool = False):

@@ -89,7 +89,6 @@ class PVConvBlock(nn.Module):
 
 
 class PVConvBlockConditioned(nn.Module):
-    """PVCNN block with AdaGN style conditioning. Used in LocalEncoder."""
     def __init__(self, feat_in, feat_out, style_dim, resolution=16):
         super().__init__()
         half = feat_out // 2
@@ -113,13 +112,13 @@ class GlobalEncoder(nn.Module):
     def __init__(self, in_channels=6, style_dim=256, hidden_dim=64, out_dim=256,
                  n_stages=3, resolution=32):
         super().__init__()
-        assert n_stages >= 1, "n_stages must be >= 1"
+        assert n_stages >= 1
 
         if n_stages == 1:
             widths = [round_channels(out_dim)]
         else:
             widths = channel_schedule(hidden_dim, out_dim, n_stages - 1)
-
+        
         self.stages = nn.ModuleList()
         prev = in_channels
         for i, width in enumerate(widths):

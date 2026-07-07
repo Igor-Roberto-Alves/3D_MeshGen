@@ -183,7 +183,9 @@ def poisson_mesh(pts: np.ndarray, depth: int = 8, knn: int = 30,
       3. reconstrucao de Poisson;
       4. corte dos vertices de baixa densidade (extrapolacao do Poisson
          longe dos pontos) + crop na bbox da nuvem;
-      5. decimacao se passar de max_tris.
+      5. decimacao se passar de max_tris;
+      6. normais por vertice (media ponderada das normais dos triangulos
+         adjacentes) para o cliente interpolar no shading (Gouraud).
     """
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(pts.astype(np.float64))
@@ -203,10 +205,12 @@ def poisson_mesh(pts: np.ndarray, depth: int = 8, knn: int = 30,
         mesh = mesh.simplify_quadric_decimation(max_tris)
     mesh.remove_degenerate_triangles()
     mesh.remove_unreferenced_vertices()
+    mesh.compute_vertex_normals()
 
     verts = np.round(np.asarray(mesh.vertices), 4).tolist()
     tris  = np.asarray(mesh.triangles).tolist()
-    return verts, tris
+    norms = np.round(np.asarray(mesh.vertex_normals), 4).tolist()
+    return verts, tris, norms
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -261,7 +265,7 @@ def generate():
             cond = torch.zeros((1,), device=DEVICE, dtype=torch.long)
             z_norm = ddim_sample(entry["schedule"], entry["model"],
                                  (entry["latent_dim"],), cond,
-                                 uncond=None, guidance=1.0, steps=steps)
+                                 uncond=None, guidance=1.0, steps=steps, eta=1.0)
             pts = decode_points(entry, z_norm)
 
         fname = f"{name}_seed{seed}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.npy"
@@ -350,7 +354,7 @@ def mesh():
             except ValueError as ve:
                 return jsonify({"success": False, "error": str(ve)}), 400
             pts = decode_points(entry, z)
-            verts, tris = poisson_mesh(pts, depth=depth, knn=knn)
+            verts, tris, norms = poisson_mesh(pts, depth=depth, knn=knn)
 
         return jsonify({
             "success":    True,
@@ -359,6 +363,7 @@ def mesh():
             "knn":        knn,
             "vertices":   verts,
             "triangles":  tris,
+            "normals":    norms,
         }), 200
     except Exception as e:
         print(f"[✗] /mesh: {e}")

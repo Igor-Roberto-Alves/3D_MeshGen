@@ -7,10 +7,7 @@ from src.Decoder import PVConvBlockDecoder, SharedMLP
 
 
 def _make_seeds(ratio: int) -> torch.Tensor:
-    """
-    Build a fixed (ratio, 2) 2-D seed grid covering [-1, 1]².
-    Uses ceil(sqrt(ratio)) × ceil(sqrt(ratio)) uniform grid, cropped to ratio.
-    """
+
     side = int(math.ceil(math.sqrt(ratio)))
     t    = torch.linspace(-1.0, 1.0, side)
     gy, gx = torch.meshgrid(t, t, indexing="ij")
@@ -19,20 +16,6 @@ def _make_seeds(ratio: int) -> torch.Tensor:
 
 
 class LIONDecoderUp(nn.Module):
-    """
-    Hierarchical decoder: coarse decode then folding-based upsampling.
-
-    Pipeline
-    --------
-    z_l (B, n_latent, latent_dim) + z_g (B, style_dim)
-      → coarse positions  (B, n_latent, 3)   [same as LIONDecoder]
-      → per-point features (B, n_latent, 64)
-      → fold: each coarse point × ratio 2-D seeds → MLP → 3-D offset
-      → fine positions (B, n_latent × ratio, 3) = (B, N, 3)
-
-    Works identically for training (reconstruction) and generation (prior sampling)
-    because it never needs the input point positions.
-    """
 
     def __init__(
         self,
@@ -48,7 +31,7 @@ class LIONDecoderUp(nn.Module):
         self.n_latent = n_latent
         self.ratio    = n_points // n_latent
 
-        # ---- Coarse decoder (mirrors LIONDecoder) ----
+
         self.pos_head  = nn.Sequential(
             nn.Conv1d(latent_dim, 64, 1), nn.GELU(), nn.Conv1d(64, 3, 1)
         )
@@ -61,7 +44,6 @@ class LIONDecoderUp(nn.Module):
         self.refine0 = nn.Conv1d(256, 3, 1)
         self.refine1 = nn.Conv1d(128, 3, 1)
 
-        # ---- Folding MLP: [feat(64) | seed(2)] → 3-D offset ----
         fold_in = 64 + 2
         self.fold_mlp = nn.Sequential(
             nn.Linear(fold_in, 128), nn.GELU(),
@@ -69,7 +51,7 @@ class LIONDecoderUp(nn.Module):
             nn.Linear(64, 3),
         )
 
-        seeds = _make_seeds(self.ratio)          # (ratio, 2)  — fixed, non-trainable
+        seeds = _make_seeds(self.ratio)          
         self.register_buffer("seeds", seeds)
 
     def forward(
@@ -78,16 +60,10 @@ class LIONDecoderUp(nn.Module):
         z_global: torch.Tensor,
         return_coarse: bool = False,
     ):
-        """
-        z_l     : (B, n_latent, latent_dim)
-        z_global: (B, style_dim)
-        Returns : (B, n_latent * ratio, 3)
-                  or ((B, n_latent * ratio, 3), (B, n_latent, 3)) if return_coarse=True
-        """
+
         B = z_l.shape[0]
         z = z_l.permute(0, 2, 1)                                              # (B, D, n_latent)
 
-        # --- Coarse positions & features ---
         xyz_cur = torch.tanh(self.pos_head(z)).permute(0, 2, 1)              # (B, n_latent, 3)
         feat    = self.feat_proj(z).permute(0, 2, 1)                         # (B, n_latent, 256)
 
@@ -103,9 +79,7 @@ class LIONDecoderUp(nn.Module):
 
         feat = self.stage2(xyz_cur, feat, z_global)                          # (B, n_latent, 64)
 
-        # --- Folding: expand each coarse point into `ratio` fine points ---
-        # feat_rep  : (B, n_latent, ratio, 64)
-        # seeds_rep : (B, n_latent, ratio, 2)
+
         feat_rep  = feat.unsqueeze(2).expand(-1, -1, self.ratio, -1)
         seeds_rep = self.seeds.unsqueeze(0).unsqueeze(0).expand(B, self.n_latent, -1, -1)
 

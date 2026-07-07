@@ -2,14 +2,6 @@ import torch
 
 
 def round_channels(x: float, base: int = 16, min_val: int = 16) -> int:
-    """
-    Arredonda pro multiplo de `base` mais proximo (minimo `min_val`).
-    Necessario porque VoxelBranch usa GroupNorm(num_groups=8, ...) em cada
-    estagio — precisa que o numero de canais (e a metade dele, usado
-    internamente) seja divisivel por 8. Multiplos de 16 garantem isso
-    sempre, independente da combinacao de hidden_dim/out_dim/n_stages
-    passada via flag.
-    """
     return max(min_val, int(round(x / base)) * base)
 
 
