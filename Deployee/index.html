@@ -151,8 +151,8 @@
     <main>
         <div>
             <div class="panel">
-                <h2>Critério do checkpoint</h2>
-                <div id="criteria">carregando…</div>
+                <h2>Modelo</h2>
+                <div id="models">carregando…</div>
 
                 <div class="row">
                     <div style="flex:1">
@@ -190,8 +190,8 @@
 
     <script>
         // ── estado ──────────────────────────────────────────────────────
-        let criteria = [];
-        let selected = 'best_val';
+        let models = [];
+        let selected = null;
         let baseZ = null;          // latente normalizado da última geração
         let topDims = [];
         let shifts = {};           // dim -> delta
@@ -210,26 +210,24 @@
             draw();
         };
 
-        // ── critérios ───────────────────────────────────────────────────
+        // ── modelos ─────────────────────────────────────────────────────
         const fmt = (v, d = 4) => Number(v).toFixed(d);
 
         async function loadModels() {
             const r = await fetch('/models');
             const j = await r.json();
-            criteria = j.criteria;
-            const box = document.getElementById('criteria');
+            models = j.models;
+            if (!selected && models.length) selected = models[0].id;
+            const box = document.getElementById('models');
             box.innerHTML = '';
-            for (const c of criteria) {
+            for (const c of models) {
                 const el = document.createElement('label');
                 el.className = 'crit' + (c.id === selected ? ' sel' : '');
                 el.innerHTML = `
-                    <input type="radio" name="crit" value="${c.id}">
+                    <input type="radio" name="model" value="${c.id}">
                     <div class="name">${c.label}</div>
                     <div class="meta">→ ${c.checkpoint} · época ${c.epoch}</div>
-                    <div class="meta">val ${fmt(c.metrics.val_loss, 5)} ·
-                        MMD ${fmt(c.metrics.mmd, 5)} ·
-                        COV ${fmt(c.metrics.cov, 3)} ·
-                        1-NNA ${fmt(c.metrics.nna_1nn, 3)}</div>`;
+                    <div class="meta">val loss ${fmt(c.metrics.val_loss, 5)}</div>`;
                 el.onclick = () => {
                     selected = c.id;
                     document.querySelectorAll('.crit').forEach(e => e.classList.remove('sel'));
@@ -250,7 +248,7 @@
                 const r = await fetch('/generate', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ criterion: selected, seed, steps })
+                    body: JSON.stringify({ model: selected, seed, steps })
                 });
                 const j = await r.json();
                 if (!j.success) throw new Error(j.error);
@@ -362,7 +360,7 @@
             const r = await fetch('/decode', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ criterion: selected, z: baseZ, shifts })
+                body: JSON.stringify({ model: selected, z: baseZ, shifts })
             });
             const j = await r.json();
             if (!j.success) throw new Error(j.error);
@@ -378,7 +376,7 @@
             const r = await fetch('/mesh', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ criterion: selected, z: baseZ, shifts, depth })
+                body: JSON.stringify({ model: selected, z: baseZ, shifts, depth })
             });
             const j = await r.json();
             if (!j.success) throw new Error(j.error);

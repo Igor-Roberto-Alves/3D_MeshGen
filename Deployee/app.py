@@ -2,11 +2,11 @@
 app.py — Deployee da difusao latente unconditional (ckpt_diff_flat_noclass).
 
 Serve uma UI onde:
-  - um seletor escolhe o checkpoint por criterio (menor val loss, maior COV,
-    menor MMD ou 1-NNA mais perto de 0.5), usando as metricas de
-    checkpoints_metrics.json (gerado por eval_checkpoints.py);
+  - um seletor escolhe qual modelo de difusao usar (checkpoint "best.pt" de
+    cada experimento de treino, ja selecionado pelo train_diffusion_flat_noclass.py
+    como o de menor val loss);
   - o botao Generate amostra um latente via DDIM com o modelo escolhido e
-    decodifica com o decoder do VAE congelado;
+    decodifica com o decoder do VAE congelado correspondente;
   - sliders aplicam shifts (em unidades de std do latente de treino) nas
     dimensoes mais ativas do vetor latente e mostram a reconstrucao.
 
@@ -14,7 +14,6 @@ Rodar a partir da raiz do repo:
     .venv/bin/python Deployee/app.py
 """
 
-import json
 import random
 import sys
 import threading
@@ -34,11 +33,9 @@ from src.Diffusion import CosineSchedule
 from src.UnetDiffusion import UNet1D, ddim_sample
 from src.vae_flat import VaeFlat
 
-CKPT_DIR     = ROOT / "ckpt_diff_flat_noclass" / "exp0_noclass"
-METRICS_PATH = HERE / "checkpoints_metrics.json"
-OUT_DIR      = HERE / "generated_clouds"
-DEVICE       = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-N_TOP_DIMS   = 8
+OUT_DIR    = HERE / "generated_clouds"
+DEVICE     = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+N_TOP_DIMS = 8
 
 app = Flask(__name__)
 OUT_DIR.mkdir(exist_ok=True)
@@ -46,37 +43,22 @@ OUT_DIR.mkdir(exist_ok=True)
 _lock = threading.Lock()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Selecao de checkpoint por criterio
+# Modelos disponiveis para inferencia
 # ─────────────────────────────────────────────────────────────────────────────
+# Cada um e o "best.pt" salvo por train_diffusion_flat_noclass.py, que grava
+# esse arquivo sempre que a val loss (eps-MSE) melhora — ou seja, ja e o
+# melhor checkpoint daquele experimento, sem precisar de criterio adicional.
 
-METRICS = json.loads(METRICS_PATH.read_text())
-
-CRITERIA = {
-    "best_val": {
-        "label": "Menor erro de validação (eps-MSE)",
-        "key":   lambda m: m["val_loss"],
+MODELS = {
+    "latent_512": {
+        "label": "Modelo latent 512",
+        "path":  ROOT / "ckpt_diff_flat_noclass" / "exp_512" / "best.pt",
     },
-    "best_cov": {
-        "label": "Maior COV",
-        "key":   lambda m: -m["cov"],
-    },
-    "best_mmd": {
-        "label": "Menor MMD-CD",
-        "key":   lambda m: m["mmd"],
-    },
-    "best_nna": {
-        "label": "1-NNA mais perto de 0.5",
-        "key":   lambda m: abs(m["nna_1nn"] - 0.5),
+    "latent_256": {
+        "label": "Modelo latent 256",
+        "path":  ROOT / "ckpt_diff_flat_noclass" / "exp_1" / "best.pt",
     },
 }
-
-
-def resolve_criterion(criterion: str) -> str:
-    """Nome do checkpoint (chave de METRICS) que vence o criterio.
-    Empates sao desfeitos pela menor val loss."""
-    key = CRITERIA[criterion]["key"]
-    return min(METRICS, key=lambda name: (key(METRICS[name]),
-                                          METRICS[name]["val_loss"]))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -99,13 +81,15 @@ def build_vae_flat(cfg: dict, decoder_norm: str) -> VaeFlat:
     ).to(DEVICE)
 
 
-_vae = None
+_vae_cache: dict[str, VaeFlat] = {}
 _diff_cache: dict[str, dict] = {}
 
 
 def get_vae(vae_ckpt: str) -> VaeFlat:
-    global _vae
-    if _vae is None:
+    """Carrega (com cache por checkpoint) o VAE congelado. Modelos diferentes
+    de difusao podem depender de VAEs diferentes (latent_dim distinto),
+    entao o cache e por caminho de checkpoint, nao um unico global."""
+    if vae_ckpt not in _vae_cache:
         ck = torch.load(ROOT / vae_ckpt, map_location=DEVICE, weights_only=False)
         cfg, state = ck["config"], ck["model"]
         norm = "batch" if "decoder.feat_proj.1.running_mean" in state else "group"
@@ -114,15 +98,15 @@ def get_vae(vae_ckpt: str) -> VaeFlat:
         vae.eval()
         for p in vae.parameters():
             p.requires_grad_(False)
-        _vae = vae
+        _vae_cache[vae_ckpt] = vae
         print(f"[✓] VAE loaded: {vae_ckpt} (norm={norm})")
-    return _vae
+    return _vae_cache[vae_ckpt]
 
 
 def get_diffusion(name: str) -> dict:
     """Carrega (com cache) o UNet EMA + schedule + stats do latente."""
     if name not in _diff_cache:
-        path = CKPT_DIR / METRICS[name]["file"]
+        path = MODELS[name]["path"]
         ck = torch.load(path, map_location=DEVICE, weights_only=False)
 
         model = UNet1D(**ck["model_kwargs"]).to(DEVICE)
@@ -142,8 +126,9 @@ def get_diffusion(name: str) -> dict:
             "top_dims":    latent_std.argsort(descending=True)[:N_TOP_DIMS].tolist(),
             "vae_ckpt":    ck["vae_ckpt"],
             "epoch":       int(ck["epoch"]),
+            "val_loss":    float(ck["val_loss"]),
         }
-        print(f"[✓] Diffusion loaded: {path.name} (epoch {ck['epoch']}, EMA)")
+        print(f"[✓] Diffusion loaded: {name} ({path.name}, epoch {ck['epoch']}, EMA)")
     return _diff_cache[name]
 
 
@@ -224,41 +209,39 @@ def index():
 
 @app.route("/models", methods=["GET"])
 def models():
-    """Criterios disponiveis e para qual checkpoint cada um resolve."""
+    """Modelos de difusao disponiveis para inferencia."""
     out = []
-    for cid, spec in CRITERIA.items():
-        name = resolve_criterion(cid)
+    for mid, spec in MODELS.items():
+        entry = get_diffusion(mid)
         out.append({
-            "id":         cid,
+            "id":         mid,
             "label":      spec["label"],
-            "checkpoint": METRICS[name]["file"],
-            "epoch":      METRICS[name]["epoch"],
-            "metrics":    {k: METRICS[name][k]
-                           for k in ("val_loss", "mmd", "cov", "nna_1nn")},
+            "checkpoint": str(spec["path"].relative_to(ROOT)),
+            "epoch":      entry["epoch"],
+            "metrics":    {"val_loss": entry["val_loss"]},
         })
-    return jsonify({"criteria": out, "device": str(DEVICE)}), 200
+    return jsonify({"models": out, "device": str(DEVICE)}), 200
 
 
 @app.route("/generate", methods=["POST"])
 def generate():
     """
-    Amostra 1 latente via DDIM com o checkpoint do criterio escolhido e
-    devolve a nuvem decodificada + o latente normalizado (para shifts).
+    Amostra 1 latente via DDIM com o modelo escolhido e devolve a nuvem
+    decodificada + o latente normalizado (para shifts).
 
-    JSON: {"criterion": "best_val", "seed": 123, "steps": 200}
+    JSON: {"model": "latent_512", "seed": 123, "steps": 200}
     """
     try:
         data = request.get_json(force=True) or {}
-        criterion = data.get("criterion", "best_val")
-        if criterion not in CRITERIA:
+        name = data.get("model", next(iter(MODELS)))
+        if name not in MODELS:
             return jsonify({"success": False,
-                            "error": f"criterion must be one of {list(CRITERIA)}"}), 400
+                            "error": f"model must be one of {list(MODELS)}"}), 400
 
         seed  = data.get("seed")
         seed  = random.randint(0, 2**31 - 1) if seed in (None, "") else int(seed)
         steps = max(10, min(1000, int(data.get("steps", 200))))
 
-        name  = resolve_criterion(criterion)
         with _lock:
             entry = get_diffusion(name)
             torch.manual_seed(seed)
@@ -273,8 +256,8 @@ def generate():
 
         return jsonify({
             "success":    True,
-            "criterion":  criterion,
-            "checkpoint": METRICS[name]["file"],
+            "model":      name,
+            "checkpoint": str(MODELS[name]["path"].relative_to(ROOT)),
             "epoch":      entry["epoch"],
             "seed":       seed,
             "steps":      steps,
@@ -294,18 +277,17 @@ def decode():
     Decodifica um latente (normalizado) com shifts por dimensao — os
     "shiftizinhos". Shifts em unidades de std do latente de treino.
 
-    JSON: {"criterion": "best_val",
+    JSON: {"model": "latent_512",
            "z": [256 floats],
            "shifts": {"9": 0.8, "134": -1.2}}
     """
     try:
         data = request.get_json(force=True) or {}
-        criterion = data.get("criterion", "best_val")
-        if criterion not in CRITERIA:
+        name = data.get("model", next(iter(MODELS)))
+        if name not in MODELS:
             return jsonify({"success": False,
-                            "error": f"criterion must be one of {list(CRITERIA)}"}), 400
+                            "error": f"model must be one of {list(MODELS)}"}), 400
 
-        name  = resolve_criterion(criterion)
         with _lock:
             entry = get_diffusion(name)
             try:
@@ -316,7 +298,7 @@ def decode():
 
         return jsonify({
             "success":    True,
-            "checkpoint": METRICS[name]["file"],
+            "checkpoint": str(MODELS[name]["path"].relative_to(ROOT)),
             "shifts":     data.get("shifts") or {},
             "points":     points_payload(pts),
         }), 200
@@ -331,22 +313,21 @@ def mesh():
     Decodifica o latente (com shifts) e reconstroi a malha: normais
     estimadas por PCA da vizinhanca k-NN + reconstrucao de Poisson.
 
-    JSON: {"criterion": "best_val",
+    JSON: {"model": "latent_512",
            "z": [256 floats],
            "shifts": {"9": 0.8},
            "depth": 8, "knn": 30}
     """
     try:
         data = request.get_json(force=True) or {}
-        criterion = data.get("criterion", "best_val")
-        if criterion not in CRITERIA:
+        name = data.get("model", next(iter(MODELS)))
+        if name not in MODELS:
             return jsonify({"success": False,
-                            "error": f"criterion must be one of {list(CRITERIA)}"}), 400
+                            "error": f"model must be one of {list(MODELS)}"}), 400
 
         depth = max(5, min(10, int(data.get("depth", 8))))
         knn   = max(8, min(100, int(data.get("knn", 30))))
 
-        name = resolve_criterion(criterion)
         with _lock:
             entry = get_diffusion(name)
             try:
@@ -358,7 +339,7 @@ def mesh():
 
         return jsonify({
             "success":    True,
-            "checkpoint": METRICS[name]["file"],
+            "checkpoint": str(MODELS[name]["path"].relative_to(ROOT)),
             "depth":      depth,
             "knn":        knn,
             "vertices":   verts,
@@ -379,12 +360,10 @@ if __name__ == "__main__":
     print("=" * 60)
     print("Latent Diffusion (noclass) — Deployee")
     print(f"Device: {DEVICE}")
-    for cid in CRITERIA:
-        name = resolve_criterion(cid)
-        m = METRICS[name]
-        print(f"  {CRITERIA[cid]['label']:<38} → {m['file']} (epoch {m['epoch']})")
+    for mid, spec in MODELS.items():
+        entry = get_diffusion(mid)
+        print(f"  {spec['label']:<20} → {spec['path'].name} "
+              f"(epoch {entry['epoch']}, val_loss {entry['val_loss']:.5f})")
     print("🚀 http://localhost:5000")
     print("=" * 60)
-    # Pre-carrega o checkpoint default para o primeiro Generate ser rapido
-    get_diffusion(resolve_criterion("best_val"))
     app.run(host="0.0.0.0", port=5000, debug=False)
